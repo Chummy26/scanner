@@ -19,6 +19,7 @@ import {
   p as Q,
   E as Xe,
   F as er,
+  J as API_BASE_URL,
 } from "/src/core/main.js";
 import { F as re } from "/src/services/discordApi.js";
 import { t as Pe } from "/src/primitives/toastRuntime.js";
@@ -658,7 +659,7 @@ function useFilterOptions() {
     t.useEffect(() => {
       (async () => {
         try {
-          const apiBaseUrl = "http://localhost:8000".replace(/\/$/, ""),
+          const apiBaseUrl = API_BASE_URL.replace(/\/$/, ""),
             [coinsResponse, exchangesResponse] = await Promise.all([
               sr(),
               fetch(`${apiBaseUrl}/catalog/exchanges`),
@@ -965,7 +966,7 @@ function HistoryDetailsModal({
             min_exit_spread: queryParams.minExit,
           },
           historyRequest = Ge.post(
-            "http://localhost:8000/api/v1/buy-sell-data",
+            `${API_BASE_URL.replace(/\/$/, "")}/api/v1/buy-sell-data`,
             requestPayload,
           ),
           baseAsset = queryParams.symbol.split(/[\/:]/)[0],
@@ -2387,7 +2388,7 @@ function walkOrderBook(bookLevels = [], targetUsdVolume) {
 
 const telegramRateLimitMap = new Map(),
   TELEGRAM_RATE_LIMIT_MS = 2e3,
-  TELEGRAM_SEND_URL = "http://localhost:8000/integrations/telegram/send",
+  TELEGRAM_SEND_URL = `${API_BASE_URL.replace(/\/$/, "")}/integrations/telegram/send`,
   sendTelegramMessage = async (
     messageContent,
     rateLimitKey,

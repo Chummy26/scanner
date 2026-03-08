@@ -5,7 +5,9 @@
 
 /* ---- Configuration ---- */
 
-const CATALOG_API_BASE_URL = "http://localhost:8000".replace(/\/$/, "");
+import { J as API_BASE_URL } from "/src/core/main.js";
+
+const CATALOG_API_BASE_URL = API_BASE_URL.replace(/\/$/, "");
 
 /* ---- Authentication Helpers ---- */
 

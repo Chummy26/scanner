@@ -5,7 +5,13 @@ TESTS_DIR = Path(__file__).resolve().parent
 if str(TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(TESTS_DIR))
 
-from run_perf_investigation import summarize_probe_samples, summarize_server_perf
+from run_perf_investigation import (
+    browser_targets_for_scenario,
+    build_browser_storage_state,
+    resolve_tracker_db_path,
+    summarize_probe_samples,
+    summarize_server_perf,
+)
 
 
 def test_summarize_probe_samples_tracks_staleness_across_timeouts():
@@ -43,3 +49,23 @@ def test_summarize_server_perf_extracts_hot_windows_from_debug_payloads():
     assert summary["runtime"]["ml_cache_size"] == 8
     assert summary["perf"]["routes"]["ml_dashboard_list"]["source_counts"]["cached_lite"] == 5
     assert len(summary["hot_windows"]) == 1
+
+
+def test_browser_targets_use_real_scanner_route():
+    targets = browser_targets_for_scenario("http://127.0.0.1:8000", "both_ui")
+
+    assert ("scanner", "http://127.0.0.1:8000/dashboards/scanner") in targets
+    assert ("dashboard", "http://127.0.0.1:8000/dashboard") in targets
+
+
+def test_browser_storage_state_seeds_auth_token_for_origin():
+    state = build_browser_storage_state("http://127.0.0.1:8000", "test-token")
+
+    assert state["origins"][0]["origin"] == "http://127.0.0.1:8000"
+    assert state["origins"][0]["localStorage"] == [{"name": "authToken", "value": "test-token"}]
+
+
+def test_resolve_tracker_db_path_isolated_per_benchmark_output(tmp_path: Path):
+    db_path = resolve_tracker_db_path(tmp_path / "scenario_a")
+
+    assert db_path == (tmp_path / "scenario_a" / "tracker_history.sqlite")

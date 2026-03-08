@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import atexit
 import asyncio
 import base64
 import gzip as _gzip
@@ -25,6 +26,11 @@ from statistics import mean
 from typing import Optional
 
 from aiohttp import web, WSMsgType
+
+try:
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+    psutil = None
 
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
@@ -100,6 +106,7 @@ CONFIG_DIR = BACKEND_DIR / "out" / "config"
 # Ensure dirs
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+SERVER_INSTANCE_LOCK_PATH = CONFIG_DIR / "server.instance.lock"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -110,6 +117,140 @@ logger = logging.getLogger("teamop_scanner")
 # Suppress noisy asyncio SSL/ProactorBasePipeTransport warnings during WS connections.
 # These are Windows-specific asyncio noise that don't affect functionality.
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+
+
+def _normalize_cmdline_part(value: object) -> str:
+    return str(value or "").strip().replace("/", "\\").lower()
+
+
+def _looks_like_server_process(cmdline: list[str] | tuple[str, ...] | None) -> bool:
+    if not cmdline:
+        return False
+    normalized = [_normalize_cmdline_part(part) for part in cmdline if str(part or "").strip()]
+    if not normalized:
+        return False
+    if any(part == "src.server" for part in normalized):
+        return True
+    server_path = _normalize_cmdline_part(SRC_DIR / "server.py")
+    server_suffixes = (
+        "\\src\\server.py",
+        "\\backend\\src\\server.py",
+        "src\\server.py",
+        "backend\\src\\server.py",
+    )
+    for part in normalized:
+        if part == server_path:
+            return True
+        if any(part.endswith(suffix) for suffix in server_suffixes):
+            return True
+    return False
+
+
+def find_conflicting_server_processes(current_pid: int | None = None) -> list[dict[str, object]]:
+    if psutil is None:
+        return []
+    current = int(current_pid or os.getpid())
+    conflicts: list[dict[str, object]] = []
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            pid = int(proc.info.get("pid") or 0)
+            if pid <= 0 or pid == current:
+                continue
+            cmdline = proc.info.get("cmdline") or []
+            if not _looks_like_server_process(cmdline):
+                continue
+            conflicts.append(
+                {
+                    "pid": pid,
+                    "name": str(proc.info.get("name") or ""),
+                    "cmdline": [str(item) for item in cmdline],
+                }
+            )
+        except Exception:
+            continue
+    return conflicts
+
+
+class ServerInstanceLock:
+    def __init__(self, lock_path: Path):
+        self.lock_path = Path(lock_path)
+        self._fh = None
+
+    def acquire(self, *, metadata: dict[str, object] | None = None) -> None:
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(self.lock_path, "a+", encoding="utf-8")
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                fh.seek(0)
+                if self.lock_path.stat().st_size == 0:
+                    fh.write(" ")
+                    fh.flush()
+                    fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:  # pragma: no cover - not exercised on Windows CI
+                import fcntl
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fh.seek(0)
+            fh.truncate()
+            payload = dict(metadata or {})
+            payload.setdefault("pid", os.getpid())
+            payload.setdefault("started_at", time.time())
+            payload.setdefault("cmdline", sys.argv[:])
+            fh.write(json.dumps(payload, ensure_ascii=True))
+            fh.flush()
+            self._fh = fh
+        except Exception:
+            fh.close()
+            raise
+
+    def release(self) -> None:
+        if self._fh is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                self._fh.seek(0)
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:  # pragma: no cover - not exercised on Windows CI
+                import fcntl
+
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            self._fh.close()
+        finally:
+            self._fh = None
+
+
+_SERVER_INSTANCE_LOCK: ServerInstanceLock | None = None
+
+
+def enforce_single_server_instance(*, host: str, port: int, current_pid: int | None = None) -> None:
+    allow_multi = str(os.environ.get("TEAM_OP_ALLOW_MULTIPLE_SERVERS", "")).strip().lower()
+    if allow_multi in {"1", "true", "yes"}:
+        return
+    conflicts = find_conflicting_server_processes(current_pid=current_pid)
+    if conflicts:
+        details = "; ".join(
+            f"pid={item['pid']} cmd={' '.join(item['cmdline'])}"
+            for item in conflicts
+        )
+        raise RuntimeError(f"Another Team OP server instance is already running: {details}")
+    global _SERVER_INSTANCE_LOCK
+    _SERVER_INSTANCE_LOCK = ServerInstanceLock(SERVER_INSTANCE_LOCK_PATH)
+    _SERVER_INSTANCE_LOCK.acquire(
+        metadata={
+            "host": str(host),
+            "port": int(port),
+            "project_dir": str(PROJECT_DIR),
+        }
+    )
+    atexit.register(_SERVER_INSTANCE_LOCK.release)
 
 
 # Debug log ring buffer — stores last N log entries for the debug monitor
@@ -2900,6 +3041,11 @@ if __name__ == "__main__":
     parser.add_argument("--host", default=HOST, help=f"Bind address (default: {HOST})")
     parser.add_argument("--port", type=int, default=PORT, help=f"Port (default: {PORT})")
     args = parser.parse_args()
+    try:
+        enforce_single_server_instance(host=args.host, port=args.port)
+    except RuntimeError as exc:
+        logger.error("%s", exc)
+        raise SystemExit(1) from exc
 
     app = create_app()
 

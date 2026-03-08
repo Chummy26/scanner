@@ -23071,7 +23071,16 @@ const {
     getAdapter: kT,
     mergeConfig: jT,
   } = Et,
-  mw = "http://localhost:8000",
+  mw =
+    typeof window < "u" &&
+    window.__TEAMOP_CONFIG__ &&
+    typeof window.__TEAMOP_CONFIG__ == "object" &&
+    typeof window.__TEAMOP_CONFIG__.API_BASE == "string" &&
+    window.__TEAMOP_CONFIG__.API_BASE.trim() !== ""
+      ? window.__TEAMOP_CONFIG__.API_BASE.replace(/\/$/, "")
+      : typeof window < "u"
+        ? window.location.origin.replace(/\/$/, "")
+        : "http://localhost:8000",
   cl = Et.create({
     baseURL: mw,
   });

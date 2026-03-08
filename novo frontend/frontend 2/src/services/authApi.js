@@ -3,7 +3,9 @@
  * Endpoints: /auth/roles, /auth/permissions, /auth/users
  * ======================================== */
 
-const AUTH_API_BASE_URL = "http://localhost:8000".replace(/\/$/, "");
+import { J as API_BASE_URL } from "/src/core/main.js";
+
+const AUTH_API_BASE_URL = API_BASE_URL.replace(/\/$/, "");
 
 const getAuthHeaders = () => {
   const token = localStorage.getItem("authToken");

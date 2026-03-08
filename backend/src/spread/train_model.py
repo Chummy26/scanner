@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import math
+import shutil
 import time as _time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,6 +46,7 @@ from .ml_model import (
 )
 
 logger = logging.getLogger("ml_trainer")
+_DEFAULT_PRELIGHT_THRESHOLDS = [1.0, 0.8, 0.7]
 
 
 def _make_loader(bundle: DatasetBundle, batch_size: int, shuffle: bool) -> DataLoader:
@@ -175,6 +177,47 @@ def _calibration_report(
         "brier_score": float(brier_score_loss(y_true, clipped)),
         "log_loss": float(log_loss(y_true, clipped, labels=[0, 1])),
         "bins": calibration_bins,
+    }
+
+
+def _high_confidence_calibration(calibration_report: dict[str, Any]) -> dict[str, Any]:
+    bins = [
+        dict(item)
+        for item in calibration_report.get("bins", [])
+        if float(item.get("lower", 0.0)) >= 0.70
+    ]
+    populated = [item for item in bins if int(item.get("count", 0)) > 0]
+    weighted_count = sum(int(item.get("count", 0)) for item in populated)
+    if not populated:
+        return {
+            "status": "insufficient_samples",
+            "count": 0,
+            "weighted_gap": 0.0,
+            "max_bin_gap": 0.0,
+            "bins": bins,
+        }
+    weighted_gap = (
+        sum(float(item.get("gap", 0.0)) * int(item.get("count", 0)) for item in populated)
+        / max(weighted_count, 1)
+    )
+    max_bin_gap = max(float(item.get("gap", 0.0)) for item in populated)
+    significant_bins = [
+        item
+        for item in populated
+        if int(item.get("count", 0)) >= 25 and float(item.get("gap", 0.0)) > 0.15
+    ]
+    if weighted_count < 25:
+        status = "insufficient_samples"
+    elif weighted_gap <= 0.10 and not significant_bins:
+        status = "ok"
+    else:
+        status = "review_required"
+    return {
+        "status": status,
+        "count": int(weighted_count),
+        "weighted_gap": float(weighted_gap),
+        "max_bin_gap": float(max_bin_gap),
+        "bins": bins,
     }
 
 
@@ -664,10 +707,19 @@ def _build_split_summary(splits: dict[str, DatasetBundle]) -> dict[str, Any]:
         "val_negative_pairs": int(shared_split_summary.get("val_negative_pairs", 0)),
         "test_negative_pairs": int(shared_split_summary.get("test_negative_pairs", 0)),
         "embargo_samples": int(shared_split_summary.get("embargo_samples", 0)),
+        "embargo_time_sec": int(shared_split_summary.get("embargo_time_sec", 0)),
         "split_mode": str(shared_split_summary.get("split_mode", "sample_chronological")),
+        "split_mode_fallback_reason": str(shared_split_summary.get("split_mode_fallback_reason", "")),
         "train_session_ids": list(shared_split_summary.get("train_session_ids", [])),
         "val_session_ids": list(shared_split_summary.get("val_session_ids", [])),
         "test_session_ids": list(shared_split_summary.get("test_session_ids", [])),
+        "train_end_label_ts": float(shared_split_summary.get("train_end_label_ts", 0.0)),
+        "val_end_label_ts": float(shared_split_summary.get("val_end_label_ts", 0.0)),
+        "purged_temporal_separation_ok": bool(shared_split_summary.get("purged_temporal_separation_ok", False)),
+        "min_cross_split_gap_sec": float(shared_split_summary.get("min_cross_split_gap_sec", 0.0)),
+        "train_positive_rate": float(splits["train"].summary.get("positive_rate", 0.0)),
+        "val_positive_rate": float(splits["val"].summary.get("positive_rate", 0.0)),
+        "test_positive_rate": float(splits["test"].summary.get("positive_rate", 0.0)),
         "global_temporal_order": bool(
             (max(train_timestamps) if train_timestamps else 0.0) <= (min(val_timestamps) if val_timestamps else float("inf"))
             and (max(val_timestamps) if val_timestamps else 0.0) <= (min(test_timestamps) if test_timestamps else float("inf"))
@@ -675,9 +727,227 @@ def _build_split_summary(splits: dict[str, DatasetBundle]) -> dict[str, Any]:
     }
 
 
+def _split_positive_rates(splits: dict[str, DatasetBundle]) -> dict[str, float]:
+    return {
+        split_name: float(split_bundle.summary.get("positive_rate", 0.0))
+        for split_name, split_bundle in splits.items()
+    }
+
+
+def _split_positive_counts(splits: dict[str, DatasetBundle]) -> dict[str, int]:
+    return {
+        split_name: int(split_bundle.summary.get("num_positive_samples", 0))
+        for split_name, split_bundle in splits.items()
+    }
+
+
+def _stability_summary(split_positive_rates: dict[str, float]) -> dict[str, Any]:
+    populated = [float(value) for value in split_positive_rates.values() if float(value) > 0.0]
+    if not populated:
+        max_delta = 0.0
+        ratio = 0.0
+    else:
+        max_delta = max(populated) - min(populated)
+        ratio = min(populated) / max(populated) if max(populated) > 0.0 else 0.0
+    return {
+        "split_positive_rates": {key: float(value) for key, value in split_positive_rates.items()},
+        "max_positive_rate_delta": float(max_delta),
+        "min_to_max_positive_rate_ratio": float(ratio),
+        "stability_ok_primary": bool(max_delta <= 0.05 and ratio >= 0.5),
+        "stability_ok_relaxed": bool(max_delta <= 0.08 and ratio >= 0.5),
+    }
+
+
+def _preflight_entry(
+    *,
+    threshold: float,
+    bundle: DatasetBundle | None,
+    splits: dict[str, DatasetBundle] | None,
+    error: str | None = None,
+    min_train_positive_samples: int,
+    min_val_positive_samples: int,
+    min_test_positive_samples: int,
+) -> dict[str, Any]:
+    if bundle is None or splits is None:
+        return {
+            "threshold": float(threshold),
+            "build_ok": False,
+            "guardrail_ok": False,
+            "purging_ok": False,
+            "stability_ok": False,
+            "stability_mode": "primary",
+            "qualifies_for_training": False,
+            "error": str(error or "dataset_build_failed"),
+        }
+
+    split_summary = _build_split_summary(splits)
+    positive_counts = _split_positive_counts(splits)
+    positive_rates = _split_positive_rates(splits)
+    stability = _stability_summary(positive_rates)
+    guardrail_ok = bool(
+        positive_counts["train"] >= int(min_train_positive_samples)
+        and positive_counts["val"] >= int(min_val_positive_samples)
+        and positive_counts["test"] >= int(min_test_positive_samples)
+    )
+    purging_ok = bool(split_summary["purged_temporal_separation_ok"])
+    qualifies_primary = bool(guardrail_ok and purging_ok and stability["stability_ok_primary"])
+    qualifies_relaxed = bool(guardrail_ok and purging_ok and stability["stability_ok_relaxed"])
+    return {
+        "threshold": float(threshold),
+        "build_ok": True,
+        "guardrail_ok": guardrail_ok,
+        "purging_ok": purging_ok,
+        "stability_ok": bool(stability["stability_ok_primary"]),
+        "stability_ok_primary": bool(stability["stability_ok_primary"]),
+        "stability_ok_relaxed": bool(stability["stability_ok_relaxed"]),
+        "stability_mode": "primary" if stability["stability_ok_primary"] else ("relaxed" if stability["stability_ok_relaxed"] else "failed"),
+        "qualifies_for_training": qualifies_primary,
+        "qualifies_for_training_relaxed": qualifies_relaxed,
+        "num_samples": int(bundle.summary.get("num_samples", 0)),
+        "num_positive_samples": int(bundle.summary.get("num_positive_samples", 0)),
+        "num_negative_samples": int(bundle.summary.get("num_negative_samples", 0)),
+        "positive_rate": float(bundle.summary.get("num_positive_samples", 0) / max(bundle.summary.get("num_samples", 1), 1)),
+        "split_positive_counts": positive_counts,
+        "split_positive_rates": stability["split_positive_rates"],
+        "max_positive_rate_delta": float(stability["max_positive_rate_delta"]),
+        "min_to_max_positive_rate_ratio": float(stability["min_to_max_positive_rate_ratio"]),
+        "split_summary": split_summary,
+        "label_audit": dict(bundle.summary.get("label_audit", {})),
+        "error": str(error or ""),
+    }
+
+
+def run_threshold_preflight(
+    *,
+    state_file: Path | None = None,
+    sequence_length: int = 15,
+    prediction_horizon_sec: int = 14_400,
+    thresholds: list[float] | None = None,
+    selected_session_ids: list[int] | None = None,
+    selected_block_ids: list[int] | None = None,
+    min_train_positive_samples: int = 500,
+    min_val_positive_samples: int = 50,
+    min_test_positive_samples: int = 50,
+    output_path: Path | None = None,
+) -> dict[str, Any]:
+    default_state = Path(__file__).resolve().parent.parent.parent / "out" / "config" / "tracker_history.sqlite"
+    state_path = Path(state_file) if state_file is not None else default_state
+    threshold_values = [float(value) for value in (thresholds or _DEFAULT_PRELIGHT_THRESHOLDS)]
+    preflight: dict[str, Any] = {
+        "state_path": str(state_path),
+        "sequence_length": int(sequence_length),
+        "prediction_horizon_sec": int(prediction_horizon_sec),
+        "thresholds": {},
+        "selected_threshold": None,
+        "selection_mode": "none",
+        "qualifies_for_training": False,
+    }
+    primary_candidates: list[float] = []
+    relaxed_candidates: list[float] = []
+    for threshold in threshold_values:
+        try:
+            bundle = build_dataset_bundle(
+                state_path=state_path,
+                sequence_length=sequence_length,
+                prediction_horizon_sec=prediction_horizon_sec,
+                min_total_spread_pct=threshold,
+                selected_session_ids=selected_session_ids,
+                selected_block_ids=selected_block_ids,
+            )
+            splits = build_group_splits(bundle, prediction_horizon_sec=prediction_horizon_sec)
+            entry = _preflight_entry(
+                threshold=threshold,
+                bundle=bundle,
+                splits=splits,
+                min_train_positive_samples=min_train_positive_samples,
+                min_val_positive_samples=min_val_positive_samples,
+                min_test_positive_samples=min_test_positive_samples,
+            )
+        except Exception as exc:
+            entry = _preflight_entry(
+                threshold=threshold,
+                bundle=None,
+                splits=None,
+                error=str(exc),
+                min_train_positive_samples=min_train_positive_samples,
+                min_val_positive_samples=min_val_positive_samples,
+                min_test_positive_samples=min_test_positive_samples,
+            )
+        key = f"{threshold:.1f}"
+        preflight["thresholds"][key] = entry
+        if entry.get("qualifies_for_training"):
+            primary_candidates.append(float(threshold))
+        if entry.get("qualifies_for_training_relaxed"):
+            relaxed_candidates.append(float(threshold))
+
+    if primary_candidates:
+        preflight["selected_threshold"] = max(primary_candidates)
+        preflight["selection_mode"] = "primary"
+        preflight["qualifies_for_training"] = True
+    elif relaxed_candidates:
+        preflight["selected_threshold"] = max(relaxed_candidates)
+        preflight["selection_mode"] = "relaxed"
+        preflight["qualifies_for_training"] = True
+
+    if output_path is not None:
+        output_target = Path(output_path)
+        _write_json(output_target, preflight)
+        preflight["output_path"] = str(output_target)
+    return preflight
+
+
+def _archive_existing_artifacts(artifact_root: Path) -> str:
+    legacy_candidates = [
+        artifact_root / f"{ARTIFACT_BASENAME}.pth",
+        artifact_root / f"{ARTIFACT_BASENAME}.meta.json",
+        artifact_root / f"{ARTIFACT_BASENAME}.report.json",
+        artifact_root / f"{ARTIFACT_BASENAME}.audit.md",
+    ]
+    existing = [path for path in legacy_candidates if path.exists()]
+    if not existing:
+        return ""
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    legacy_dir = artifact_root / "legacy_artifacts" / timestamp
+    legacy_dir.mkdir(parents=True, exist_ok=True)
+    for source_path in existing:
+        shutil.copy2(source_path, legacy_dir / source_path.name)
+    return str(legacy_dir)
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _build_psi_reference(
+    X: torch.Tensor,
+    feature_names: list[str],
+    *,
+    bins: int = 10,
+) -> dict[str, Any]:
+    if X.numel() == 0:
+        return {"feature_bins": {}, "min_samples_required": 200}
+    flattened = X.detach().cpu().numpy().reshape(-1, X.shape[-1])
+    feature_bins: dict[str, Any] = {}
+    for index, feature_name in enumerate(feature_names):
+        column = flattened[:, index]
+        quantiles = np.quantile(column, np.linspace(0.0, 1.0, bins + 1))
+        quantiles[0] = -np.inf
+        quantiles[-1] = np.inf
+        counts, _ = np.histogram(column, bins=quantiles)
+        expected = (counts / max(int(counts.sum()), 1)).tolist()
+        edges = [
+            None if not math.isfinite(float(value)) else float(value)
+            for value in quantiles.tolist()
+        ]
+        feature_bins[feature_name] = {
+            "bin_edges": edges,
+            "expected_proportions": [float(value) for value in expected],
+        }
+    return {
+        "feature_bins": feature_bins,
+        "min_samples_required": 200,
+    }
 
 
 def write_audit_report(report: dict[str, Any], audit_path: Path) -> Path:
@@ -686,6 +956,7 @@ def write_audit_report(report: dict[str, Any], audit_path: Path) -> Path:
     metrics = report["metrics"]["test"]
     baselines = report["baselines"]
     calibration = report["calibration"]["test"]
+    high_confidence_calibration = calibration.get("high_confidence", {})
     temporal_summary = report["temporal_walk_forward"]["test"]["summary"]
     validation_partition = report["validation_partition"]
     feature_monitoring = report["feature_monitoring"]
@@ -694,13 +965,16 @@ def write_audit_report(report: dict[str, Any], audit_path: Path) -> Path:
         "dataset_non_degenerate": bool(dataset_summary["num_samples"] > 0 and dataset_summary["feature_abs_sum"] > 0.0),
         "windows_respect_blocks": int(dataset_summary.get("num_cross_block_windows", 0)) == 0,
         "global_temporal_order": bool(split_summary["global_temporal_order"]),
-        "embargo_active": bool(split_summary["embargo_samples"] > 0),
+        "purged_temporal_separation_ok": bool(split_summary.get("purged_temporal_separation_ok", False)),
         "beats_negative_baseline_recall": bool(metrics["recall"] > baselines["always_negative"]["recall"]),
         "beats_negative_baseline_ap": bool(
             metrics["average_precision"] >= baselines["always_negative"]["average_precision"]
         ),
         "nonzero_positive_predictions": bool(metrics["predicted_positive_rate"] > 0.0),
         "calibration_within_guardrail": bool(calibration["ece"] <= 0.12),
+        "high_confidence_calibration_ok": bool(
+            high_confidence_calibration.get("status") in {"ok", "insufficient_samples"}
+        ),
         "temporal_ap_above_baseline": bool(
             temporal_summary.get("min_average_precision", 0.0) >= baselines["always_negative"]["average_precision"]
         ),
@@ -714,8 +988,8 @@ def write_audit_report(report: dict[str, Any], audit_path: Path) -> Path:
         findings.append("- Crítico: existem janelas cruzando blocos temporais, violando a continuidade do treino.")
     if not checks["global_temporal_order"]:
         findings.append("- Crítico: treino, validação e teste ainda se sobrepõem no tempo global.")
-    if not checks["embargo_active"]:
-        findings.append("- Alto: o split temporal ficou sem embargo entre fronteiras e pode compartilhar contexto entre janelas adjacentes.")
+    if not checks["purged_temporal_separation_ok"]:
+        findings.append("- Crítico: o split temporal não respeitou a separação purgada pelo horizonte do label.")
     if not checks["beats_negative_baseline_recall"]:
         findings.append("- Alto: o modelo não superou o baseline sempre-negativo em recall.")
     if not checks["beats_negative_baseline_ap"]:
@@ -726,6 +1000,8 @@ def write_audit_report(report: dict[str, Any], audit_path: Path) -> Path:
         findings.append("- Alto: o bloco temporal mais fraco caiu abaixo do baseline sempre-negativo em PR-AUC.")
     if not checks["calibration_within_guardrail"]:
         findings.append("- Médio: a calibração ficou acima do guardrail de ECE e exige threshold mais conservador.")
+    if not checks["high_confidence_calibration_ok"]:
+        findings.append("- Médio: os bins de alta confiança ficaram descalibrados e exigem revisão manual antes da promoção.")
     if not checks["strong_precision_guardrail"]:
         findings.append("- Médio: o threshold de STRONG_EXECUTE não atingiu a precisão mínima esperada para sinal forte.")
     if not findings:
@@ -760,7 +1036,11 @@ def write_audit_report(report: dict[str, Any], audit_path: Path) -> Path:
         f"- Pairwise overlap sum: {split_summary['pair_overlap_pairwise_sum']}",
         f"- Unique pair overlap rate: {split_summary['pair_overlap_rate']:.4f}",
         f"- Embargo samples: {split_summary['embargo_samples']}",
+        f"- Embargo time sec: {split_summary.get('embargo_time_sec', 0)}",
         f"- Global temporal order: {split_summary['global_temporal_order']}",
+        f"- Purged temporal separation ok: {split_summary.get('purged_temporal_separation_ok', False)}",
+        f"- Min cross-split gap sec: {split_summary.get('min_cross_split_gap_sec', 0.0):.1f}",
+        f"- Split mode fallback reason: {split_summary.get('split_mode_fallback_reason', '')}",
         f"- Train time range: {split_summary['train_start_ts']:.0f} -> {split_summary['train_end_ts']:.0f}",
         f"- Validation time range: {split_summary['val_start_ts']:.0f} -> {split_summary['val_end_ts']:.0f}",
         f"- Test time range: {split_summary['test_start_ts']:.0f} -> {split_summary['test_end_ts']:.0f}",
@@ -801,6 +1081,8 @@ def write_audit_report(report: dict[str, Any], audit_path: Path) -> Path:
         f"- Test ECE: {report['calibration']['test']['ece']:.4f}",
         f"- Test Brier score: {calibration['brier_score']:.4f}",
         f"- Test log loss: {calibration['log_loss']:.4f}",
+        f"- High-confidence status: {high_confidence_calibration.get('status', 'unavailable')}",
+        f"- High-confidence weighted gap: {high_confidence_calibration.get('weighted_gap', 0.0):.4f}",
         "",
         "## Validation Partition",
         f"- Mode: {validation_partition['mode']}",
@@ -913,12 +1195,12 @@ def run_training_loop(
     if bundle.summary["num_samples"] < 30:
         raise ValueError("Dataset construction failed or too small for robust training.")
 
-    splits = build_group_splits(bundle)
+    splits = build_group_splits(bundle, prediction_horizon_sec=prediction_horizon_sec)
     split_summary = _build_split_summary(splits)
     if not split_summary["global_temporal_order"]:
         raise ValueError("Global temporal separation failed in split construction.")
-    if split_summary["split_mode"] == "sample_chronological" and split_summary["embargo_samples"] <= 0:
-        raise ValueError("Temporal split did not reserve an embargo between boundaries.")
+    if not split_summary["purged_temporal_separation_ok"]:
+        raise ValueError("Temporal split did not preserve purged separation between boundaries.")
     if min(splits["train"].summary["num_samples"], splits["val"].summary["num_samples"], splits["test"].summary["num_samples"]) == 0:
         raise ValueError("At least one split is empty; need more disjoint pairs.")
 
@@ -943,6 +1225,7 @@ def run_training_loop(
             "Revise min_total_spread_pct or prediction_horizon_sec before retraining."
         )
 
+    raw_train_X = splits["train"].X.detach().clone()
     feature_mean, feature_std = compute_feature_stats(splits["train"].X)
     for split_bundle in splits.values():
         split_bundle.X = normalize_features(split_bundle.X, feature_mean, feature_std)
@@ -1083,11 +1366,14 @@ def run_training_loop(
         "min_variance": float(np.min(np.square(feature_std_np))) if feature_std_np.size else 0.0,
         "max_variance": float(np.max(np.square(feature_std_np))) if feature_std_np.size else 0.0,
         "mean_abs_zscore_test": mean_abs_zscore_test,
+        "psi_reference": _build_psi_reference(raw_train_X, list(bundle.feature_names)),
     }
     calibration = {
         split_name: _calibration_report(evaluation["y_class"], evaluation["probs"])
         for split_name, evaluation in evaluations.items()
     }
+    for calibration_payload in calibration.values():
+        calibration_payload["high_confidence"] = _high_confidence_calibration(calibration_payload)
     subgroup_metrics = {
         split_name: _subgroup_metrics(evaluation, execute_threshold)
         for split_name, evaluation in evaluations.items()
@@ -1196,6 +1482,7 @@ def run_training_loop(
             "validation_partition_mode": validation_partition["mode"],
             "selected_session_ids": list(selected_session_ids or []),
             "selected_block_ids": list(selected_block_ids or []),
+            "psi_reference": feature_monitoring["psi_reference"],
         },
         use_attention=True,
         trained_at_utc=datetime.now(timezone.utc).isoformat(),
@@ -1226,6 +1513,90 @@ def run_training_loop(
     }
     _write_json(report_path, report)
     logger.info("Training complete. Artifacts saved to %s", artifact_root)
+    return report
+
+
+def run_clean_training_cycle(
+    *,
+    state_file: Path | None = None,
+    artifact_dir: Path | None = None,
+    sequence_length: int = 15,
+    prediction_horizon_sec: int = 14_400,
+    thresholds: list[float] | None = None,
+    selected_session_ids: list[int] | None = None,
+    selected_block_ids: list[int] | None = None,
+    hidden_size: int = 64,
+    num_layers: int = 2,
+    dropout: float = 0.3,
+    batch_size: int = 128,
+    max_epochs: int = 80,
+    patience: int = 5,
+    learning_rate: float = 0.001,
+    weight_decay: float = 1e-4,
+    focal_alpha: float | None = None,
+    focal_gamma: float = 2.0,
+    min_train_positive_samples: int = 500,
+    min_val_positive_samples: int = 50,
+    min_test_positive_samples: int = 50,
+    seed: int = 42,
+    audit_output: Path | None = None,
+) -> dict[str, Any]:
+    artifact_root = Path(artifact_dir) if artifact_dir is not None else get_default_artifact_dir()
+    preflight_output = artifact_root / "threshold_preflight.json"
+    preflight = run_threshold_preflight(
+        state_file=state_file,
+        sequence_length=sequence_length,
+        prediction_horizon_sec=prediction_horizon_sec,
+        thresholds=thresholds,
+        selected_session_ids=selected_session_ids,
+        selected_block_ids=selected_block_ids,
+        min_train_positive_samples=min_train_positive_samples,
+        min_val_positive_samples=min_val_positive_samples,
+        min_test_positive_samples=min_test_positive_samples,
+        output_path=preflight_output,
+    )
+    if not preflight.get("qualifies_for_training"):
+        raise ValueError("No threshold qualified for clean training in preflight.")
+    selected_threshold = float(preflight["selected_threshold"])
+    legacy_archive_dir = _archive_existing_artifacts(artifact_root)
+    report = run_training_loop(
+        state_file=state_file,
+        artifact_dir=artifact_root,
+        sequence_length=sequence_length,
+        prediction_horizon_sec=prediction_horizon_sec,
+        min_total_spread_pct=selected_threshold,
+        selected_session_ids=selected_session_ids,
+        selected_block_ids=selected_block_ids,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        dropout=dropout,
+        batch_size=batch_size,
+        max_epochs=max_epochs,
+        patience=patience,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        focal_alpha=focal_alpha,
+        focal_gamma=focal_gamma,
+        min_train_positive_samples=min_train_positive_samples,
+        min_val_positive_samples=min_val_positive_samples,
+        min_test_positive_samples=min_test_positive_samples,
+        seed=seed,
+        audit_output=audit_output,
+    )
+    report["preflight"] = preflight
+    report["legacy_archive_dir"] = legacy_archive_dir
+    report["training"]["selected_threshold"] = selected_threshold
+    report_path = artifact_root / f"{ARTIFACT_BASENAME}.report.json"
+    _write_json(report_path, report)
+
+    _, metadata_path = get_artifact_paths(artifact_root)
+    if metadata_path.is_file():
+        metadata_payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata_payload.setdefault("training_config", {})
+        metadata_payload["training_config"]["preflight"] = preflight
+        metadata_payload["training_config"]["selected_threshold"] = selected_threshold
+        metadata_payload["training_config"]["legacy_archive_dir"] = legacy_archive_dir
+        metadata_path.write_text(json.dumps(metadata_payload, indent=2, sort_keys=True), encoding="utf-8")
     return report
 
 

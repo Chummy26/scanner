@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -10,9 +11,11 @@ from src.spread.train_model import (
     _derive_focal_alpha,
     build_dataset_bundle,
     build_group_splits,
+    run_clean_training_cycle,
     run_training_loop,
+    run_threshold_preflight,
 )
-from src.spread.ml_dataset import FEATURE_NAMES, _label_window_from_episodes
+from src.spread.ml_dataset import FEATURE_NAMES, _label_window_from_episodes, _load_blocks_from_sqlite
 from src.spread.spread_tracker import SpreadTracker, TrackerEpisode
 
 
@@ -265,6 +268,109 @@ def _write_multi_session_sqlite(path: Path, *, num_sessions: int = 4) -> Path:
     return path
 
 
+def _write_near_threshold_state(path: Path, *, count: int = 12) -> Path:
+    base_ts = 1_702_000_000
+    template_records = [
+        {"ts": float(base_ts + 0), "entry": 0.12, "exit": -0.18},
+        {"ts": float(base_ts + 60), "entry": 0.14, "exit": -0.17},
+        {"ts": float(base_ts + 120), "entry": 0.18, "exit": -0.14},
+        {"ts": float(base_ts + 180), "entry": 0.82, "exit": -0.09},
+        {"ts": float(base_ts + 240), "entry": 0.68, "exit": -0.04},
+        {"ts": float(base_ts + 300), "entry": 0.54, "exit": 0.02},
+        {"ts": float(base_ts + 360), "entry": -0.04, "exit": 0.08},
+        {"ts": float(base_ts + 420), "entry": -0.07, "exit": 0.10},
+        {"ts": float(base_ts + 480), "entry": -0.05, "exit": 0.11},
+    ]
+    pairs: dict[str, dict] = {}
+    last_seen_ts = 0.0
+    for index in range(count):
+        offset = index * 10_000
+        shifted_records = [
+            {
+                "ts": float(record["ts"] + offset),
+                "entry": float(record["entry"]),
+                "exit": float(record["exit"]),
+            }
+            for record in template_records
+        ]
+        last_seen_ts = max(last_seen_ts, shifted_records[-1]["ts"])
+        pairs[f"NEAR{index:02d}|buy|spot|sell|futures"] = {
+            "last_state": -1,
+            "last_crossover_ts": float(base_ts + 360 + offset),
+            "last_seen_ts": float(shifted_records[-1]["ts"]),
+            "history_enabled": True,
+            "inverted_events": [float(base_ts + 360 + offset)],
+            "entry_events": [],
+            "exit_events": [],
+            "records": shifted_records,
+        }
+    path.write_text(
+        json.dumps({"saved_at": last_seen_ts, "window_sec": 604800, "pairs": pairs}),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_many_gap_blocks_sqlite(path: Path, *, num_blocks: int = 1_100) -> Path:
+    tracker = SpreadTracker(
+        window_sec=30 * 24 * 60 * 60,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=path,
+        gap_threshold_sec=30.0,
+    )
+    pair = ("BTC", "mexc", "spot", "gate", "futures")
+    for index in range(num_blocks):
+        tracker.record_spread(
+            *pair,
+            0.20 + ((index % 5) * 0.01),
+            -0.10 + ((index % 3) * 0.01),
+            now_ts=float(index * 120),
+        )
+    assert tracker.flush_to_storage(now_ts=float(num_blocks * 120), force=True)
+    tracker.close_active_session(ended_at=float(num_blocks * 120))
+    return path
+
+
+def _write_multi_session_sqlite_with_spacing(
+    path: Path,
+    *,
+    num_sessions: int = 4,
+    session_spacing_sec: int = 90,
+) -> Path:
+    for session_index in range(num_sessions):
+        tracker = SpreadTracker(
+            window_sec=604800,
+            record_interval_sec=15.0,
+            max_records_per_pair=0,
+            epsilon_pct=0.0,
+            history_enable_entry_spread_pct=0.0,
+            track_enable_entry_spread_pct=0.0,
+            db_path=path,
+            gap_threshold_sec=60.0,
+        )
+        base_ts = 1_703_000_000 + (session_index * session_spacing_sec)
+        for pair_offset, symbol in enumerate((f"BTCG{session_index}", f"ETHG{session_index}")):
+            start = base_ts + pair_offset * 10
+            for index in range(12):
+                tracker.record_spread(
+                    symbol,
+                    "mexc",
+                    "spot",
+                    "gate",
+                    "futures",
+                    0.30 + (index * 0.01),
+                    -0.08 + (index * 0.005),
+                    now_ts=float(start + index * 15),
+                )
+        assert tracker.flush_to_storage(now_ts=float(base_ts + 400), force=True)
+        tracker.close_active_session(ended_at=float(base_ts + 400))
+    return path
+
+
 def _write_overlapping_tracker_state(path: Path) -> Path:
     pairs = {}
     for index in range(6):
@@ -322,6 +428,15 @@ def test_build_dataset_bundle_reads_tracker_sqlite_schema(tmp_path: Path):
     assert bundle.summary["num_cross_block_windows"] == 0
     assert bundle.block_ids
     assert bundle.session_ids
+
+
+def test_load_blocks_from_sqlite_chunks_large_block_queries(tmp_path: Path):
+    sqlite_path = _write_many_gap_blocks_sqlite(tmp_path / "tracker_history_many_blocks.sqlite", num_blocks=1_100)
+
+    blocks, _, summary = _load_blocks_from_sqlite(sqlite_path, selected_only=False, closed_only=True)
+
+    assert len(blocks) >= 1_000
+    assert summary["num_blocks"] == len(blocks)
 
 
 def test_build_dataset_bundle_still_reads_legacy_tracker_json_schema(tmp_path: Path):
@@ -534,6 +649,27 @@ def test_group_splits_use_session_boundaries_when_multiple_sessions_exist(tmp_pa
     assert set(summary["test_session_ids"]) == set(splits["test"].session_ids)
 
 
+def test_group_splits_fall_back_to_purged_sample_mode_when_session_gap_is_below_horizon(tmp_path: Path):
+    sqlite_path = _write_multi_session_sqlite_with_spacing(
+        tmp_path / "tracker_history_sessions_tight.sqlite",
+        num_sessions=4,
+        session_spacing_sec=230,
+    )
+    bundle = build_dataset_bundle(
+        state_path=sqlite_path,
+        sequence_length=4,
+        prediction_horizon_sec=240,
+    )
+
+    splits = build_group_splits(bundle, prediction_horizon_sec=240)
+    summary = splits["train"].summary["split_summary"]
+
+    assert summary["split_mode"] == "sample_chronological_purged"
+    assert summary["split_mode_fallback_reason"] == "session_gap_below_horizon"
+    assert summary["purged_temporal_separation_ok"] is True
+    assert summary["embargo_time_sec"] == 240
+
+
 def test_run_training_loop_saves_artifacts_and_beats_negative_baseline(tmp_path: Path):
     json_state = _write_tracker_state(tmp_path / "tracker_state.json")
     payload = json.loads(json_state.read_text(encoding="utf-8"))
@@ -582,6 +718,8 @@ def test_run_training_loop_saves_artifacts_and_beats_negative_baseline(tmp_path:
     assert report["validation_partition"]["calibration_end_ts"] <= report["validation_partition"]["selection_start_ts"]
     assert report["training"]["positive_rate_train"] > 0.0
     assert 0.25 <= report["training"]["focal_alpha_effective"] <= 0.95
+    assert "high_confidence" in report["calibration"]["test"]
+    assert report["split_summary"]["purged_temporal_separation_ok"] is True
     assert report["dataset_summary"]["labeling_method"] == "episode_take_profit_time_barrier"
     assert "future_episode_total_spread_quantiles" in report["label_audit"]
 
@@ -611,6 +749,61 @@ def test_run_training_loop_saves_artifacts_and_beats_negative_baseline(tmp_path:
     assert "Unique pair overlap rate" in audit_text
 
 
+def test_threshold_preflight_selects_highest_threshold_that_passes_guardrails(tmp_path: Path):
+    state_path = _write_near_threshold_state(tmp_path / "tracker_state_near_threshold.json", count=15)
+
+    preflight = run_threshold_preflight(
+        state_file=state_path,
+        sequence_length=3,
+        prediction_horizon_sec=240,
+        thresholds=[1.0, 0.8, 0.7],
+        min_train_positive_samples=1,
+        min_val_positive_samples=1,
+        min_test_positive_samples=1,
+        output_path=tmp_path / "threshold_preflight.json",
+    )
+
+    assert preflight["selected_threshold"] == pytest.approx(0.8)
+    assert Path(preflight["output_path"]).is_file()
+    assert preflight["thresholds"]["1.0"]["guardrail_ok"] is False
+    assert preflight["thresholds"]["0.8"]["qualifies_for_training"] is True
+    assert "split_positive_rates" in preflight["thresholds"]["0.8"]
+
+
+def test_clean_training_cycle_archives_existing_artifacts_and_writes_preflight(tmp_path: Path):
+    json_state = _write_tracker_state(tmp_path / "tracker_state_clean_cycle.json")
+    payload = json.loads(json_state.read_text(encoding="utf-8"))
+    state_path = _write_tracker_sqlite(tmp_path / "tracker_history_clean_cycle.sqlite", payload["pairs"])
+    artifact_dir = tmp_path / "artifacts_clean_cycle"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir.joinpath("best_lstm_model.pth").write_bytes(b"legacy-model")
+    artifact_dir.joinpath("best_lstm_model.meta.json").write_text(json.dumps({"version": "legacy"}), encoding="utf-8")
+
+    report = run_clean_training_cycle(
+        state_file=state_path,
+        artifact_dir=artifact_dir,
+        sequence_length=4,
+        prediction_horizon_sec=240,
+        thresholds=[1.0, 0.8, 0.7],
+        hidden_size=8,
+        num_layers=1,
+        dropout=0.0,
+        batch_size=8,
+        max_epochs=3,
+        patience=2,
+        learning_rate=0.01,
+        min_train_positive_samples=1,
+        min_val_positive_samples=0,
+        min_test_positive_samples=0,
+    )
+
+    legacy_dir = artifact_dir / "legacy_artifacts"
+    assert report["preflight"]["selected_threshold"] in {1.0, 0.8, 0.7}
+    assert artifact_dir.joinpath("threshold_preflight.json").is_file()
+    assert legacy_dir.is_dir()
+    assert any(path.is_dir() for path in legacy_dir.iterdir())
+
+
 def test_run_training_loop_accepts_session_chronological_split(tmp_path: Path):
     sqlite_path = _write_multi_session_sqlite(tmp_path / "tracker_history_sessions.sqlite", num_sessions=4)
     artifact_dir = tmp_path / "artifacts_sessions"
@@ -634,6 +827,7 @@ def test_run_training_loop_accepts_session_chronological_split(tmp_path: Path):
 
     assert report["model_status"] == "trained"
     assert report["split_summary"]["split_mode"] == "session_chronological"
+    assert report["split_summary"]["split_mode_fallback_reason"] == ""
     assert report["dataset_summary"]["sessions_used"] == 4
     assert set(report["split_summary"]["train_session_ids"]).isdisjoint(report["split_summary"]["val_session_ids"])
     assert set(report["split_summary"]["train_session_ids"]).isdisjoint(report["split_summary"]["test_session_ids"])

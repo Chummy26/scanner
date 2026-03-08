@@ -21,6 +21,7 @@ FEATURE_NAMES = [
 ]
 
 _ROLLING_WINDOW = 5
+_SQLITE_BLOCK_FETCH_CHUNK = 500
 
 
 @dataclass(slots=True)
@@ -32,6 +33,7 @@ class DatasetBundle:
     block_ids: list[int]
     session_ids: list[int]
     timestamps: list[float]
+    label_end_timestamps: list[float]
     last_entries: list[float]
     feature_names: list[str]
     summary: dict[str, Any]
@@ -45,6 +47,7 @@ class DatasetBundle:
             block_ids=[self.block_ids[index] for index in indices],
             session_ids=[self.session_ids[index] for index in indices],
             timestamps=[self.timestamps[index] for index in indices],
+            label_end_timestamps=[self.label_end_timestamps[index] for index in indices],
             last_entries=[self.last_entries[index] for index in indices],
             feature_names=list(self.feature_names),
             summary={
@@ -52,6 +55,11 @@ class DatasetBundle:
                 "num_samples": len(indices),
                 "num_positive_samples": int(self.y_class[indices].sum().item()) if indices else 0,
                 "num_negative_samples": len(indices) - int(self.y_class[indices].sum().item()) if indices else 0,
+                "positive_rate": (
+                    float(self.y_class[indices].mean().item())
+                    if indices
+                    else 0.0
+                ),
                 "num_pairs": len({self.pair_ids[index] for index in indices}),
             },
         )
@@ -388,40 +396,44 @@ def _load_blocks_from_sqlite(
             block_ids.append(block_id)
             session_ids.add(int(row["session_id"]))
 
-        placeholders = ",".join("?" for _ in block_ids)
-        for row in conn.execute(
-            f"""
-            SELECT block_id, ts, entry_spread_pct, exit_spread_pct
-            FROM tracker_records
-            WHERE block_id IN ({placeholders})
-            ORDER BY block_id ASC, ts ASC
-            """,
-            block_ids,
-        ):
-            payload = blocks_by_id.get(int(row["block_id"]))
-            if payload is None:
+        for chunk_start in range(0, len(block_ids), _SQLITE_BLOCK_FETCH_CHUNK):
+            chunk_ids = block_ids[chunk_start : chunk_start + _SQLITE_BLOCK_FETCH_CHUNK]
+            if not chunk_ids:
                 continue
-            payload["records"].append(
-                {
-                    "ts": _coerce_float(row["ts"], 0.0),
-                    "entry": _coerce_float(row["entry_spread_pct"], 0.0),
-                    "exit": _coerce_float(row["exit_spread_pct"], 0.0),
-                }
-            )
+            placeholders = ",".join("?" for _ in chunk_ids)
+            for row in conn.execute(
+                f"""
+                SELECT block_id, ts, entry_spread_pct, exit_spread_pct
+                FROM tracker_records
+                WHERE block_id IN ({placeholders})
+                ORDER BY block_id ASC, ts ASC
+                """,
+                chunk_ids,
+            ):
+                payload = blocks_by_id.get(int(row["block_id"]))
+                if payload is None:
+                    continue
+                payload["records"].append(
+                    {
+                        "ts": _coerce_float(row["ts"], 0.0),
+                        "entry": _coerce_float(row["entry_spread_pct"], 0.0),
+                        "exit": _coerce_float(row["exit_spread_pct"], 0.0),
+                    }
+                )
 
-        for row in conn.execute(
-            f"""
-            SELECT block_id, ts
-            FROM tracker_events
-            WHERE event_type = 'inverted' AND block_id IN ({placeholders})
-            ORDER BY block_id ASC, ts ASC
-            """,
-            block_ids,
-        ):
-            payload = blocks_by_id.get(int(row["block_id"]))
-            if payload is None:
-                continue
-            payload["inverted_events"].append(_coerce_float(row["ts"], 0.0))
+            for row in conn.execute(
+                f"""
+                SELECT block_id, ts
+                FROM tracker_events
+                WHERE event_type = 'inverted' AND block_id IN ({placeholders})
+                ORDER BY block_id ASC, ts ASC
+                """,
+                chunk_ids,
+            ):
+                payload = blocks_by_id.get(int(row["block_id"]))
+                if payload is None:
+                    continue
+                payload["inverted_events"].append(_coerce_float(row["ts"], 0.0))
     finally:
         conn.close()
 
@@ -592,6 +604,7 @@ def build_dataset_bundle(
     block_ids: list[int] = []
     session_ids: list[int] = []
     timestamps: list[float] = []
+    label_end_timestamps: list[float] = []
     last_entries: list[float] = []
     state_path = Path(state_path)
     storage_kind = "json"
@@ -665,6 +678,7 @@ def build_dataset_bundle(
             block_ids.append(int(block.get("block_id") or 0))
             session_ids.append(normalized_session_id)
             timestamps.append(current_ts)
+            label_end_timestamps.append(float(current_ts) + float(prediction_horizon_sec))
             last_entries.append(window[-1]["entry_spread"])
 
             future_episode_total_spreads.extend(float(value) for value in label["future_episode_total_spreads"])
@@ -744,6 +758,7 @@ def build_dataset_bundle(
         block_ids=block_ids,
         session_ids=session_ids,
         timestamps=timestamps,
+        label_end_timestamps=label_end_timestamps,
         last_entries=last_entries,
         feature_names=list(FEATURE_NAMES),
         summary=summary,
@@ -776,15 +791,114 @@ def build_group_splits(
     train_ratio: float = 0.70,
     val_ratio: float = 0.15,
     test_ratio: float = 0.15,
+    *,
+    prediction_horizon_sec: int | None = None,
 ) -> dict[str, DatasetBundle]:
     if bundle.summary["num_samples"] == 0:
         empty = bundle.subset([], "empty")
         return {"train": empty, "val": empty, "test": empty}
+    horizon_sec = int(prediction_horizon_sec or bundle.summary.get("prediction_horizon_sec", 14_400))
+
+    def _pair_positive_lookup() -> dict[str, bool]:
+        pair_has_positive: dict[str, bool] = {}
+        for pair_id, label in zip(bundle.pair_ids, bundle.y_class.tolist()):
+            pair_has_positive[pair_id] = pair_has_positive.get(pair_id, False) or bool(label >= 0.5)
+        return pair_has_positive
+
+    def _next_start_after_horizon(ordered_indices: list[int]) -> list[int | None]:
+        result: list[int | None] = [None] * len(ordered_indices)
+        pointer = 0
+        ordered_timestamps = [float(bundle.timestamps[index]) for index in ordered_indices]
+        for idx, current_ts in enumerate(ordered_timestamps):
+            pointer = max(pointer, idx + 1)
+            while pointer < len(ordered_timestamps) and ordered_timestamps[pointer] < current_ts + horizon_sec:
+                pointer += 1
+            result[idx] = pointer if pointer < len(ordered_timestamps) else None
+        return result
+
+    def _attach_summary(
+        train_indices: list[int],
+        val_indices: list[int],
+        test_indices: list[int],
+        *,
+        split_mode: str,
+        embargo_samples: int,
+        fallback_reason: str,
+        train_session_ids: list[int] | None = None,
+        val_session_ids: list[int] | None = None,
+        test_session_ids: list[int] | None = None,
+    ) -> dict[str, DatasetBundle]:
+        train_bundle = bundle.subset(train_indices, "train")
+        val_bundle = bundle.subset(val_indices, "val")
+        test_bundle = bundle.subset(test_indices, "test")
+        split_pairs = {
+            "train": set(train_bundle.pair_ids),
+            "val": set(val_bundle.pair_ids),
+            "test": set(test_bundle.pair_ids),
+        }
+        pair_has_positive = _pair_positive_lookup()
+        overlap = len(split_pairs["train"] & split_pairs["val"])
+        overlap += len(split_pairs["train"] & split_pairs["test"])
+        overlap += len(split_pairs["val"] & split_pairs["test"])
+        train_end_label_ts = max(train_bundle.label_end_timestamps) if train_bundle.label_end_timestamps else 0.0
+        val_end_label_ts = max(val_bundle.label_end_timestamps) if val_bundle.label_end_timestamps else 0.0
+        val_start_ts = min(val_bundle.timestamps) if val_bundle.timestamps else 0.0
+        test_start_ts = min(test_bundle.timestamps) if test_bundle.timestamps else 0.0
+        min_cross_split_gap_sec = min(
+            max(0.0, val_start_ts - train_end_label_ts) if train_bundle.timestamps and val_bundle.timestamps else float("inf"),
+            max(0.0, test_start_ts - val_end_label_ts) if val_bundle.timestamps and test_bundle.timestamps else float("inf"),
+        )
+        if min_cross_split_gap_sec == float("inf"):
+            min_cross_split_gap_sec = 0.0
+        split_summary = {
+            "pair_overlap": overlap,
+            "train_pairs": len(split_pairs["train"]),
+            "val_pairs": len(split_pairs["val"]),
+            "test_pairs": len(split_pairs["test"]),
+            "train_positive_pairs": sum(1 for pid in split_pairs["train"] if pair_has_positive.get(pid, False)),
+            "val_positive_pairs": sum(1 for pid in split_pairs["val"] if pair_has_positive.get(pid, False)),
+            "test_positive_pairs": sum(1 for pid in split_pairs["test"] if pair_has_positive.get(pid, False)),
+            "train_negative_pairs": sum(1 for pid in split_pairs["train"] if not pair_has_positive.get(pid, False)),
+            "val_negative_pairs": sum(1 for pid in split_pairs["val"] if not pair_has_positive.get(pid, False)),
+            "test_negative_pairs": sum(1 for pid in split_pairs["test"] if not pair_has_positive.get(pid, False)),
+            "train_start_ts": min(train_bundle.timestamps) if train_bundle.timestamps else 0.0,
+            "train_end_ts": max(train_bundle.timestamps) if train_bundle.timestamps else 0.0,
+            "train_end_label_ts": train_end_label_ts,
+            "val_start_ts": val_start_ts,
+            "val_end_ts": max(val_bundle.timestamps) if val_bundle.timestamps else 0.0,
+            "val_end_label_ts": val_end_label_ts,
+            "test_start_ts": test_start_ts,
+            "test_end_ts": max(test_bundle.timestamps) if test_bundle.timestamps else 0.0,
+            "embargo_samples": int(embargo_samples),
+            "embargo_time_sec": int(horizon_sec),
+            "split_mode": split_mode,
+            "split_mode_fallback_reason": str(fallback_reason),
+            "train_session_ids": list(train_session_ids or []),
+            "val_session_ids": list(val_session_ids or []),
+            "test_session_ids": list(test_session_ids or []),
+            "purged_temporal_separation_ok": bool(
+                (not train_bundle.timestamps or not val_bundle.timestamps or train_end_label_ts <= val_start_ts)
+                and (not val_bundle.timestamps or not test_bundle.timestamps or val_end_label_ts <= test_start_ts)
+            ),
+            "min_cross_split_gap_sec": float(min_cross_split_gap_sec),
+            "global_temporal_order": bool(
+                (max(train_bundle.timestamps) if train_bundle.timestamps else 0.0) <= (min(val_bundle.timestamps) if val_bundle.timestamps else float("inf"))
+                and (max(val_bundle.timestamps) if val_bundle.timestamps else 0.0) <= (min(test_bundle.timestamps) if test_bundle.timestamps else float("inf"))
+            ),
+        }
+        for split_bundle in (train_bundle, val_bundle, test_bundle):
+            split_bundle.summary["split_summary"] = split_summary
+        return {"train": train_bundle, "val": val_bundle, "test": test_bundle}
 
     valid_session_ids = [int(session_id) for session_id in bundle.session_ids if int(session_id) > 0]
-    unique_sessions = sorted(set(valid_session_ids), key=lambda session_id: min(
-        bundle.timestamps[index] for index, candidate in enumerate(bundle.session_ids) if int(candidate) == session_id
-    )) if valid_session_ids else []
+    unique_sessions = sorted(
+        set(valid_session_ids),
+        key=lambda session_id: min(
+            bundle.timestamps[index]
+            for index, candidate in enumerate(bundle.session_ids)
+            if int(candidate) == session_id
+        ),
+    ) if valid_session_ids else []
     if len(unique_sessions) >= 3:
         session_to_indices: dict[int, list[int]] = {}
         for index, session_id in enumerate(bundle.session_ids):
@@ -797,135 +911,111 @@ def build_group_splits(
         val_sessions = unique_sessions[session_counts[0] : session_counts[0] + session_counts[1]]
         test_sessions = unique_sessions[session_counts[0] + session_counts[1] :]
         if train_sessions and val_sessions and test_sessions:
-            split_indices = {
-                "train": [index for session_id in train_sessions for index in session_to_indices.get(session_id, [])],
-                "val": [index for session_id in val_sessions for index in session_to_indices.get(session_id, [])],
-                "test": [index for session_id in test_sessions for index in session_to_indices.get(session_id, [])],
+            session_ranges = {
+                session_id: {
+                    "start_ts": min(bundle.timestamps[index] for index in session_to_indices.get(session_id, [])),
+                    "end_label_ts": max(bundle.label_end_timestamps[index] for index in session_to_indices.get(session_id, [])),
+                }
+                for session_id in unique_sessions
             }
-            train_bundle = bundle.subset(split_indices["train"], "train")
-            val_bundle = bundle.subset(split_indices["val"], "val")
-            test_bundle = bundle.subset(split_indices["test"], "test")
-            split_pairs = {
-                "train": set(train_bundle.pair_ids),
-                "val": set(val_bundle.pair_ids),
-                "test": set(test_bundle.pair_ids),
-            }
-            split_summary = {
-                "pair_overlap": len((split_pairs["train"] & split_pairs["val"]) | (split_pairs["train"] & split_pairs["test"]) | (split_pairs["val"] & split_pairs["test"])),
-                "train_pairs": len(split_pairs["train"]),
-                "val_pairs": len(split_pairs["val"]),
-                "test_pairs": len(split_pairs["test"]),
-                "train_positive_pairs": 0,
-                "val_positive_pairs": 0,
-                "test_positive_pairs": 0,
-                "train_negative_pairs": 0,
-                "val_negative_pairs": 0,
-                "test_negative_pairs": 0,
-                "train_start_ts": min(train_bundle.timestamps) if train_bundle.timestamps else 0.0,
-                "train_end_ts": max(train_bundle.timestamps) if train_bundle.timestamps else 0.0,
-                "val_start_ts": min(val_bundle.timestamps) if val_bundle.timestamps else 0.0,
-                "val_end_ts": max(val_bundle.timestamps) if val_bundle.timestamps else 0.0,
-                "test_start_ts": min(test_bundle.timestamps) if test_bundle.timestamps else 0.0,
-                "test_end_ts": max(test_bundle.timestamps) if test_bundle.timestamps else 0.0,
-                "embargo_samples": 0,
-                "split_mode": "session_chronological",
-                "train_session_ids": list(train_sessions),
-                "val_session_ids": list(val_sessions),
-                "test_session_ids": list(test_sessions),
-            }
-            pair_has_positive: dict[str, bool] = {}
-            for pair_id, label in zip(bundle.pair_ids, bundle.y_class.tolist()):
-                pair_has_positive[pair_id] = pair_has_positive.get(pair_id, False) or bool(label >= 0.5)
-            for split_name, pair_set in split_pairs.items():
-                split_summary[f"{split_name}_positive_pairs"] = sum(1 for pid in pair_set if pair_has_positive.get(pid, False))
-                split_summary[f"{split_name}_negative_pairs"] = sum(1 for pid in pair_set if not pair_has_positive.get(pid, False))
-            split_summary["global_temporal_order"] = bool(
-                split_summary["train_end_ts"] <= split_summary["val_start_ts"]
-                and split_summary["val_end_ts"] <= split_summary["test_start_ts"]
+            session_split_ok = bool(
+                session_ranges[train_sessions[-1]]["end_label_ts"] <= session_ranges[val_sessions[0]]["start_ts"]
+                and session_ranges[val_sessions[-1]]["end_label_ts"] <= session_ranges[test_sessions[0]]["start_ts"]
             )
-            train_bundle.summary["split_summary"] = split_summary
-            val_bundle.summary["split_summary"] = split_summary
-            test_bundle.summary["split_summary"] = split_summary
-            return {"train": train_bundle, "val": val_bundle, "test": test_bundle}
-
-    pair_has_positive: dict[str, bool] = {}
-    for pair_id, label in zip(bundle.pair_ids, bundle.y_class.tolist()):
-        pair_has_positive[pair_id] = pair_has_positive.get(pair_id, False) or bool(label >= 0.5)
+            if session_split_ok:
+                return _attach_summary(
+                    [index for session_id in train_sessions for index in session_to_indices.get(session_id, [])],
+                    [index for session_id in val_sessions for index in session_to_indices.get(session_id, [])],
+                    [index for session_id in test_sessions for index in session_to_indices.get(session_id, [])],
+                    split_mode="session_chronological",
+                    embargo_samples=0,
+                    fallback_reason="",
+                    train_session_ids=list(train_sessions),
+                    val_session_ids=list(val_sessions),
+                    test_session_ids=list(test_sessions),
+                )
+            session_fallback_reason = "session_gap_below_horizon"
+        else:
+            session_fallback_reason = "insufficient_session_groups"
+    else:
+        session_fallback_reason = "insufficient_sessions"
 
     ordered_indices = sorted(range(len(bundle.timestamps)), key=lambda index: (bundle.timestamps[index], index))
-    ratios = (train_ratio, val_ratio, test_ratio)
-    max_embargo = max(0, min(int(bundle.summary.get("sequence_length", 1)) - 1, max(0, (len(ordered_indices) - 3) // 2)))
-    chosen: tuple[int, int, int, int, int] | None = None
-    for embargo_samples in range(max_embargo, -1, -1):
-        effective_total = len(ordered_indices) - (2 * embargo_samples)
-        if effective_total < 3:
+    target_counts = _largest_remainder_counts(len(ordered_indices), (train_ratio, val_ratio, test_ratio))
+    next_start = _next_start_after_horizon(ordered_indices)
+    valid_val_end_positions = [index for index, candidate in enumerate(next_start) if candidate is not None]
+
+    chosen: tuple[int, int, int] | None = None
+    best_score: tuple[float, float, float, float] | None = None
+    for train_last_index, val_start in enumerate(next_start):
+        if val_start is None:
             continue
-        train_count, val_count, test_count = _largest_remainder_counts(effective_total, ratios)
-        train_end = train_count
-        val_start = train_end + embargo_samples
-        val_end = val_start + val_count
-        test_start = val_end + embargo_samples
-        if train_end <= 0 or val_end <= val_start or test_start >= len(ordered_indices):
+        train_count = train_last_index + 1
+        if train_count <= 0 or val_start >= len(ordered_indices) - 1:
             continue
-        chosen = (embargo_samples, train_end, val_start, val_end, test_start)
-        if test_count > 0:
-            break
+        target_val_last = min(len(ordered_indices) - 2, max(val_start, val_start + target_counts[1] - 1))
+        candidate_positions = sorted(
+            {
+                candidate
+                for candidate in (
+                    max(val_start, min(target_val_last, len(ordered_indices) - 2)),
+                    max(val_start, min(target_val_last - 1, len(ordered_indices) - 2)),
+                    max(val_start, min(target_val_last + 1, len(ordered_indices) - 2)),
+                )
+                if candidate < len(ordered_indices) - 1
+            }
+        )
+        candidate_positions.extend(
+            [
+                candidate
+                for candidate in valid_val_end_positions
+                if candidate >= val_start and candidate < len(ordered_indices) - 1 and candidate not in candidate_positions
+            ][:3]
+        )
+        for val_last_index in candidate_positions:
+            test_start = next_start[val_last_index]
+            if test_start is None:
+                continue
+            val_count = (val_last_index - val_start) + 1
+            test_count = len(ordered_indices) - test_start
+            if min(train_count, val_count, test_count) <= 0:
+                continue
+            embargo_samples = max(0, val_start - train_count) + max(0, test_start - (val_last_index + 1))
+            score = (
+                abs(train_count - target_counts[0]) + abs(val_count - target_counts[1]) + abs(test_count - target_counts[2]),
+                float(embargo_samples),
+                abs(float(bundle.timestamps[ordered_indices[val_start]]) - float(bundle.label_end_timestamps[ordered_indices[train_last_index]])),
+                abs(float(bundle.timestamps[ordered_indices[test_start]]) - float(bundle.label_end_timestamps[ordered_indices[val_last_index]])),
+            )
+            if best_score is None or score < best_score:
+                chosen = (train_last_index, val_start, val_last_index)
+                best_score = score
 
     if chosen is None:
-        counts = _largest_remainder_counts(len(ordered_indices), ratios)
+        counts = _largest_remainder_counts(len(ordered_indices), (train_ratio, val_ratio, test_ratio))
         train_end = counts[0]
         val_end = train_end + counts[1]
-        chosen = (0, train_end, train_end, val_end, val_end)
+        return _attach_summary(
+            ordered_indices[:train_end],
+            ordered_indices[train_end:val_end],
+            ordered_indices[val_end:],
+            split_mode="sample_chronological_purged",
+            embargo_samples=0,
+            fallback_reason=session_fallback_reason or "purging_failed",
+        )
 
-    embargo_samples, train_end, val_start, val_end, test_start = chosen
-    split_indices = {
-        "train": ordered_indices[:train_end],
-        "val": ordered_indices[val_start:val_end],
-        "test": ordered_indices[test_start:],
-    }
-    train_bundle = bundle.subset(split_indices["train"], "train")
-    val_bundle = bundle.subset(split_indices["val"], "val")
-    test_bundle = bundle.subset(split_indices["test"], "test")
-
-    split_pairs = {
-        "train": set(train_bundle.pair_ids),
-        "val": set(val_bundle.pair_ids),
-        "test": set(test_bundle.pair_ids),
-    }
-
-    overlap = len(split_pairs["train"] & split_pairs["val"])
-    overlap += len(split_pairs["train"] & split_pairs["test"])
-    overlap += len(split_pairs["val"] & split_pairs["test"])
-
-    split_summary = {
-        "pair_overlap": overlap,
-        "train_pairs": len(split_pairs["train"]),
-        "val_pairs": len(split_pairs["val"]),
-        "test_pairs": len(split_pairs["test"]),
-        "train_positive_pairs": sum(1 for pid in split_pairs["train"] if pair_has_positive.get(pid, False)),
-        "val_positive_pairs": sum(1 for pid in split_pairs["val"] if pair_has_positive.get(pid, False)),
-        "test_positive_pairs": sum(1 for pid in split_pairs["test"] if pair_has_positive.get(pid, False)),
-        "train_negative_pairs": sum(1 for pid in split_pairs["train"] if not pair_has_positive.get(pid, False)),
-        "val_negative_pairs": sum(1 for pid in split_pairs["val"] if not pair_has_positive.get(pid, False)),
-        "test_negative_pairs": sum(1 for pid in split_pairs["test"] if not pair_has_positive.get(pid, False)),
-        "train_start_ts": min(train_bundle.timestamps) if train_bundle.timestamps else 0.0,
-        "train_end_ts": max(train_bundle.timestamps) if train_bundle.timestamps else 0.0,
-        "val_start_ts": min(val_bundle.timestamps) if val_bundle.timestamps else 0.0,
-        "val_end_ts": max(val_bundle.timestamps) if val_bundle.timestamps else 0.0,
-        "test_start_ts": min(test_bundle.timestamps) if test_bundle.timestamps else 0.0,
-        "test_end_ts": max(test_bundle.timestamps) if test_bundle.timestamps else 0.0,
-        "embargo_samples": int(embargo_samples),
-        "split_mode": "sample_chronological",
-    }
-    split_summary["global_temporal_order"] = bool(
-        split_summary["train_end_ts"] <= split_summary["val_start_ts"]
-        and split_summary["val_end_ts"] <= split_summary["test_start_ts"]
+    train_last_index, val_start, val_last_index = chosen
+    test_start = next_start[val_last_index]
+    assert test_start is not None
+    embargo_samples = max(0, val_start - (train_last_index + 1)) + max(0, test_start - (val_last_index + 1))
+    return _attach_summary(
+        ordered_indices[: train_last_index + 1],
+        ordered_indices[val_start : val_last_index + 1],
+        ordered_indices[test_start:],
+        split_mode="sample_chronological_purged",
+        embargo_samples=embargo_samples,
+        fallback_reason=session_fallback_reason,
     )
-    train_bundle.summary["split_summary"] = split_summary
-    val_bundle.summary["split_summary"] = split_summary
-    test_bundle.summary["split_summary"] = split_summary
-
-    return {"train": train_bundle, "val": val_bundle, "test": test_bundle}
 
 
 def compute_feature_stats(X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

@@ -150,7 +150,7 @@ class SpreadEngine:
         """
         now = time.time()
         perf_started = time.perf_counter()
-        stale_threshold = 8.0  # Books older than 8s are unreliable for arbitrage
+        stale_threshold = 8.0  # Disconnected books older than 8s are unreliable for arbitrage
         notional_usd = float(getattr(self.config, "min_volume_usd", 0.0) or 0.0)
         min_spread = self.config.min_spread_pct
         max_spread = self.config.max_spread_pct
@@ -229,12 +229,29 @@ class SpreadEngine:
                 if sym in pending_dirty:
                     # Fresh data pending — keep opps as-is, don't age
                     continue
+                symbol_snapshots = self._snapshots.get(sym, {})
                 # Only age symbols that truly have no new data
                 kept: List[SpreadOpportunity] = []
                 for opp in opps:
                     opp.buy_book_age += elapsed
                     opp.sell_book_age += elapsed
                     opp.timestamp = now
+                    buy_snap = (
+                        symbol_snapshots.get(opp.buy_exchange, {})
+                        .get(opp.buy_market_type)
+                    )
+                    sell_snap = (
+                        symbol_snapshots.get(opp.sell_exchange, {})
+                        .get(opp.sell_market_type)
+                    )
+                    if (
+                        buy_snap is not None
+                        and sell_snap is not None
+                        and buy_snap.connected
+                        and sell_snap.connected
+                    ):
+                        kept.append(opp)
+                        continue
                     if opp.buy_book_age < stale_threshold and opp.sell_book_age < stale_threshold:
                         kept.append(opp)
                 if kept:
@@ -321,15 +338,11 @@ class SpreadEngine:
                 if not snap.is_valid():
                     continue
                 age = now - snap.timestamp
-                # Hard ceiling: no book older than stale_threshold
-                # is ever trusted (catches inactive symbols in active
-                # WS batches where _connected stays True).
-                if age >= stale_threshold:
-                    stale_n += 1
-                    continue
-                # Accelerated filter: disconnected books filtered at
-                # half the threshold (WS dropped, REST not recovering).
-                if not snap.connected and age >= stale_threshold * 0.5:
+                # Keep quiet books visible while the feed itself is still
+                # connected. Arbitrage opportunities should not disappear only
+                # because the market did not move for a while. Age-based
+                # pruning is only applied after connectivity is lost.
+                if not snap.connected and age >= stale_threshold:
                     stale_n += 1
                     continue
 

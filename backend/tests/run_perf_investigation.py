@@ -26,6 +26,44 @@ DEFAULT_ENDPOINTS = (
 )
 
 
+def resolve_tracker_db_path(output_dir: Path) -> Path:
+    return (output_dir / "tracker_history.sqlite").resolve()
+
+
+def browser_targets_for_scenario(base_url: str, scenario: str) -> list[tuple[str, str]]:
+    targets: list[tuple[str, str]] = []
+    if scenario in {"scanner_ui", "both_ui"}:
+        targets.append(("scanner", f"{base_url}/dashboards/scanner"))
+    if scenario in {"dashboard_ui", "both_ui"}:
+        targets.append(("dashboard", f"{base_url}/dashboard"))
+    return targets
+
+
+def build_browser_storage_state(base_url: str, token: str) -> dict[str, Any]:
+    return {
+        "origins": [
+            {
+                "origin": base_url.rstrip("/"),
+                "localStorage": [{"name": "authToken", "value": token}],
+            }
+        ]
+    }
+
+
+def issue_benchmark_auth_token(base_url: str, *, timeout_sec: int = 20) -> str:
+    body = json.dumps({"username": "benchmark", "password": "benchmark"}).encode("utf-8")
+    request = urllib.request.Request(
+        f"{base_url.rstrip('/')}/auth/login",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    token = str((payload or {}).get("token") or "")
+    return token
+
+
 def _append_ndjson(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
@@ -288,15 +326,50 @@ def _browser_sampler(base_url: str, scenario: str, sample_interval_sec: int, out
     async def _run() -> None:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True)
-            pages: list[tuple[str, Any, dict[str, int]]] = []
+            token = ""
             try:
-                targets = []
-                if scenario in {"scanner_ui", "both_ui"}:
-                    targets.append(("scanner", f"{base_url}/"))
-                if scenario in {"dashboard_ui", "both_ui"}:
-                    targets.append(("dashboard", f"{base_url}/dashboard"))
+                token = issue_benchmark_auth_token(base_url)
+            except Exception as exc:  # pragma: no cover - runtime-only path
+                _append_ndjson(
+                    output_path,
+                    {"timestamp": time.time(), "kind": "browser_auth_error", "error": str(exc)},
+                )
+            context = await browser.new_context(
+                storage_state=build_browser_storage_state(base_url, token) if token else None
+            )
+            pages: list[tuple[str, Any, dict[str, int]]] = []
+
+            async def _ensure_logged_in(page, target_url: str) -> None:
+                if "/login" not in page.url:
+                    return
+                await page.evaluate(
+                    """async () => {
+                        const response = await fetch("/auth/login", {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ username: "benchmark", password: "benchmark" }),
+                        });
+                        const payload = await response.json();
+                        window.localStorage.setItem("authToken", String(payload.token || ""));
+                    }"""
+                )
+                if page.url != target_url:
+                    await page.goto(target_url, wait_until="networkidle", timeout=60000)
+
+            try:
+                if token:
+                    bootstrap_page = await context.new_page()
+                    await bootstrap_page.goto(f"{base_url}/login", wait_until="domcontentloaded", timeout=60000)
+                    await bootstrap_page.evaluate(
+                        """(authToken) => {
+                            window.localStorage.setItem("authToken", authToken);
+                        }""",
+                        token,
+                    )
+                    await bootstrap_page.close()
+                targets = browser_targets_for_scenario(base_url, scenario)
                 for label, url in targets:
-                    page = await browser.new_page()
+                    page = await context.new_page()
                     counters = {"inflight": 0, "console_errors": 0, "page_errors": 0}
 
                     def _on_request(_request, _counters=counters):
@@ -318,6 +391,7 @@ def _browser_sampler(base_url: str, scenario: str, sample_interval_sec: int, out
                     page.on("console", _on_console)
                     page.on("pageerror", _on_page_error)
                     await page.goto(url, wait_until="networkidle", timeout=60000)
+                    await _ensure_logged_in(page, url)
                     pages.append((label, page, counters))
 
                 while not stop_event.is_set():
@@ -357,6 +431,7 @@ def _browser_sampler(base_url: str, scenario: str, sample_interval_sec: int, out
                         )
                     stop_event.wait(timeout=sample_interval_sec)
             finally:
+                await context.close()
                 await browser.close()
 
     import asyncio
@@ -390,6 +465,7 @@ def run_single_scenario(
     env["TEAM_OP_BIND"] = host
     env["TEAM_OP_MAX_SYMBOLS"] = str(int(max_symbols))
     env["TEAM_OP_SYMBOL_DISCOVERY_ENABLED"] = str(symbol_discovery_enabled)
+    env["TEAM_OP_TRACKER_DB_PATH"] = str(resolve_tracker_db_path(output_dir))
 
     if spawn_server:
         with log_path.open("wb") as log_handle:

@@ -17,9 +17,10 @@ try:
 except Exception:  # pragma: no cover
     psutil = None
 
+from .ml_analyzer import SpreadMLAnalyzer
 from .ml_dataset import build_dataset_bundle
 from .spread_tracker import SpreadRecord, build_recurring_context_from_episodes, compute_closed_episodes
-from .train_model import run_training_loop
+from .train_model import run_clean_training_cycle
 
 
 def _utc_now_iso() -> str:
@@ -713,77 +714,129 @@ def _build_context_coverage(events: list[dict[str, Any]], snapshot_path: Path | 
     }
 
 
-def _build_signal_confirmations(events: list[dict[str, Any]], snapshot_path: Path | None) -> dict[str, Any]:
-    signal_events = [event for event in events if str(event.get("kind") or "") == "signal"]
-    if snapshot_path is None or not snapshot_path.is_file() or snapshot_path.suffix.lower() != ".sqlite":
-        return {"summary": {"total": len(signal_events), "confirmable_now": 0, "confirmed": 0, "awaiting_confirmation": len(signal_events)}, "by_action": {}, "by_eta_alignment": {}, "signals": []}
+def _load_snapshot_histories(snapshot_path: Path) -> tuple[dict[str, list[dict[str, float]]], dict[str, float]]:
+    histories: dict[str, list[dict[str, float]]] = {}
+    pair_max_ts: dict[str, float] = {}
+    try:
+        with sqlite3.connect(snapshot_path, timeout=30.0) as conn:
+            conn.row_factory = sqlite3.Row
+            for row in conn.execute(
+                """
+                SELECT p.symbol, p.buy_ex, p.buy_mt, p.sell_ex, p.sell_mt,
+                       r.ts, r.entry_spread_pct, r.exit_spread_pct, r.session_id, r.block_id
+                FROM tracker_records r
+                JOIN tracker_pairs p ON p.id = r.pair_id
+                ORDER BY p.symbol, p.buy_ex, p.buy_mt, p.sell_ex, p.sell_mt, r.ts ASC
+                """
+            ):
+                pair_key = _pair_key_from_row(row)
+                record = {
+                    "timestamp": float(row["ts"] or 0.0),
+                    "entry_spread": float(row["entry_spread_pct"] or 0.0),
+                    "exit_spread": float(row["exit_spread_pct"] or 0.0),
+                    "session_id": int(row["session_id"] or 0),
+                    "block_id": int(row["block_id"] or 0),
+                }
+                histories.setdefault(pair_key, []).append(record)
+                pair_max_ts[pair_key] = float(record["timestamp"])
+    except sqlite3.Error:
+        return {}, {}
+    return histories, pair_max_ts
 
-    pair_to_id, pair_max_ts, _ = _load_snapshot_pair_maps(snapshot_path)
+
+def _load_snapshot_qualified_episodes(
+    snapshot_path: Path,
+    *,
+    min_total_spread_pct: float,
+) -> tuple[dict[str, list[Any]], dict[str, float]]:
+    histories, pair_max_ts = _load_snapshot_histories(snapshot_path)
+    qualified: dict[str, list[Any]] = {}
+    for pair_key, history in histories.items():
+        episodes = compute_closed_episodes(
+            [
+                SpreadRecord(
+                    timestamp=float(record["timestamp"]),
+                    entry_spread_pct=float(record["entry_spread"]),
+                    exit_spread_pct=float(record["exit_spread"]),
+                    session_id=int(record.get("session_id", 0) or 0),
+                    block_id=int(record.get("block_id", 0) or 0),
+                )
+                for record in history
+            ]
+        )
+        qualified[pair_key] = [
+            episode
+            for episode in episodes
+            if float(getattr(episode, "total_spread", 0.0) or 0.0) >= float(min_total_spread_pct or 0.0)
+        ]
+    return qualified, pair_max_ts
+
+
+def _confirm_signals_against_qualified_episodes(
+    signal_events: list[dict[str, Any]],
+    *,
+    qualified_episodes_by_pair: dict[str, list[Any]],
+    pair_max_ts: dict[str, float],
+) -> dict[str, Any]:
     by_action: dict[str, Counter[str]] = {}
     by_eta_alignment: dict[str, Counter[str]] = {}
     signals: list[dict[str, Any]] = []
     confirmed = 0
     confirmable = 0
     awaiting = 0
-    try:
-        with sqlite3.connect(snapshot_path, timeout=30.0) as conn:
-            conn.row_factory = sqlite3.Row
-            for event in signal_events:
-                pair_key = str(event.get("pair_key") or "")
-                signal_action = str(event.get("signal_action") or "WAIT")
-                eta_alignment = str(event.get("eta_alignment_status") or "unknown")
-                signal_ts = float(event.get("wall_ts") or 0.0)
-                display_eta = int(event.get("display_eta_seconds") or event.get("eta_seconds") or 0)
-                available_until_ts = float(pair_max_ts.get(pair_key, 0.0))
-                pair_id = pair_to_id.get(pair_key)
-                status = "awaiting_confirmation"
-                actual_duration_sec = None
-                confirmed_within_eta = False
-                if pair_id is not None and display_eta > 0 and available_until_ts >= signal_ts + display_eta:
-                    confirmable += 1
-                    row = conn.execute(
-                        """
-                        SELECT MIN(ts) AS first_inverted_ts
-                        FROM tracker_events
-                        WHERE pair_id = ? AND event_type = 'inverted' AND ts > ?
-                        """,
-                        (int(pair_id), float(signal_ts)),
-                    ).fetchone()
-                    first_inverted_ts = float(row["first_inverted_ts"] or 0.0) if row is not None else 0.0
-                    if first_inverted_ts > 0.0 and first_inverted_ts <= signal_ts + display_eta:
-                        status = "confirmed"
-                        confirmed += 1
-                        confirmed_within_eta = True
-                        actual_duration_sec = round(first_inverted_ts - signal_ts, 6)
-                    else:
-                        status = "not_confirmed"
-                else:
-                    awaiting += 1
-                by_action.setdefault(signal_action, Counter())[status] += 1
-                by_eta_alignment.setdefault(eta_alignment, Counter())[status] += 1
-                signals.append(
-                    {
-                        "pair_key": pair_key,
-                        "signal_action": signal_action,
-                        "signal_ts": signal_ts,
-                        "display_eta_seconds": display_eta,
-                        "model_eta_seconds": int(event.get("model_eta_seconds") or 0),
-                        "eta_alignment_status": eta_alignment,
-                        "status": status,
-                        "confirmed_within_eta": confirmed_within_eta,
-                        "actual_duration_sec": actual_duration_sec,
-                        "available_until_ts": available_until_ts,
-                        "range_status": str(event.get("range_status") or "unknown"),
-                        "range_window": str(event.get("range_window") or "none"),
-                        "recommended_entry_range": str(event.get("recommended_entry_range") or "--"),
-                        "recommended_exit_range": str(event.get("recommended_exit_range") or "--"),
-                        "current_entry": float(event.get("current_entry") or 0.0),
-                        "inversion_probability": float(event.get("inversion_probability") or 0.0),
-                        "context_strength": str(event.get("context_strength") or ""),
-                    }
-                )
-    except sqlite3.Error:
-        return {"summary": {"total": len(signal_events), "confirmable_now": 0, "confirmed": 0, "awaiting_confirmation": len(signal_events)}, "by_action": {}, "by_eta_alignment": {}, "signals": []}
+    for event in signal_events:
+        pair_key = str(event.get("pair_key") or "")
+        signal_action = str(event.get("signal_action") or "WAIT")
+        eta_alignment = str(event.get("eta_alignment_status") or "unknown")
+        signal_ts = float(event.get("wall_ts") or 0.0)
+        display_eta = int(event.get("display_eta_seconds") or event.get("eta_seconds") or 0)
+        available_until_ts = float(pair_max_ts.get(pair_key, 0.0))
+        status = "awaiting_confirmation"
+        actual_duration_sec = None
+        confirmed_within_eta = False
+        if display_eta > 0 and available_until_ts >= signal_ts + display_eta:
+            confirmable += 1
+            qualified_episodes = qualified_episodes_by_pair.get(pair_key, [])
+            first_episode = next(
+                (
+                    episode
+                    for episode in qualified_episodes
+                    if float(episode.end_ts) > signal_ts and float(episode.end_ts) <= signal_ts + display_eta
+                ),
+                None,
+            )
+            if first_episode is not None:
+                status = "confirmed"
+                confirmed += 1
+                confirmed_within_eta = True
+                actual_duration_sec = round(float(first_episode.end_ts) - signal_ts, 6)
+            else:
+                status = "not_confirmed"
+        else:
+            awaiting += 1
+        by_action.setdefault(signal_action, Counter())[status] += 1
+        by_eta_alignment.setdefault(eta_alignment, Counter())[status] += 1
+        signals.append(
+            {
+                "pair_key": pair_key,
+                "signal_action": signal_action,
+                "signal_ts": signal_ts,
+                "display_eta_seconds": display_eta,
+                "model_eta_seconds": int(event.get("model_eta_seconds") or 0),
+                "eta_alignment_status": eta_alignment,
+                "status": status,
+                "confirmed_within_eta": confirmed_within_eta,
+                "actual_duration_sec": actual_duration_sec,
+                "available_until_ts": available_until_ts,
+                "range_status": str(event.get("range_status") or "unknown"),
+                "range_window": str(event.get("range_window") or "none"),
+                "recommended_entry_range": str(event.get("recommended_entry_range") or "--"),
+                "recommended_exit_range": str(event.get("recommended_exit_range") or "--"),
+                "current_entry": float(event.get("current_entry") or 0.0),
+                "inversion_probability": float(event.get("inversion_probability") or 0.0),
+                "context_strength": str(event.get("context_strength") or ""),
+            }
+        )
     return {
         "summary": {
             "total": len(signal_events),
@@ -796,6 +849,29 @@ def _build_signal_confirmations(events: list[dict[str, Any]], snapshot_path: Pat
         "by_eta_alignment": {key: dict(value) for key, value in sorted(by_eta_alignment.items())},
         "signals": signals,
     }
+
+
+def _build_signal_confirmations(
+    events: list[dict[str, Any]],
+    snapshot_path: Path | None,
+    *,
+    min_total_spread_pct: float = 1.0,
+) -> dict[str, Any]:
+    signal_events = [event for event in events if str(event.get("kind") or "") == "signal"]
+    if snapshot_path is None or not snapshot_path.is_file() or snapshot_path.suffix.lower() != ".sqlite":
+        return {"summary": {"total": len(signal_events), "confirmable_now": 0, "confirmed": 0, "awaiting_confirmation": len(signal_events)}, "by_action": {}, "by_eta_alignment": {}, "signals": []}
+    try:
+        qualified_episodes_by_pair, pair_max_ts = _load_snapshot_qualified_episodes(
+            snapshot_path,
+            min_total_spread_pct=min_total_spread_pct,
+        )
+    except sqlite3.Error:
+        return {"summary": {"total": len(signal_events), "confirmable_now": 0, "confirmed": 0, "awaiting_confirmation": len(signal_events)}, "by_action": {}, "by_eta_alignment": {}, "signals": []}
+    return _confirm_signals_against_qualified_episodes(
+        signal_events,
+        qualified_episodes_by_pair=qualified_episodes_by_pair,
+        pair_max_ts=pair_max_ts,
+    )
 
 
 def _build_legacy_comparison(legacy_package_dir: Path | None) -> dict[str, Any]:
@@ -857,6 +933,209 @@ def _build_legacy_comparison(legacy_package_dir: Path | None) -> dict[str, Any]:
         "blocked_by_new_context": blocked_by_context,
         "still_context_ready": context_ready,
         "unresolved_signals": unresolved,
+    }
+
+
+def _training_threshold_from_report(training_report: dict[str, Any]) -> float:
+    for payload in (
+        training_report.get("preflight", {}),
+        training_report.get("artifact_metadata", {}).get("training_config", {}),
+        training_report.get("training_config", {}),
+    ):
+        value = payload.get("selected_threshold")
+        if value is None:
+            value = payload.get("min_total_spread_pct")
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if numeric > 0.0:
+            return numeric
+    return 1.0
+
+
+def _build_snapshot_retrain_readiness(snapshot_path: Path, *, min_total_spread_pct: float) -> dict[str, Any]:
+    qualified_episodes_by_pair, _ = _load_snapshot_qualified_episodes(
+        snapshot_path,
+        min_total_spread_pct=min_total_spread_pct,
+    )
+    qualified_episode_count = sum(len(episodes) for episodes in qualified_episodes_by_pair.values())
+    if qualified_episode_count >= 500:
+        status = "preferred_met"
+    elif qualified_episode_count >= 200:
+        status = "minimum_met"
+    else:
+        status = "below_minimum"
+    return {
+        "qualified_episode_count_at_threshold": int(qualified_episode_count),
+        "min_total_spread_pct": float(min_total_spread_pct),
+        "retrain_readiness_status": status,
+    }
+
+
+def _psi_value(observed: list[float], expected: list[float]) -> float:
+    epsilon = 1e-6
+    total = 0.0
+    for observed_value, expected_value in zip(observed, expected):
+        observed_safe = max(float(observed_value), epsilon)
+        expected_safe = max(float(expected_value), epsilon)
+        total += (observed_safe - expected_safe) * math.log(observed_safe / expected_safe)
+    return float(total)
+
+
+def _build_snapshot_psi_summary(
+    snapshot_path: Path,
+    *,
+    artifact_dir: Path,
+    sequence_length: int,
+    prediction_horizon_sec: int,
+) -> dict[str, Any]:
+    metadata_path = artifact_dir / "best_lstm_model.meta.json"
+    if not metadata_path.is_file():
+        return {"status": "unavailable", "reason": "artifact metadata missing"}
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"status": "unavailable", "reason": f"artifact metadata unreadable: {exc}"}
+    psi_reference = metadata.get("training_config", {}).get("psi_reference", {})
+    feature_bins = psi_reference.get("feature_bins", {})
+    min_samples_required = int(psi_reference.get("min_samples_required", 200) or 200)
+    if not feature_bins:
+        return {"status": "unavailable", "reason": "psi reference missing from metadata"}
+    bundle = build_dataset_bundle(
+        state_path=snapshot_path,
+        sequence_length=sequence_length,
+        prediction_horizon_sec=prediction_horizon_sec,
+        min_total_spread_pct=float(metadata.get("training_config", {}).get("min_total_spread_pct", 1.0) or 1.0),
+    )
+    if int(bundle.summary.get("num_samples", 0)) < min_samples_required:
+        return {
+            "status": "insufficient_samples",
+            "sample_count": int(bundle.summary.get("num_samples", 0)),
+            "min_samples_required": min_samples_required,
+            "features": {},
+        }
+    flattened = bundle.X.detach().cpu().numpy().reshape(-1, bundle.X.shape[-1])
+    feature_names = list(metadata.get("feature_names", []))
+    psi_by_feature: dict[str, Any] = {}
+    for feature_index, feature_name in enumerate(feature_names):
+        reference = feature_bins.get(feature_name)
+        if not isinstance(reference, dict):
+            continue
+        edges = [
+            -np.inf if edge is None and index == 0 else (np.inf if edge is None else float(edge))
+            for index, edge in enumerate(reference.get("bin_edges", []))
+        ]
+        expected = [float(value) for value in reference.get("expected_proportions", [])]
+        if len(edges) < 2 or len(expected) == 0:
+            continue
+        counts, _ = np.histogram(flattened[:, feature_index], bins=np.asarray(edges, dtype=float))
+        observed = (counts / max(int(counts.sum()), 1)).tolist()
+        psi_score = _psi_value(observed, expected)
+        if psi_score > 0.20:
+            status = "alert"
+        elif psi_score >= 0.10:
+            status = "investigate"
+        else:
+            status = "stable"
+        psi_by_feature[feature_name] = {
+            "psi": float(psi_score),
+            "status": status,
+        }
+    return {
+        "status": "ok",
+        "sample_count": int(bundle.summary.get("num_samples", 0)),
+        "min_samples_required": min_samples_required,
+        "features": psi_by_feature,
+    }
+
+
+def _build_snapshot_replay(
+    snapshot_path: Path,
+    *,
+    artifact_dir: Path,
+    min_total_spread_pct: float,
+) -> dict[str, Any]:
+    model_path = artifact_dir / "best_lstm_model.pth"
+    metadata_path = artifact_dir / "best_lstm_model.meta.json"
+    if not model_path.is_file() or not metadata_path.is_file():
+        return {"status": "unavailable", "reason": "artifact bundle missing"}
+    analyzer = SpreadMLAnalyzer(
+        artifact_dir=artifact_dir,
+        allow_stale_artifacts=True,
+        min_total_spread_pct=min_total_spread_pct,
+    )
+    if analyzer.model_status != "ready":
+        return {"status": "unavailable", "reason": analyzer.model_status}
+    histories, pair_max_ts = _load_snapshot_histories(snapshot_path)
+    qualified_episodes_by_pair, _ = _load_snapshot_qualified_episodes(
+        snapshot_path,
+        min_total_spread_pct=min_total_spread_pct,
+    )
+    raw_actionable_states: list[dict[str, Any]] = []
+    deduped_signals: list[dict[str, Any]] = []
+    max_repeated_action_streak_sec = 0.0
+    for pair_key, history in histories.items():
+        active_until_ts = 0.0
+        streak_start_ts: float | None = None
+        for index in range(max(analyzer.sequence_length, 4), len(history) + 1):
+            current_history = history[:index]
+            current_ts = float(current_history[-1]["timestamp"])
+            current_entry = float(current_history[-1]["entry_spread"])
+            result = analyzer.analyze_pair(current_entry, current_history, pair_key=pair_key) or {}
+            action = str(result.get("signal_action") or "WAIT")
+            if action not in {"EXECUTE", "STRONG_EXECUTE"}:
+                streak_start_ts = None
+                if current_ts > active_until_ts:
+                    active_until_ts = 0.0
+                continue
+            raw_state = {
+                "pair_key": pair_key,
+                "signal_action": action,
+                "wall_ts": current_ts,
+                "current_entry": current_entry,
+                "display_eta_seconds": int(result.get("display_eta_seconds") or result.get("eta_seconds") or 0),
+                "model_eta_seconds": int(result.get("model_eta_seconds") or 0),
+                "eta_alignment_status": str(result.get("eta_alignment_status") or "unknown"),
+                "range_status": str(result.get("range_status") or "unknown"),
+                "range_window": str(result.get("range_window") or "none"),
+                "recommended_entry_range": str(result.get("recommended_entry_range") or "--"),
+                "recommended_exit_range": str(result.get("recommended_exit_range") or "--"),
+                "inversion_probability": float(result.get("inversion_probability") or 0.0),
+                "context_strength": str(result.get("context_strength") or ""),
+            }
+            raw_actionable_states.append(raw_state)
+            if streak_start_ts is None:
+                streak_start_ts = current_ts
+            max_repeated_action_streak_sec = max(max_repeated_action_streak_sec, current_ts - streak_start_ts)
+            if current_ts > active_until_ts:
+                deduped_signals.append(dict(raw_state))
+                active_until_ts = current_ts + float(raw_state["display_eta_seconds"] or 0)
+
+    actionable_states_per_pair_per_hour: dict[str, float] = {}
+    for pair_key, history in histories.items():
+        if len(history) < 2:
+            actionable_states_per_pair_per_hour[pair_key] = 0.0
+            continue
+        state_count = sum(1 for state in raw_actionable_states if str(state.get("pair_key") or "") == pair_key)
+        elapsed_hours = max((float(history[-1]["timestamp"]) - float(history[0]["timestamp"])) / 3600.0, 1.0 / 3600.0)
+        actionable_states_per_pair_per_hour[pair_key] = float(state_count / elapsed_hours)
+
+    confirmations = _confirm_signals_against_qualified_episodes(
+        deduped_signals,
+        qualified_episodes_by_pair=qualified_episodes_by_pair,
+        pair_max_ts=pair_max_ts,
+    )
+    return {
+        "status": "ok",
+        "raw_actionable_state_count": len(raw_actionable_states),
+        "deduped_signal_count": len(deduped_signals),
+        "actionable_states_per_pair_per_hour": actionable_states_per_pair_per_hour,
+        "max_repeated_action_streak_sec": float(max_repeated_action_streak_sec),
+        "confirmation_summary": dict(confirmations.get("summary", {})),
+        "confirmations_by_action": dict(confirmations.get("by_action", {})),
+        "confirmations_by_eta_alignment": dict(confirmations.get("by_eta_alignment", {})),
+        "deduped_signals": deduped_signals,
     }
 
 
@@ -1230,7 +1509,7 @@ def finalize_runtime_audit_package(
     *,
     output_dir: Path,
     state_path: Path,
-    run_training_fn=run_training_loop,
+    run_training_fn=run_clean_training_cycle,
     duration_sec: int = 7_200,
     sequence_length: int = 15,
     prediction_horizon_sec: int = 14_400,
@@ -1252,6 +1531,7 @@ def finalize_runtime_audit_package(
     snapshot_path = output_root / snapshot_name
     training_root = output_root / "training_artifacts"
     training_root.mkdir(parents=True, exist_ok=True)
+    min_total_spread_pct = 1.0
     try:
         create_sqlite_snapshot(source_state, snapshot_path)
         dataset_bundle = build_dataset_bundle(
@@ -1267,6 +1547,7 @@ def finalize_runtime_audit_package(
             prediction_horizon_sec=prediction_horizon_sec,
             audit_output=training_root / "best_lstm_model.audit.md",
         )
+        min_total_spread_pct = _training_threshold_from_report(training_report if isinstance(training_report, dict) else {})
     except Exception as exc:
         dataset_summary = {
             "model_status": "dataset_failed",
@@ -1292,8 +1573,30 @@ def finalize_runtime_audit_package(
             "artifacts": {},
         }
 
-    signal_confirmations = _build_signal_confirmations(list(_iter_ndjson(output_root / "events.ndjson")), snapshot_path)
+    signal_confirmations = _build_signal_confirmations(
+        list(_iter_ndjson(output_root / "events.ndjson")),
+        snapshot_path,
+        min_total_spread_pct=min_total_spread_pct,
+    )
     _write_json(output_root / "signal_confirmations.json", signal_confirmations)
+    snapshot_replay = _build_snapshot_replay(
+        snapshot_path,
+        artifact_dir=training_root,
+        min_total_spread_pct=min_total_spread_pct,
+    )
+    snapshot_replay_path = _write_json(output_root / "snapshot_replay_report.json", snapshot_replay)
+    psi_monitoring = _build_snapshot_psi_summary(
+        snapshot_path,
+        artifact_dir=training_root,
+        sequence_length=sequence_length,
+        prediction_horizon_sec=prediction_horizon_sec,
+    )
+    _write_json(output_root / "psi_monitoring.json", psi_monitoring)
+    retrain_readiness = _build_snapshot_retrain_readiness(
+        snapshot_path,
+        min_total_spread_pct=min_total_spread_pct,
+    )
+    _write_json(output_root / "retrain_readiness.json", retrain_readiness)
     auxiliary_short_block_smoke = _build_auxiliary_short_block_smoke(
         snapshot_path=snapshot_path,
         output_root=output_root,
@@ -1315,6 +1618,14 @@ def finalize_runtime_audit_package(
     runtime_summary["duration_sec"] = int(duration_sec)
     runtime_summary["run_status"] = str(run_status)
     runtime_summary["signal_confirmation_summary"] = dict(signal_confirmations.get("summary", {}))
+    runtime_summary["snapshot_replay"] = {
+        "status": snapshot_replay.get("status", "unavailable"),
+        "raw_actionable_state_count": int(snapshot_replay.get("raw_actionable_state_count", 0)),
+        "deduped_signal_count": int(snapshot_replay.get("deduped_signal_count", 0)),
+        "confirmation_summary": dict(snapshot_replay.get("confirmation_summary", {})),
+    }
+    runtime_summary["psi_monitoring"] = psi_monitoring
+    runtime_summary["retrain_readiness"] = retrain_readiness
     summary_path = _write_json(output_root / "summary.json", runtime_summary)
     (output_root / "runtime_audit.md").write_text(build_runtime_markdown(runtime_summary), encoding="utf-8")
 
@@ -1347,6 +1658,7 @@ def finalize_runtime_audit_package(
         "sqlite_snapshot": str(snapshot_path),
         "dataset_summary_path": str(dataset_summary_path),
         "training_report_path": str(training_report_path),
+        "snapshot_replay_path": str(snapshot_replay_path),
         "manual_verification_path": str(manual_verification_path),
         "final_audit_path": str(final_audit_path),
     }

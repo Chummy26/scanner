@@ -82,6 +82,17 @@ class TrackerEpisode:
         return float(self.peak_entry_spread + self.exit_spread_at_close)
 
 
+@dataclass(slots=True)
+class TrackerBlockMeta:
+    session_id: int
+    start_ts: float
+    end_ts: float
+    record_count: int
+    max_gap_sec: float
+    boundary_reason: str
+    is_open: bool = True
+
+
 def _linear_percentile(values: Iterable[float], percentile: float) -> float:
     ordered = sorted(float(value) for value in values)
     if not ordered:
@@ -181,7 +192,7 @@ def compute_closed_episodes(records: Iterable[SpreadRecord]) -> list[TrackerEpis
         (
             record
             for record in records
-            if int(getattr(record, "block_id", 0) or 0) > 0
+            if int(getattr(record, "block_id", 0) or 0) != 0
         ),
         key=lambda item: (int(item.block_id), float(item.timestamp)),
     )
@@ -416,26 +427,44 @@ class PairStats:
     max_spread: float = float("-inf")
     avg_spread: float = 0.0
     _stats_dirty: bool = True
+    block_meta: Dict[int, TrackerBlockMeta] = field(default_factory=dict)
     episodes: Deque[TrackerEpisode] = field(default_factory=deque)
     _episodes_cache_valid: bool = False
 
-    def _prune_events(self, cutoff: float):
+    def _prune_events(self, cutoff: float) -> bool:
+        pruned = False
         while self.inverted_events and self.inverted_events[0].timestamp < cutoff:
             self.inverted_events.popleft()
+            pruned = True
         while self.entry_events and self.entry_events[0].timestamp < cutoff:
             self.entry_events.popleft()
+            pruned = True
         while self.exit_events and self.exit_events[0].timestamp < cutoff:
             self.exit_events.popleft()
+            pruned = True
+        return pruned
 
-    def _prune_records(self, cutoff: float):
+    def _prune_records(self, cutoff: float) -> bool:
+        pruned = False
         while self.records and self.records[0].timestamp < cutoff:
             self.records.popleft()
             self._stats_dirty = True
             self._episodes_cache_valid = False
+            pruned = True
+        return pruned
 
     def _prune_episodes(self, cutoff: float):
         while self.episodes and self.episodes[0].end_ts < cutoff:
             self.episodes.popleft()
+
+    def _prune_block_meta(self, cutoff: float):
+        stale_block_ids = [
+            int(block_id)
+            for block_id, meta in self.block_meta.items()
+            if (not meta.is_open) and float(meta.end_ts) < cutoff
+        ]
+        for block_id in stale_block_ids:
+            self.block_meta.pop(block_id, None)
 
     def _recompute_stats(self):
         if not self.records:
@@ -1035,21 +1064,20 @@ class SpreadTracker:
             current_blocks = []
             for stats in self._pairs.values():
                 if stats.current_session_id == self._active_session_id and stats.current_block_id:
+                    current_block_id = int(stats.current_block_id)
+                    self._close_current_block_locked(stats, finished_at)
+                    closed_meta = stats.block_meta.get(current_block_id)
                     current_blocks.append(
                         (
-                            stats.current_block_id,
-                            stats.current_block_end_ts or stats.current_block_start_ts,
-                            stats.current_block_record_count,
-                            stats.current_block_max_gap_sec,
+                            current_block_id,
+                            float(closed_meta.end_ts if closed_meta is not None else 0.0),
+                            int(closed_meta.record_count if closed_meta is not None else 0),
+                            float(closed_meta.max_gap_sec if closed_meta is not None else 0.0),
                         )
                     )
                     stats.current_session_id = 0
-                    stats.current_block_id = 0
-                    stats.current_block_start_ts = 0.0
-                    stats.current_block_end_ts = 0.0
-                    stats.current_block_record_count = 0
-                    stats.current_block_max_gap_sec = 0.0
-                    stats.current_block_boundary_reason = ""
+                elif stats.current_session_id == self._active_session_id:
+                    stats.current_session_id = 0
             active_session_id = self._active_session_id
             self._active_session_id = 0
 
@@ -1067,6 +1095,8 @@ class SpreadTracker:
                 max((float(block_end_ts) for _, block_end_ts, _, _ in current_blocks), default=0.0),
             )
             for block_id, end_ts, record_count, max_gap_sec in current_blocks:
+                if int(block_id) <= 0:
+                    continue
                 conn.execute(
                     """
                     UPDATE tracker_pair_blocks
@@ -1103,6 +1133,45 @@ class SpreadTracker:
             del self._pairs[key]
             self._deleted_pairs.add(key)
             self._dirty_pairs.discard(key)
+
+    @staticmethod
+    def _normalize_boundary_reason(boundary_reason: str) -> str:
+        normalized = str(boundary_reason or "initial")
+        return normalized if normalized in _BLOCK_BOUNDARY_REASONS else "initial"
+
+    def _set_current_block_locked(self, ps: PairStats, block_id: int, ts: float, boundary_reason: str, session_id: int):
+        normalized_reason = self._normalize_boundary_reason(boundary_reason)
+        ps.current_session_id = int(session_id)
+        ps.current_block_id = int(block_id)
+        ps.current_block_start_ts = float(ts)
+        ps.current_block_end_ts = float(ts)
+        ps.current_block_record_count = 0
+        ps.current_block_max_gap_sec = 0.0
+        ps.current_block_boundary_reason = normalized_reason
+        ps.block_meta[int(block_id)] = TrackerBlockMeta(
+            session_id=int(session_id),
+            start_ts=float(ts),
+            end_ts=float(ts),
+            record_count=0,
+            max_gap_sec=0.0,
+            boundary_reason=normalized_reason,
+            is_open=True,
+        )
+
+    @staticmethod
+    def _update_open_block_meta_locked(ps: PairStats):
+        if not ps.current_block_id:
+            return
+        meta = ps.block_meta.get(int(ps.current_block_id))
+        if meta is None:
+            return
+        meta.start_ts = float(ps.current_block_start_ts)
+        meta.end_ts = float(ps.current_block_end_ts)
+        meta.record_count = int(ps.current_block_record_count)
+        meta.max_gap_sec = float(ps.current_block_max_gap_sec)
+        meta.boundary_reason = str(ps.current_block_boundary_reason or meta.boundary_reason or "initial")
+        meta.session_id = int(ps.current_session_id or meta.session_id)
+        meta.is_open = True
 
     def _ensure_storage_pair_id_locked(self, key: PairKey, ps: PairStats) -> int:
         if ps.storage_pair_id:
@@ -1150,68 +1219,25 @@ class SpreadTracker:
         return ps.storage_pair_id
 
     def _create_block_locked(self, key: PairKey, ps: PairStats, ts: float, boundary_reason: str) -> int:
+        session_id = self._active_session_id or self._ephemeral_session_id
         if self.db_path is None:
-            block_id = self._ephemeral_block_id
-            self._ephemeral_block_id += 1
-            ps.current_session_id = self._active_session_id or self._ephemeral_session_id
-            ps.current_block_id = block_id
-            ps.current_block_start_ts = ts
-            ps.current_block_end_ts = ts
-            ps.current_block_record_count = 0
-            ps.current_block_max_gap_sec = 0.0
-            ps.current_block_boundary_reason = boundary_reason
-            return block_id
-
-        pair_storage_id = self._ensure_storage_pair_id_locked(key, ps)
-        now = time.time()
-        with self._connect() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO tracker_pair_blocks(
-                    pair_id, session_id, start_ts, end_ts, record_count, max_gap_sec, boundary_reason,
-                    selected_for_training, disabled_reason, manual_override, notes, is_open, created_at, updated_at
-                )
-                VALUES(?, ?, ?, ?, 0, 0.0, ?, 1, '', 0, '', 1, ?, ?)
-                """,
-                (
-                    pair_storage_id,
-                    self._active_session_id,
-                    ts,
-                    ts,
-                    boundary_reason if boundary_reason in _BLOCK_BOUNDARY_REASONS else "initial",
-                    now,
-                    now,
-                ),
-            )
-            block_id = int(cursor.lastrowid)
-        ps.current_session_id = self._active_session_id
-        ps.current_block_id = block_id
-        ps.current_block_start_ts = ts
-        ps.current_block_end_ts = ts
-        ps.current_block_record_count = 0
-        ps.current_block_max_gap_sec = 0.0
-        ps.current_block_boundary_reason = boundary_reason
-        return block_id
+            block_id = int(self._ephemeral_block_id)
+        else:
+            block_id = -int(self._ephemeral_block_id)
+        self._ephemeral_block_id += 1
+        self._set_current_block_locked(ps, block_id, ts, boundary_reason, session_id)
+        return int(block_id)
 
     def _close_current_block_locked(self, ps: PairStats, finished_at: float):
-        if not ps.current_block_id or self.db_path is None:
+        if not ps.current_block_id:
             return
-        end_ts = ps.current_block_end_ts or ps.current_block_start_ts or finished_at
-        with self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE tracker_pair_blocks
-                SET end_ts = ?, record_count = ?, max_gap_sec = ?, is_open = 0, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    end_ts,
-                    ps.current_block_record_count,
-                    ps.current_block_max_gap_sec,
-                    time.time(),
-                    ps.current_block_id,
-                ),
-            )
+        end_ts = float(ps.current_block_end_ts or ps.current_block_start_ts or finished_at)
+        meta = ps.block_meta.get(int(ps.current_block_id))
+        if meta is not None:
+            meta.end_ts = end_ts
+            meta.record_count = int(ps.current_block_record_count)
+            meta.max_gap_sec = float(ps.current_block_max_gap_sec)
+            meta.is_open = False
         ps.current_block_id = 0
         ps.current_block_start_ts = 0.0
         ps.current_block_end_ts = 0.0
@@ -1260,6 +1286,20 @@ class SpreadTracker:
             for record in ps.records
             if record.timestamp >= cutoff
         ]
+        blocks = [
+            {
+                "runtime_block_id": int(block_id),
+                "session_id": int(meta.session_id),
+                "start_ts": float(meta.start_ts),
+                "end_ts": float(meta.end_ts),
+                "record_count": int(meta.record_count),
+                "max_gap_sec": float(meta.max_gap_sec),
+                "boundary_reason": str(meta.boundary_reason or "initial"),
+                "is_open": bool(meta.is_open),
+            }
+            for block_id, meta in ps.block_meta.items()
+            if bool(meta.is_open) or float(meta.end_ts) >= cutoff
+        ]
         return {
             "key": key,
             "storage_pair_id": int(ps.storage_pair_id),
@@ -1271,6 +1311,7 @@ class SpreadTracker:
             "entry_events": ent,
             "exit_events": ext,
             "records": recs,
+            "blocks": blocks,
         }
 
     @staticmethod
@@ -1498,15 +1539,19 @@ class SpreadTracker:
         new_state = self._state(entry_v, exit_v)
         cutoff = ts - self.window_sec
         with self._lock:
+            pair_dirty = False
             if key not in self._pairs:
                 if self.max_pairs > 0 and len(self._pairs) >= self.max_pairs:
                     return
                 if self.track_enable_entry_spread_pct > 0 and entry_v < self.track_enable_entry_spread_pct:
                     return
+                pair_dirty = True
 
             ps = self._pairs[key]
             ps.last_seen_ts = ts
-            ps._prune_events(cutoff)
+            if ps._prune_events(cutoff):
+                pair_dirty = True
+            ps._prune_block_meta(cutoff)
             ps._prune_episodes(cutoff)
             event_session_id = self._active_session_id or ps.current_session_id or self._ephemeral_session_id
             event_block_id = ps.current_block_id if ps.history_enabled and ps.current_block_id else None
@@ -1514,17 +1559,24 @@ class SpreadTracker:
                 if ps.last_state in (-1, 1) and new_state != ps.last_state:
                     ps.inverted_events.append(TrackerEvent(ts, "inverted", event_session_id, event_block_id))
                     ps.last_crossover_ts = ts
+                    pair_dirty = True
                 if new_state == 1 and ps.last_state != 1:
                     ps.entry_events.append(TrackerEvent(ts, "entry", event_session_id, event_block_id))
+                    pair_dirty = True
                 if new_state == -1 and ps.last_state != -1:
                     ps.exit_events.append(TrackerEvent(ts, "exit", event_session_id, event_block_id))
-                ps.last_state = new_state
+                    pair_dirty = True
+                if ps.last_state != new_state:
+                    ps.last_state = new_state
+                    pair_dirty = True
 
             if (not ps.history_enabled) and (entry_v >= self.history_enable_entry_spread_pct):
                 ps.history_enabled = True
+                pair_dirty = True
 
             if ps.history_enabled and self.record_interval_sec >= 0:
-                ps._prune_records(cutoff)
+                if ps._prune_records(cutoff):
+                    pair_dirty = True
                 record_delta_sec = (ts - ps._last_record_ts) if ps._last_record_ts > 0.0 else 0.0
                 gap_detected = bool(ps._last_record_ts > 0.0 and record_delta_sec > self.gap_threshold_sec)
                 monotonic = bool(ps._last_record_ts <= 0.0 or ts > ps._last_record_ts)
@@ -1547,9 +1599,11 @@ class SpreadTracker:
                     )
                     ps.current_block_end_ts = ts
                     ps.current_block_record_count += 1
+                    self._update_open_block_meta_locked(ps)
                     ps._last_record_ts = ts
                     ps._stats_dirty = True
                     ps._episodes_cache_valid = False
+                    pair_dirty = True
                     if self.audit_collector is not None:
                         self.audit_collector.record_tracker_record(
                             pair_id=self._pair_id(key),
@@ -1584,8 +1638,10 @@ class SpreadTracker:
                         while len(ps.records) > self.max_records_per_pair:
                             ps.records.popleft()
                             ps._stats_dirty = True
+                            pair_dirty = True
 
-            self._mark_dirty(key)
+            if pair_dirty:
+                self._mark_dirty(key)
 
     def get_pair_stats_obj(self, symbol: str, buy_ex: str, buy_mt: str, sell_ex: str, sell_mt: str) -> Optional[PairStats]:
         key = self._pair_key(symbol, buy_ex, buy_mt, sell_ex, sell_mt)
@@ -1762,9 +1818,11 @@ class SpreadTracker:
                     continue
                 ps._prune_events(cutoff)
                 ps._prune_records(cutoff)
+                ps._prune_block_meta(cutoff)
                 snapshots.append(self._pair_snapshot(key, ps, cutoff))
 
         started_at = time.perf_counter()
+        snapshot_rebindings: list[tuple[PairKey, int, dict[int, int]]] = []
         try:
             with self._connect() as conn:
                 conn.execute("BEGIN")
@@ -1829,19 +1887,123 @@ class SpreadTracker:
                                 1 if snapshot["history_enabled"] else 0,
                                 storage_pair_id,
                             ),
-                        )
+                            )
                     conn.execute("DELETE FROM tracker_events WHERE pair_id = ?", (storage_pair_id,))
                     conn.execute("DELETE FROM tracker_records WHERE pair_id = ?", (storage_pair_id,))
+                    block_metadata = {
+                        int(item["runtime_block_id"]): {
+                            "session_id": int(item["session_id"]),
+                            "start_ts": float(item["start_ts"]),
+                            "end_ts": float(item["end_ts"]),
+                            "record_count": int(item["record_count"]),
+                            "max_gap_sec": float(item["max_gap_sec"]),
+                            "boundary_reason": self._normalize_boundary_reason(str(item["boundary_reason"])),
+                            "is_open": bool(item["is_open"]),
+                        }
+                        for item in snapshot.get("blocks", [])
+                    }
+                    grouped = self._group_records_by_block(records)
+                    current_block_ids = sorted({int(block_id) for block_id in grouped.keys()} | {int(block_id) for block_id in block_metadata.keys() if int(block_id) != 0})
+                    runtime_to_storage_block_id: dict[int, int] = {}
+                    for runtime_block_id in current_block_ids:
+                        block_group = grouped.get(int(runtime_block_id), {})
+                        block_meta = block_metadata.get(int(runtime_block_id), {})
+                        session_id = int(block_meta.get("session_id") or block_group.get("session_id") or self._active_session_id or 0)
+                        start_ts_value = float(block_group.get("start_ts", block_meta.get("start_ts", snapshot["last_seen_ts"])))
+                        end_ts_value = float(block_group.get("end_ts", block_meta.get("end_ts", start_ts_value)))
+                        record_count_value = int(block_group.get("record_count", block_meta.get("record_count", 0)))
+                        max_gap_value = float(block_group.get("max_gap_sec", block_meta.get("max_gap_sec", 0.0)))
+                        boundary_reason = self._normalize_boundary_reason(str(block_meta.get("boundary_reason", "initial")))
+                        is_open = 1 if bool(block_meta.get("is_open", False)) else 0
+                        if runtime_block_id > 0:
+                            conn.execute(
+                                """
+                                UPDATE tracker_pair_blocks
+                                SET session_id = ?, start_ts = ?, end_ts = ?, record_count = ?, max_gap_sec = ?,
+                                    boundary_reason = ?, is_open = ?, updated_at = ?
+                                WHERE id = ?
+                                """,
+                                (
+                                    session_id,
+                                    start_ts_value,
+                                    end_ts_value,
+                                    record_count_value,
+                                    max_gap_value,
+                                    boundary_reason,
+                                    is_open,
+                                    ts,
+                                    int(runtime_block_id),
+                                ),
+                            )
+                            runtime_to_storage_block_id[int(runtime_block_id)] = int(runtime_block_id)
+                        else:
+                            cursor = conn.execute(
+                                """
+                                INSERT INTO tracker_pair_blocks(
+                                    pair_id, session_id, start_ts, end_ts, record_count, max_gap_sec, boundary_reason,
+                                    selected_for_training, disabled_reason, manual_override, notes, is_open, created_at, updated_at
+                                )
+                                VALUES(?, ?, ?, ?, ?, ?, ?, 1, '', 0, '', ?, ?, ?)
+                                """,
+                                (
+                                    storage_pair_id,
+                                    session_id,
+                                    start_ts_value,
+                                    end_ts_value,
+                                    record_count_value,
+                                    max_gap_value,
+                                    boundary_reason,
+                                    is_open,
+                                    ts,
+                                    ts,
+                                ),
+                            )
+                            runtime_to_storage_block_id[int(runtime_block_id)] = int(cursor.lastrowid)
+                    mapped_inv = [
+                        (
+                            storage_pair_id,
+                            float(event_ts),
+                            int(session_id),
+                            int(runtime_to_storage_block_id.get(int(block_id), int(block_id))) if block_id is not None else None,
+                        )
+                        for event_ts, session_id, block_id in inv
+                    ]
+                    mapped_ent = [
+                        (
+                            storage_pair_id,
+                            float(event_ts),
+                            int(session_id),
+                            int(runtime_to_storage_block_id.get(int(block_id), int(block_id))) if block_id is not None else None,
+                        )
+                        for event_ts, session_id, block_id in ent
+                    ]
+                    mapped_ext = [
+                        (
+                            storage_pair_id,
+                            float(event_ts),
+                            int(session_id),
+                            int(runtime_to_storage_block_id.get(int(block_id), int(block_id))) if block_id is not None else None,
+                        )
+                        for event_ts, session_id, block_id in ext
+                    ]
+                    mapped_records = [
+                        (
+                            storage_pair_id,
+                            float(record[0]),
+                            float(record[1]),
+                            float(record[2]),
+                            int(record[3]),
+                            int(runtime_to_storage_block_id.get(int(record[4]), int(record[4]))),
+                        )
+                        for record in records
+                    ]
                     if inv:
                         conn.executemany(
                             """
                             INSERT INTO tracker_events(pair_id, event_type, ts, session_id, block_id)
                             VALUES(?, 'inverted', ?, ?, ?)
                             """,
-                            [
-                                (storage_pair_id, float(event_ts), int(session_id), int(block_id) if block_id is not None else None)
-                                for event_ts, session_id, block_id in inv
-                            ],
+                            mapped_inv,
                         )
                     if ent:
                         conn.executemany(
@@ -1849,10 +2011,7 @@ class SpreadTracker:
                             INSERT INTO tracker_events(pair_id, event_type, ts, session_id, block_id)
                             VALUES(?, 'entry', ?, ?, ?)
                             """,
-                            [
-                                (storage_pair_id, float(event_ts), int(session_id), int(block_id) if block_id is not None else None)
-                                for event_ts, session_id, block_id in ent
-                            ],
+                            mapped_ent,
                         )
                     if ext:
                         conn.executemany(
@@ -1860,10 +2019,7 @@ class SpreadTracker:
                             INSERT INTO tracker_events(pair_id, event_type, ts, session_id, block_id)
                             VALUES(?, 'exit', ?, ?, ?)
                             """,
-                            [
-                                (storage_pair_id, float(event_ts), int(session_id), int(block_id) if block_id is not None else None)
-                                for event_ts, session_id, block_id in ext
-                            ],
+                            mapped_ext,
                         )
                     if records:
                         conn.executemany(
@@ -1871,28 +2027,8 @@ class SpreadTracker:
                             INSERT INTO tracker_records(pair_id, ts, entry_spread_pct, exit_spread_pct, session_id, block_id)
                             VALUES(?, ?, ?, ?, ?, ?)
                             """,
-                            [
-                                (storage_pair_id, float(record[0]), float(record[1]), float(record[2]), int(record[3]), int(record[4]))
-                                for record in records
-                            ],
+                            mapped_records,
                         )
-                        grouped = self._group_records_by_block(records)
-                        for block_id, block_meta in grouped.items():
-                            conn.execute(
-                                """
-                                UPDATE tracker_pair_blocks
-                                SET start_ts = ?, end_ts = ?, record_count = ?, max_gap_sec = ?, updated_at = ?
-                                WHERE id = ?
-                                """,
-                                (
-                                    float(block_meta["start_ts"]),
-                                    float(block_meta["end_ts"]),
-                                    int(block_meta["record_count"]),
-                                    float(block_meta["max_gap_sec"]),
-                                    ts,
-                                    int(block_id),
-                                ),
-                            )
                     conn.execute(
                         """
                         DELETE FROM tracker_pair_blocks
@@ -1906,6 +2042,7 @@ class SpreadTracker:
                         (storage_pair_id, storage_pair_id),
                     )
                     self._rebuild_episodes_for_pair_conn(conn, storage_pair_id)
+                    snapshot_rebindings.append((key, storage_pair_id, runtime_to_storage_block_id))
                 self._last_flush_at = ts
                 self._write_meta(
                     conn,
@@ -1925,6 +2062,36 @@ class SpreadTracker:
             return False
 
         with self._lock:
+            for key, storage_pair_id, block_id_map in snapshot_rebindings:
+                ps = self._pairs.get(key)
+                if ps is None:
+                    continue
+                ps.storage_pair_id = int(storage_pair_id)
+                if block_id_map:
+                    for record in ps.records:
+                        mapped = block_id_map.get(int(record.block_id), int(record.block_id))
+                        record.block_id = int(mapped)
+                    for events in (ps.inverted_events, ps.entry_events, ps.exit_events):
+                        for event in events:
+                            if event.block_id is None:
+                                continue
+                            event.block_id = int(block_id_map.get(int(event.block_id), int(event.block_id)))
+                    for episode in ps.episodes:
+                        episode.block_id = int(block_id_map.get(int(episode.block_id), int(episode.block_id)))
+                    remapped_block_meta: Dict[int, TrackerBlockMeta] = {}
+                    for runtime_block_id, meta in ps.block_meta.items():
+                        storage_block_id = int(block_id_map.get(int(runtime_block_id), int(runtime_block_id)))
+                        existing = remapped_block_meta.get(storage_block_id)
+                        if existing is None:
+                            remapped_block_meta[storage_block_id] = meta
+                        else:
+                            existing.start_ts = min(existing.start_ts, meta.start_ts)
+                            existing.end_ts = max(existing.end_ts, meta.end_ts)
+                            existing.record_count = max(existing.record_count, meta.record_count)
+                            existing.max_gap_sec = max(existing.max_gap_sec, meta.max_gap_sec)
+                            existing.is_open = bool(existing.is_open or meta.is_open)
+                    ps.block_meta = remapped_block_meta
+                    ps.current_block_id = int(block_id_map.get(int(ps.current_block_id), int(ps.current_block_id))) if ps.current_block_id else 0
             if force:
                 self._dirty_pairs.clear()
             else:
@@ -3467,16 +3634,21 @@ class SpreadTracker:
                     exit_v = 0.0
                 new_state = self._state(entry_v, exit_v)
                 key = self._pair_key(symbol, buy_ex, buy_mt, sell_ex, sell_mt)
+                pair_dirty = False
                 if key not in self._pairs:
                     if pairs_at_cap:
                         continue
                     if track_gate > 0 and entry_v < track_gate:
                         continue
+                    pair_dirty = True
                 ps = self._pairs[key]
                 ps.last_seen_ts = ts
                 if key not in pruned:
-                    ps._prune_events(cutoff)
-                    ps._prune_records(cutoff)
+                    if ps._prune_events(cutoff):
+                        pair_dirty = True
+                    if ps._prune_records(cutoff):
+                        pair_dirty = True
+                    ps._prune_block_meta(cutoff)
                     pruned.add(key)
                 event_session_id = self._active_session_id or ps.current_session_id or self._ephemeral_session_id
                 event_block_id = ps.current_block_id if ps.history_enabled and ps.current_block_id else None
@@ -3484,13 +3656,19 @@ class SpreadTracker:
                     if ps.last_state in (-1, 1) and new_state != ps.last_state:
                         ps.inverted_events.append(TrackerEvent(ts, "inverted", event_session_id, event_block_id))
                         ps.last_crossover_ts = ts
+                        pair_dirty = True
                     if new_state == 1 and ps.last_state != 1:
                         ps.entry_events.append(TrackerEvent(ts, "entry", event_session_id, event_block_id))
+                        pair_dirty = True
                     if new_state == -1 and ps.last_state != -1:
                         ps.exit_events.append(TrackerEvent(ts, "exit", event_session_id, event_block_id))
-                    ps.last_state = new_state
+                        pair_dirty = True
+                    if ps.last_state != new_state:
+                        ps.last_state = new_state
+                        pair_dirty = True
                 if (not ps.history_enabled) and (entry_v >= hist_gate):
                     ps.history_enabled = True
+                    pair_dirty = True
                 if ps.history_enabled and rec_interval >= 0:
                     record_delta_sec = (ts - ps._last_record_ts) if ps._last_record_ts > 0.0 else 0.0
                     gap_detected = bool(ps._last_record_ts > 0.0 and record_delta_sec > self.gap_threshold_sec)
@@ -3511,8 +3689,11 @@ class SpreadTracker:
                         )
                         ps.current_block_end_ts = ts
                         ps.current_block_record_count += 1
+                        self._update_open_block_meta_locked(ps)
                         ps._last_record_ts = ts
                         ps._stats_dirty = True
+                        ps._episodes_cache_valid = False
+                        pair_dirty = True
                         if self.audit_collector is not None:
                             self.audit_collector.record_tracker_record(
                                 pair_id=self._pair_id(key),
@@ -3547,4 +3728,6 @@ class SpreadTracker:
                             while len(ps.records) > max_recs:
                                 ps.records.popleft()
                                 ps._stats_dirty = True
-                self._mark_dirty(key)
+                                pair_dirty = True
+                if pair_dirty:
+                    self._mark_dirty(key)

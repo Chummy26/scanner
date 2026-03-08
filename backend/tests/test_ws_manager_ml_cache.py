@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 from src.spread.models import SpreadConfig, SpreadOpportunity
@@ -137,3 +138,85 @@ def test_ws_manager_refreshes_prediction_when_tracker_marker_changes(tmp_path: P
 
     assert ws_mgr.tracker.history_calls == 2
     assert ws_mgr.ml_analyzer.predict_calls == 2
+
+
+def test_ws_manager_persist_loop_offloads_flush_to_thread(monkeypatch, tmp_path: Path):
+    config = SpreadConfig(exchanges=[], symbols=[], tracker_db_path=str(tmp_path / "tracker.sqlite"))
+    ws_mgr = WSManager(config)
+    flush_calls: list[str] = []
+    to_thread_calls: list[str] = []
+
+    class _ThreadTracker:
+        def flush_to_storage(self):
+            flush_calls.append("flush")
+            ws_mgr._running = False
+            return True
+
+    async def _fake_sleep(_seconds):
+        return None
+
+    async def _fake_to_thread(func, *args, **kwargs):
+        to_thread_calls.append(getattr(func, "__name__", "unknown"))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("src.spread.ws_manager.asyncio.sleep", _fake_sleep)
+    monkeypatch.setattr("src.spread.ws_manager.asyncio.to_thread", _fake_to_thread)
+
+    ws_mgr.tracker = _ThreadTracker()
+    ws_mgr._running = True
+    asyncio.run(ws_mgr._persist_loop())
+
+    assert flush_calls == ["flush"]
+    assert to_thread_calls == ["flush_to_storage"]
+
+
+def test_ws_manager_perf_state_uses_tracker_storage_pair_counts(tmp_path: Path):
+    config = SpreadConfig(exchanges=[], symbols=[], tracker_db_path=str(tmp_path / "tracker.sqlite"))
+    ws_mgr = WSManager(config)
+
+    class _TrackerWithStorageStats:
+        @staticmethod
+        def get_storage_stats():
+            return {
+                "pairs_in_memory": 17,
+                "pairs_persisted": 9,
+                "records_total": 123,
+                "episodes_total": 7,
+                "db_size_bytes": 4567,
+            }
+
+    ws_mgr.tracker = _TrackerWithStorageStats()
+    state = ws_mgr.get_perf_state()
+
+    assert state["tracker_pairs"] == 17
+    assert state["tracker_records_total"] == 123
+    assert state["tracker_episodes_total"] == 7
+    assert state["tracker_db_size_bytes"] == 4567
+
+
+def test_ws_manager_prunes_stale_ml_runtime_state_when_active_keys_shrink(tmp_path: Path):
+    config = SpreadConfig(exchanges=[], symbols=[], tracker_db_path=str(tmp_path / "tracker.sqlite"))
+    ws_mgr = WSManager(config)
+    stale_key = "BTC|mexc|spot|gate|futures"
+    active_key = "ETH|mexc|spot|gate|futures"
+    old_ts = 100.0
+
+    ws_mgr._ml_pending_refreshes[stale_key] = old_ts
+    ws_mgr._ml_pending_refreshes[active_key] = old_ts
+    ws_mgr._ml_cache[stale_key] = {
+        "last_seen_at": old_ts - (ws_mgr._ML_PREDICTION_MAX_AGE_SEC * 5.0),
+        "marker": {"history_points": 20},
+        "prediction": {"prediction_status": "ready"},
+    }
+    ws_mgr._ml_cache[active_key] = {
+        "last_seen_at": old_ts,
+        "marker": {"history_points": 20},
+        "prediction": {"prediction_status": "ready"},
+    }
+
+    ws_mgr._prune_ml_runtime_state({active_key}, now_ts=old_ts + 1.0)
+
+    assert stale_key not in ws_mgr._ml_pending_refreshes
+    assert active_key in ws_mgr._ml_pending_refreshes
+    assert stale_key not in ws_mgr._ml_cache
+    assert ws_mgr._ml_cache[active_key]["last_seen_at"] == old_ts + 1.0

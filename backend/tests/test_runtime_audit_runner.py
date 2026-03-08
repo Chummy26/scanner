@@ -197,6 +197,7 @@ def test_finalize_runtime_audit_package_creates_snapshot_and_reports(tmp_path: P
     assert Path(result["training_report_path"]).is_file()
     assert Path(result["manual_verification_path"]).is_file()
     assert Path(result["final_audit_path"]).is_file()
+    assert Path(result["snapshot_replay_path"]).is_file()
 
     dataset_summary = json.loads(Path(result["dataset_summary_path"]).read_text(encoding="utf-8"))
     assert dataset_summary["num_samples"] > 0
@@ -345,8 +346,44 @@ def test_finalize_runtime_audit_package_reports_context_coverage_and_signal_conf
     )
     pair = ("BTC", "mexc", "spot", "gate", "futures")
     base_ts = 1_700_000_000.0
-    entries = ([0.10, 0.11, 0.09, 0.10, 0.11, 0.26, 0.41, 0.18] * 4) + [0.08, 0.05, -0.04, -0.06, -0.05, -0.03]
-    exits = ([-0.08, -0.07, -0.08, -0.07, -0.06, -0.03, -0.01, 0.08] * 4) + [-0.04, -0.02, 0.06, 0.08, 0.09, 0.11]
+    entries_template = [
+        0.10,
+        0.12,
+        0.14,
+        0.18,
+        0.22,
+        0.45,
+        0.82,
+        1.05,
+        0.96,
+        0.60,
+        0.18,
+        -0.05,
+        -0.08,
+        -0.06,
+        -0.05,
+        -0.03,
+    ]
+    exits_template = [
+        -0.20,
+        -0.18,
+        -0.16,
+        -0.15,
+        -0.12,
+        -0.10,
+        -0.08,
+        -0.05,
+        -0.02,
+        0.04,
+        0.08,
+        0.12,
+        0.11,
+        0.10,
+        0.09,
+        0.08,
+    ]
+    entries = entries_template * 3
+    exits = exits_template * 3
     for index, (entry_spread, exit_spread) in enumerate(zip(entries, exits)):
         tracker.record_spread(*pair, entry_spread, exit_spread, now_ts=base_ts + (index * 15.0))
     tracker.flush_to_storage(now_ts=base_ts + (len(entries) * 15.0), force=True)
@@ -376,9 +413,9 @@ def test_finalize_runtime_audit_package_reports_context_coverage_and_signal_conf
         exit_core_range_min=-0.01,
         exit_core_range_max=0.08,
         inversion_probability=0.82,
-        display_eta_seconds=60,
-        model_eta_seconds=60,
-        wall_ts=base_ts + 450.0,
+        display_eta_seconds=120,
+        model_eta_seconds=120,
+        wall_ts=base_ts + 135.0,
     )
     collector.event(
         "signal",
@@ -390,14 +427,14 @@ def test_finalize_runtime_audit_package_reports_context_coverage_and_signal_conf
         recommended_exit_range="-0.01% à 0.08%",
         current_entry=0.41,
         inversion_probability=0.82,
-        eta_seconds=60,
-        display_eta_seconds=60,
-        model_eta_seconds=60,
+        eta_seconds=120,
+        display_eta_seconds=120,
+        model_eta_seconds=120,
         eta_alignment_status="aligned",
         context_strength="strong",
         entry_position_label="inside_core",
-            wall_ts=base_ts + 450.0,
-        )
+        wall_ts=base_ts + 135.0,
+    )
     collector.finalize()
     (audit_dir / "api_probe.ndjson").write_text(
         json.dumps(
@@ -430,6 +467,7 @@ def test_finalize_runtime_audit_package_reports_context_coverage_and_signal_conf
 
     summary = json.loads(Path(result["summary_path"]).read_text(encoding="utf-8"))
     confirmations = json.loads((audit_dir / "signal_confirmations.json").read_text(encoding="utf-8"))
+    replay = json.loads((audit_dir / "snapshot_replay_report.json").read_text(encoding="utf-8"))
 
     assert summary["context_coverage"]["eligible_ready_pairs"] == 1
     assert summary["context_coverage"]["ready_short_pairs"] == 1
@@ -438,3 +476,4 @@ def test_finalize_runtime_audit_package_reports_context_coverage_and_signal_conf
     assert confirmations["summary"]["confirmable_now"] == 1
     assert confirmations["summary"]["confirmed"] == 1
     assert confirmations["by_action"]["EXECUTE"]["confirmed"] == 1
+    assert replay["status"] in {"ok", "unavailable"}

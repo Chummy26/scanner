@@ -2351,8 +2351,8 @@ const tr = (e, a) => {
   ms = (e, a) => (typeof e == "function" ? e(a) : e),
   hs = (e) => Array.from(new Set(e)),
   fs = (e) => e === "SPOT-FUTURO" || e === "FUTURO-FUTURO",
-  rr = 5e3,
   Qe = 500,
+  rr = Qe,
   ps = 10,
   nr = (e) => {
     const a = Object.entries(e);
@@ -3582,8 +3582,17 @@ ${f}`;
               return;
             }
             E();
-            const ee = u.current;
-            ee && !j.getState().isPaused && ((u.current = null), I(ee));
+            u.current = null;
+            // Resync from an authoritative snapshot after the tab becomes
+            // visible again. While hidden we intentionally skip applying
+            // deltas to avoid heavy renders, so reconnecting guarantees that
+            // stale rows and missed removes do not accumulate in the client.
+            w();
+            d.current &&
+              d.current.readyState !== WebSocket.CLOSED &&
+              d.current.readyState !== WebSocket.CLOSING &&
+              F();
+            m.current = setTimeout(T, 150);
           };
         return (
           document.addEventListener("visibilitychange", L),
@@ -4270,7 +4279,7 @@ function ScannerDashboardPage() {
           if (U)
             try {
               const V = (
-                  await $e.get("http://localhost:8000/panels", {
+                  await $e.get(`${Xr.replace(/\/$/, "")}/panels`, {
                     headers: {
                       Authorization: `Bearer ${U}`,
                     },
@@ -4564,7 +4573,7 @@ function ScannerDashboardPage() {
         }
         L(i.pinKey);
         try {
-          const v = "http://localhost:8000",
+          const v = Xr.replace(/\/$/, ""),
             $ = (await Tt()).monitoring.globalMinLiquidity,
             U = $ && $ > 0 ? $ : 50,
             _ = (
@@ -4722,7 +4731,7 @@ function ScannerDashboardPage() {
     (async () => {
       Et(!0);
       try {
-        const k = "http://localhost:8000".replace(/\/$/, ""),
+        const k = Xr.replace(/\/$/, ""),
           [v, P] = await Promise.all([un(), fetch(`${k}/catalog/exchanges`)]),
           $ = (v.data || []).map((V) => {
             const q = String(V).trim().toUpperCase();

@@ -62,6 +62,9 @@ class WSManager:
         self._ml_cache: OrderedDict = OrderedDict()
         self._ML_CACHE_MAX = 2000
         self._ML_PREDICTION_MAX_AGE_SEC = 30.0
+        self._ML_REFRESHES_PER_CYCLE = 12
+        self._ML_REFRESH_BUDGET_MS = 75.0
+        self._ml_pending_refreshes: OrderedDict = OrderedDict()
         self._exchange_instances: Dict[str, BaseExchangeWS] = {}
         self._scanner_clients: Set[Any] = set()
         self._scanner_lite_clients: Set[Any] = set()
@@ -107,6 +110,81 @@ class WSManager:
             return True
         computed_at = float(cache_entry.get("computed_at", 0.0) or 0.0)
         return (now_ts - computed_at) >= self._ML_PREDICTION_MAX_AGE_SEC
+
+    def _drain_ml_prediction_queue(
+        self,
+        *,
+        now_ts: float,
+        record_started_at_by_key: Dict[Any, float],
+    ) -> tuple[float, float, int]:
+        history_fetch_ms = 0.0
+        ml_analyze_ms = 0.0
+        processed = 0
+        started = time.perf_counter()
+        while self._ml_pending_refreshes and processed < self._ML_REFRESHES_PER_CYCLE:
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            if processed > 0 and elapsed_ms >= self._ML_REFRESH_BUDGET_MS:
+                break
+            key, refresh_payload = self._ml_pending_refreshes.popitem(last=False)
+            _history_started = time.perf_counter()
+            history = self.tracker.get_history(
+                refresh_payload["symbol"],
+                refresh_payload["buy_exchange"],
+                refresh_payload["buy_market_type"],
+                refresh_payload["sell_exchange"],
+                refresh_payload["sell_market_type"],
+                limit=100,
+            )
+            history_fetch_ms += (time.perf_counter() - _history_started) * 1000.0
+            _ml_started = time.perf_counter()
+            prediction = self.ml_analyzer.predict_history(history)
+            ml_analyze_ms += (time.perf_counter() - _ml_started) * 1000.0
+            cache_entry = self._ml_cache.get(key) or {}
+            cache_entry["prediction"] = prediction
+            cache_entry["tracker_marker"] = refresh_payload["tracker_marker"]
+            cache_entry["computed_at"] = now_ts
+            self._ml_cache[key] = cache_entry
+            self._ml_cache.move_to_end(key)
+            if len(self._ml_cache) > self._ML_CACHE_MAX:
+                self._ml_cache.popitem(last=False)
+            if self.runtime_audit is not None and str(prediction.get("prediction_status") or "") == "ready":
+                rendered_ctx = self.ml_analyzer.render_prediction(
+                    float(refresh_payload["current_entry"]),
+                    prediction,
+                    pair_key=key,
+                )
+                cache_entry["context"] = rendered_ctx
+                cache_entry["rendered_at"] = now_ts
+                cache_entry["rendered_entry_spread"] = float(refresh_payload["current_entry"])
+                end_to_end_ms = None
+                started_at = record_started_at_by_key.get(key)
+                if started_at is not None:
+                    end_to_end_ms = (time.perf_counter() - started_at) * 1000.0
+                self.runtime_audit.record_inference(
+                    pair_id=self.tracker._pair_id(key),
+                    result=rendered_ctx,
+                    end_to_end_ms=end_to_end_ms,
+                )
+            processed += 1
+        return history_fetch_ms, ml_analyze_ms, processed
+
+    def _prune_ml_runtime_state(self, active_keys: Set[Any], *, now_ts: float) -> None:
+        if self._ml_pending_refreshes:
+            stale_pending = [key for key in self._ml_pending_refreshes.keys() if key not in active_keys]
+            for stale_key in stale_pending:
+                self._ml_pending_refreshes.pop(stale_key, None)
+        if not self._ml_cache:
+            return
+        stale_cache: List[Any] = []
+        for key, cache_entry in list(self._ml_cache.items()):
+            if key in active_keys:
+                cache_entry["last_seen_at"] = now_ts
+                continue
+            last_seen_at = float(cache_entry.get("last_seen_at", 0.0) or 0.0)
+            if last_seen_at <= 0.0 or (now_ts - last_seen_at) >= (self._ML_PREDICTION_MAX_AGE_SEC * 4.0):
+                stale_cache.append(key)
+        for stale_key in stale_cache:
+            self._ml_cache.pop(stale_key, None)
 
     def _build_scanner_lite_summary(self, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         spot_future = 0
@@ -437,11 +515,18 @@ class WSManager:
             pass
         return {
             "ml_cache_size": len(self._ml_cache),
+            "ml_refresh_queue_size": len(self._ml_pending_refreshes),
             "scanner_clients": len(self._scanner_clients),
             "scanner_lite_clients": len(self._scanner_lite_clients),
             "opportunities_cached": len(self._last_filtered_opps),
             "scanner_lite_rows": len(self._last_scanner_lite_rows),
-            "tracker_pairs": int(tracker_stats.get("pairs_tracked", 0) or 0),
+            "tracker_pairs": int(
+                tracker_stats.get(
+                    "pairs_in_memory",
+                    tracker_stats.get("pairs_persisted", tracker_stats.get("pairs_tracked", 0)),
+                )
+                or 0
+            ),
             "tracker_records_total": int(tracker_stats.get("records_total", 0) or 0),
             "tracker_episodes_total": int(tracker_stats.get("episodes_total", 0) or 0),
             "tracker_db_size_bytes": int(tracker_stats.get("db_size_bytes", 0) or 0),
@@ -529,26 +614,10 @@ class WSManager:
 
         # --- 1. Spread calculation ----------------------------------------
         _perf_started = time.perf_counter()
-        _records_batch = []
-        if on_spread_cb:
-            record_started_at_by_key = {}
-            def _collect_record(*args):
-                _records_batch.append(args)
-                key = self.tracker._pair_key(args[0], args[1], args[2], args[3], args[4])
-                record_started_at_by_key[key] = time.perf_counter()
-            calc_cb = _collect_record
-        else:
-            calc_cb = None
-            record_started_at_by_key = {}
-
-        opportunities = self.engine.calculate_all(on_spread=calc_cb)
+        record_started_at_by_key = {}
+        opportunities = self.engine.calculate_all(on_spread=None)
         _t_calc = time.time()
         _perf_after_calc = time.perf_counter()
-
-        # Batch-record all tracker data in one lock acquisition.
-        if _records_batch:
-            self.tracker.batch_record(_records_batch)
-        _perf_after_batch_record = time.perf_counter()
 
         now_ts = time.time()
 
@@ -601,15 +670,19 @@ class WSManager:
             self._enrich_tracker_cycle % self._ENRICH_TRACKER_EVERY == 0
             or tracker_cache is None
         )
+        pair_key = self.tracker._pair_key
+        opportunity_keys = [
+            pair_key(opp.asset, opp.buy_exchange, opp.buy_market_type,
+                     opp.sell_exchange, opp.sell_market_type)
+            for opp in opportunities
+        ]
+        active_keys = set(opportunity_keys)
 
         if refresh_tracker:
-            pair_key = self.tracker._pair_key
-            keys = [
-                pair_key(opp.asset, opp.buy_exchange, opp.buy_market_type,
-                         opp.sell_exchange, opp.sell_market_type)
-                for opp in opportunities
-            ]
-            tracker_cache = self.tracker.batch_enrich(keys, now_ts)
+            tracker_cache = self.tracker.batch_enrich(opportunity_keys, now_ts)
+            self._tracker_enrich_cache = tracker_cache
+        elif tracker_cache:
+            tracker_cache = {key: tracker_cache.get(key) for key in opportunity_keys}
             self._tracker_enrich_cache = tracker_cache
         _perf_after_tracker_enrich = time.perf_counter()
 
@@ -617,7 +690,6 @@ class WSManager:
         _ml_analyze_ms = 0.0
         _ml_render_ms = 0.0
         if tracker_cache:
-            pair_key = self.tracker._pair_key
             for opp in opportunities:
                 key = pair_key(opp.asset, opp.buy_exchange, opp.buy_market_type,
                                opp.sell_exchange, opp.sell_market_type)
@@ -631,51 +703,51 @@ class WSManager:
 
                 cache_entry = self._ml_cache.get(key)
                 if self._cache_prediction_is_stale(cache_entry, cached, now_ts=now_ts):
-                    _history_started = time.perf_counter()
-                    history = self.tracker.get_history(
-                        opp.asset, opp.buy_exchange, opp.buy_market_type,
-                        opp.sell_exchange, opp.sell_market_type, limit=100
-                    )
-                    _history_fetch_ms += (time.perf_counter() - _history_started) * 1000.0
-                    _ml_started = time.perf_counter()
-                    prediction = self.ml_analyzer.predict_history(history)
-                    _ml_analyze_ms += (time.perf_counter() - _ml_started) * 1000.0
-                    cache_entry = {
-                        "prediction": prediction,
+                    self._ml_pending_refreshes[key] = {
+                        "symbol": opp.asset,
+                        "buy_exchange": opp.buy_exchange,
+                        "buy_market_type": opp.buy_market_type,
+                        "sell_exchange": opp.sell_exchange,
+                        "sell_market_type": opp.sell_market_type,
+                        "current_entry": float(opp.entry_spread_pct),
                         "tracker_marker": self._tracker_marker_from_cache(cached),
-                        "computed_at": now_ts,
                     }
-                    self._ml_cache[key] = cache_entry
-                    self._ml_cache.move_to_end(key)
-                    if len(self._ml_cache) > self._ML_CACHE_MAX:
-                        self._ml_cache.popitem(last=False)
+                    self._ml_pending_refreshes.move_to_end(key)
 
-                if refresh_tracker and cache_entry and cache_entry.get("prediction") is not None:
-                    _render_started = time.perf_counter()
-                    rendered_ctx = self.ml_analyzer.render_prediction(
-                        opp.entry_spread_pct,
-                        cache_entry["prediction"],
-                        pair_key=key,
-                    )
-                    _ml_render_ms += (time.perf_counter() - _render_started) * 1000.0
-                    cache_entry["context"] = rendered_ctx
-                    cache_entry["rendered_at"] = now_ts
-                    cache_entry["rendered_entry_spread"] = float(opp.entry_spread_pct)
-                    if self.runtime_audit is not None and cache_entry.get("computed_at") == now_ts:
-                        end_to_end_ms = None
-                        started_at = record_started_at_by_key.get(key)
-                        if started_at is not None:
-                            end_to_end_ms = (time.perf_counter() - started_at) * 1000.0
-                        self.runtime_audit.record_inference(
-                            pair_id=self.tracker._pair_id(key),
-                            result=rendered_ctx,
-                            end_to_end_ms=end_to_end_ms,
+            drained_history_ms, drained_ml_ms, drained_predictions = self._drain_ml_prediction_queue(
+                now_ts=now_ts,
+                record_started_at_by_key=record_started_at_by_key,
+            )
+            _history_fetch_ms += drained_history_ms
+            _ml_analyze_ms += drained_ml_ms
+            for opp in opportunities:
+                key = pair_key(
+                    opp.asset,
+                    opp.buy_exchange,
+                    opp.buy_market_type,
+                    opp.sell_exchange,
+                    opp.sell_market_type,
+                )
+                cache_entry = self._ml_cache.get(key)
+                if cache_entry and cache_entry.get("prediction") is not None:
+                    rendered_at = float(cache_entry.get("rendered_at", 0.0) or 0.0)
+                    if refresh_tracker or rendered_at <= 0.0:
+                        _render_started = time.perf_counter()
+                        rendered_ctx = self.ml_analyzer.render_prediction(
+                            opp.entry_spread_pct,
+                            cache_entry["prediction"],
+                            pair_key=key,
                         )
-
-                if cache_entry and cache_entry.get("context") is not None:
-                    ctx = cache_entry["context"]
-                    opp.ml_context = ctx
-                    opp.ml_score = ctx.get("ml_score", 0)
+                        _ml_render_ms += (time.perf_counter() - _render_started) * 1000.0
+                        cache_entry["context"] = rendered_ctx
+                        cache_entry["rendered_at"] = now_ts
+                        cache_entry["rendered_entry_spread"] = float(opp.entry_spread_pct)
+                    if cache_entry.get("context") is not None:
+                        ctx = cache_entry["context"]
+                        opp.ml_context = ctx
+                        opp.ml_score = ctx.get("ml_score", 0)
+        self._prune_ml_runtime_state(active_keys, now_ts=now_ts)
+        _perf_after_ml = time.perf_counter()
 
         # --- 4. Clamp + filter --------------------------------------------
         for opp in opportunities:
@@ -698,6 +770,26 @@ class WSManager:
             ]
         _perf_after_filter = time.perf_counter()
 
+        # Batch-record only the filtered operational opportunities.
+        _records_batch = []
+        if on_spread_cb:
+            for opp in opportunities:
+                record = (
+                    opp.asset,
+                    opp.buy_exchange,
+                    opp.buy_market_type,
+                    opp.sell_exchange,
+                    opp.sell_market_type,
+                    opp.entry_spread_pct,
+                    opp.exit_spread_pct,
+                )
+                _records_batch.append(record)
+                key = self.tracker._pair_key(*record[:5])
+                record_started_at_by_key[key] = time.perf_counter()
+        if _records_batch:
+            self.tracker.batch_record(_records_batch, now_ts=now_ts)
+        _perf_after_batch_record = time.perf_counter()
+
         self._refresh_scanner_lite_state(opportunities)
         _perf_after_lite_refresh = time.perf_counter()
 
@@ -713,19 +805,21 @@ class WSManager:
                 {
                     "total_ms": round((_perf_after_lite_refresh - _perf_started) * 1000.0, 6),
                     "calculate_ms": round((_perf_after_calc - _perf_started) * 1000.0, 6),
-                    "batch_record_ms": round((_perf_after_batch_record - _perf_after_calc) * 1000.0, 6),
-                    "market_enrich_ms": round((_perf_after_market_enrich - _perf_after_batch_record) * 1000.0, 6),
+                    "market_enrich_ms": round((_perf_after_market_enrich - _perf_after_calc) * 1000.0, 6),
                     "tracker_enrich_ms": round((_perf_after_tracker_enrich - _perf_after_market_enrich) * 1000.0, 6),
+                    "filter_ms": round((_perf_after_filter - _perf_after_ml) * 1000.0, 6),
+                    "batch_record_ms": round((_perf_after_batch_record - _perf_after_filter) * 1000.0, 6),
                     "history_fetch_ms": round(_history_fetch_ms, 6),
                     "ml_analyze_ms": round(_ml_analyze_ms, 6),
                     "ml_render_ms": round(_ml_render_ms, 6),
-                    "filter_ms": round((_perf_after_filter - _perf_after_tracker_enrich) * 1000.0, 6),
-                    "lite_refresh_ms": round((_perf_after_lite_refresh - _perf_after_filter) * 1000.0, 6),
+                    "lite_refresh_ms": round((_perf_after_lite_refresh - _perf_after_batch_record) * 1000.0, 6),
                     "opportunities_before_filter": len(self.engine._opportunities),
                     "opportunities_after_filter": len(opportunities),
                     "refresh_tracker": bool(refresh_tracker),
                     "tracker_cache_size": len(tracker_cache or {}),
                     "ml_cache_size": len(self._ml_cache),
+                    "ml_refresh_queue_size": len(self._ml_pending_refreshes),
+                    "ml_predictions_drained": int(drained_predictions if tracker_cache else 0),
                 }
             )
         return opportunities
@@ -986,7 +1080,7 @@ class WSManager:
         while self._running:
             await asyncio.sleep(60)
             try:
-                self.tracker.prune()
+                await asyncio.to_thread(self.tracker.prune)
             except Exception as e:
                 logger.error(f"[WSManager] Prune error: {e}")
 
@@ -996,7 +1090,7 @@ class WSManager:
             await asyncio.sleep(60)
             try:
                 started = time.perf_counter()
-                self.tracker.flush_to_storage()
+                await asyncio.to_thread(self.tracker.flush_to_storage)
                 logger.debug("[WSManager] Tracker SQLite flushed")
                 if self.perf_monitor is not None:
                     self.perf_monitor.record_cache_state(

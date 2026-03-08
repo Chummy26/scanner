@@ -353,3 +353,103 @@ def test_tracker_excludes_open_episode_from_recurring_context(tmp_path: Path):
     assert all(episode["is_closed"] is True for episode in episodes)
     assert context["empirical_support_short"] == 2
     assert context["range_status"] == "ready_short"
+
+
+def test_tracker_does_not_mark_pair_dirty_when_no_persistable_state_changed(tmp_path: Path):
+    db_path = tmp_path / "tracker_history.sqlite"
+    tracker = SpreadTracker(
+        window_sec=24 * 60 * 60,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=db_path,
+        gap_threshold_sec=120.0,
+    )
+
+    pair = ("BTC", "mexc", "spot", "gate", "futures")
+    tracker.record_spread(*pair, 0.50, -0.20, now_ts=0.0)
+    assert tracker._dirty_pairs
+    assert tracker.flush_to_storage(now_ts=0.0, force=True)
+    assert not tracker._dirty_pairs
+
+    tracker.record_spread(*pair, 0.50, -0.20, now_ts=5.0)
+
+    assert not tracker._dirty_pairs
+    assert tracker.get_storage_stats()["records_total"] == 1
+
+
+def test_tracker_record_spread_hot_path_does_not_touch_sqlite_until_flush(tmp_path: Path, monkeypatch):
+    db_path = tmp_path / "tracker_history.sqlite"
+    tracker = SpreadTracker(
+        window_sec=24 * 60 * 60,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=db_path,
+        gap_threshold_sec=45.0,
+    )
+
+    pair = ("BTC", "mexc", "spot", "gate", "futures")
+    real_connect = tracker._connect
+
+    def _fail_connect():
+        raise AssertionError("hot path touched sqlite")
+
+    monkeypatch.setattr(tracker, "_connect", _fail_connect)
+    tracker.record_spread(*pair, 0.42, -0.20, now_ts=0.0)
+    tracker.record_spread(*pair, 0.47, -0.16, now_ts=15.0)
+    tracker.record_spread(*pair, 0.55, -0.08, now_ts=90.0)
+
+    stats = tracker.get_pair_stats(*pair)
+    assert stats is not None
+    assert stats["record_count"] == 3
+
+    monkeypatch.setattr(tracker, "_connect", real_connect)
+    assert tracker.flush_to_storage(now_ts=90.0, force=True)
+    tracker.close_active_session(ended_at=90.0)
+
+    listing = tracker.list_training_blocks()
+    assert listing["summary"]["total_blocks"] == 2
+    assert listing["sessions"][0]["blocks"][0]["boundary_reason"] == "initial"
+    assert listing["sessions"][0]["blocks"][1]["boundary_reason"] == "auto_gap"
+
+
+def test_tracker_batch_record_flush_materializes_runtime_block_ids(tmp_path: Path):
+    db_path = tmp_path / "tracker_history.sqlite"
+    tracker = SpreadTracker(
+        window_sec=24 * 60 * 60,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=db_path,
+        gap_threshold_sec=45.0,
+    )
+
+    pair = ("ETH", "mexc", "spot", "gate", "futures")
+    tracker.batch_record([(*pair, 0.44, -0.20)], now_ts=0.0)
+    tracker.batch_record([(*pair, 0.49, -0.15)], now_ts=15.0)
+    tracker.batch_record([(*pair, 0.58, -0.08)], now_ts=90.0)
+
+    stats = tracker.get_pair_stats_obj(*pair)
+    assert stats is not None
+    pre_flush_block_ids = {record.block_id for record in stats.records}
+    assert all(block_id < 0 for block_id in pre_flush_block_ids)
+
+    assert tracker.flush_to_storage(now_ts=90.0, force=True)
+
+    stats = tracker.get_pair_stats_obj(*pair)
+    assert stats is not None
+    post_flush_block_ids = {record.block_id for record in stats.records}
+    assert all(block_id > 0 for block_id in post_flush_block_ids)
+    assert stats.current_block_id > 0
+
+    tracker.close_active_session(ended_at=90.0)
+    storage = tracker.get_storage_stats()
+    assert storage["records_total"] == 3
+    assert storage["blocks_total"] == 2
