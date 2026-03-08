@@ -1,0 +1,55 @@
+{
+  "interval_hours_default": 8,
+  "interval_hours_by_exchange": {
+    "mexc": 8,
+    "bingx": 8
+  },
+  "rate_unit_overrides": {},
+  "assume_pct_between_0_1": true,
+  "rate_unit_default": null,
+  "costs": {
+    "default": {
+      "taker_fee_bps_open": 4,
+      "taker_fee_bps_close": 4,
+      "slippage_bps_open": 2,
+      "slippage_bps_close": 2
+    },
+    "by_exchange": {
+      "mexc": {
+        "taker_fee_bps_open": 4,
+        "taker_fee_bps_close": 4
+      },
+      "bingx": {
+        "taker_fee_bps_open": 5,
+        "taker_fee_bps_close": 5
+      },
+      "gate": {
+        "taker_fee_bps_open": 5,
+        "taker_fee_bps_close": 5
+      },
+      "kucoin": {
+        "taker_fee_bps_open": 6,
+        "taker_fee_bps_close": 6
+      },
+      "bitget": {
+        "taker_fee_bps_open": 6,
+        "taker_fee_bps_close": 6
+      },
+      "xt": {
+        "taker_fee_bps_open": 5,
+        "taker_fee_bps_close": 5
+      }
+    }
+  },
+  "cost_amortization_hours": 1,
+  "debug_top_n": 50,
+  "validation": {
+    "enabled": true,
+    "min_interval_hours": 0.25,
+    "max_interval_hours": 24,
+    "max_abs_rate_frac": 1.0,
+    "max_abs_rate_per_hour_frac": 0.25,
+    "max_future_seconds": 3600,
+    "max_age_hours": null
+  }
+}

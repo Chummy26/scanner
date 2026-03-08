@@ -1,0 +1,1169 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import math
+import time as _time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    brier_score_loss,
+    confusion_matrix,
+    f1_score,
+    log_loss,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from torch.utils.data import DataLoader, TensorDataset
+
+from .ml_dataset import (
+    DatasetBundle,
+    build_dataset_bundle,
+    build_group_splits,
+    compute_feature_stats,
+    normalize_features,
+)
+from .ml_model import (
+    ARTIFACT_BASENAME,
+    ModelArtifactMetadata,
+    SpreadSequenceLSTM,
+    current_feature_schema_hash,
+    get_artifact_paths,
+    get_default_artifact_dir,
+    save_artifact_bundle,
+)
+
+logger = logging.getLogger("ml_trainer")
+
+
+def _make_loader(bundle: DatasetBundle, batch_size: int, shuffle: bool) -> DataLoader:
+    effective_batch = max(1, min(int(batch_size), max(1, bundle.summary["num_samples"])))
+    dataset = TensorDataset(bundle.X, bundle.y_class, bundle.y_eta)
+    return DataLoader(dataset, batch_size=effective_batch, shuffle=shuffle)
+
+
+def _eta_loss(
+    criterion: nn.SmoothL1Loss,
+    eta_raw: torch.Tensor,
+    target_eta_seconds: torch.Tensor,
+    target_class: torch.Tensor,
+) -> torch.Tensor:
+    mask = target_class > 0.5
+    if not torch.any(mask):
+        return eta_raw.new_tensor(0.0)
+    target = torch.log1p(target_eta_seconds[mask])
+    pred = eta_raw.squeeze(1)[mask]
+    return criterion(pred, target)
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        bce = nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        probs = torch.sigmoid(logits)
+        pt = targets * probs + (1 - targets) * (1 - probs)
+        alpha_t = targets * self.alpha + (1 - targets) * (1 - self.alpha)
+        focal_weight = alpha_t * (1 - pt) ** self.gamma
+        return (focal_weight * bce).mean()
+
+
+def _apply_platt_scaling(logits: np.ndarray, scale: float, bias: float) -> np.ndarray:
+    calibrated = 1.0 / (1.0 + np.exp(-(logits * scale + bias)))
+    return np.clip(calibrated, 1e-6, 1.0 - 1e-6)
+
+
+def _fit_platt_scaler(logits: np.ndarray, labels: np.ndarray) -> tuple[float, float]:
+    if logits.size == 0 or len(np.unique(labels)) < 2:
+        return 1.0, 0.0
+    model = LogisticRegression(solver="lbfgs", random_state=42, max_iter=200)
+    model.fit(logits.reshape(-1, 1), labels.astype(int))
+    return float(model.coef_[0][0]), float(model.intercept_[0])
+
+
+def _safe_average_precision(y_true: np.ndarray, probs: np.ndarray) -> float:
+    if y_true.size == 0:
+        return 0.0
+    positives = int(np.sum(y_true >= 0.5))
+    if positives == 0:
+        return 0.0
+    if positives == y_true.size:
+        return 1.0
+    try:
+        return float(average_precision_score(y_true, probs))
+    except ValueError:
+        return 0.0
+
+
+def _safe_roc_auc(y_true: np.ndarray, probs: np.ndarray) -> float:
+    if y_true.size == 0:
+        return 0.0
+    if len(np.unique(y_true)) < 2:
+        return 0.0
+    try:
+        return float(roc_auc_score(y_true, probs))
+    except ValueError:
+        return 0.0
+
+
+def _calibration_report(
+    y_true: np.ndarray,
+    probs: np.ndarray,
+    bins: int = 10,
+) -> dict[str, Any]:
+    if y_true.size == 0 or probs.size == 0:
+        return {"ece": 0.0, "brier_score": 0.0, "log_loss": 0.0, "bins": []}
+
+    clipped = np.clip(probs, 1e-6, 1.0 - 1e-6)
+    bin_edges = np.linspace(0.0, 1.0, bins + 1)
+    calibration_bins: list[dict[str, float | int]] = []
+    ece = 0.0
+    for index in range(bins):
+        lower = bin_edges[index]
+        upper = bin_edges[index + 1]
+        if index == bins - 1:
+            mask = (clipped >= lower) & (clipped <= upper)
+        else:
+            mask = (clipped >= lower) & (clipped < upper)
+        if not np.any(mask):
+            calibration_bins.append(
+                {
+                    "lower": float(lower),
+                    "upper": float(upper),
+                    "count": 0,
+                    "avg_confidence": 0.0,
+                    "observed_rate": 0.0,
+                    "gap": 0.0,
+                }
+            )
+            continue
+        avg_confidence = float(np.mean(clipped[mask]))
+        observed_rate = float(np.mean(y_true[mask]))
+        gap = abs(avg_confidence - observed_rate)
+        ece += gap * (float(np.sum(mask)) / float(y_true.size))
+        calibration_bins.append(
+            {
+                "lower": float(lower),
+                "upper": float(upper),
+                "count": int(np.sum(mask)),
+                "avg_confidence": avg_confidence,
+                "observed_rate": observed_rate,
+                "gap": float(gap),
+            }
+        )
+
+    return {
+        "ece": float(ece),
+        "brier_score": float(brier_score_loss(y_true, clipped)),
+        "log_loss": float(log_loss(y_true, clipped, labels=[0, 1])),
+        "bins": calibration_bins,
+    }
+
+
+def _classification_metrics(
+    y_true: np.ndarray,
+    probs: np.ndarray,
+    threshold: float,
+) -> dict[str, float]:
+    if y_true.size == 0 or probs.size == 0:
+        return {
+            "accuracy": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "average_precision": 0.0,
+            "predicted_positive_rate": 0.0,
+            "positive_rate": 0.0,
+            "threshold": float(threshold),
+            "roc_auc": 0.0,
+            "specificity": 0.0,
+            "balanced_accuracy": 0.0,
+            "false_positive_rate": 0.0,
+            "false_negative_rate": 0.0,
+            "brier_score": 0.0,
+            "log_loss": 0.0,
+            "confusion_matrix": {"tn": 0, "fp": 0, "fn": 0, "tp": 0},
+        }
+
+    clipped = np.clip(probs, 1e-6, 1.0 - 1e-6)
+    preds = (probs >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, preds, labels=[0, 1]).ravel()
+    recall = float(recall_score(y_true, preds, zero_division=0))
+    specificity = float(tn / max(tn + fp, 1))
+    false_positive_rate = float(fp / max(fp + tn, 1))
+    false_negative_rate = float(fn / max(fn + tp, 1))
+    metrics = {
+        "accuracy": float(accuracy_score(y_true, preds)),
+        "precision": float(precision_score(y_true, preds, zero_division=0)),
+        "recall": recall,
+        "f1": float(f1_score(y_true, preds, zero_division=0)),
+        "average_precision": _safe_average_precision(y_true, probs),
+        "predicted_positive_rate": float(preds.mean()) if preds.size else 0.0,
+        "positive_rate": float(y_true.mean()) if y_true.size else 0.0,
+        "threshold": float(threshold),
+        "specificity": specificity,
+        "balanced_accuracy": float((recall + specificity) / 2.0),
+        "false_positive_rate": false_positive_rate,
+        "false_negative_rate": false_negative_rate,
+        "brier_score": float(brier_score_loss(y_true, clipped)),
+        "log_loss": float(log_loss(y_true, clipped, labels=[0, 1])),
+        "confusion_matrix": {
+            "tn": int(tn),
+            "fp": int(fp),
+            "fn": int(fn),
+            "tp": int(tp),
+        },
+    }
+    metrics["roc_auc"] = _safe_roc_auc(y_true, probs)
+    return metrics
+
+
+def _eta_metrics(
+    y_true_class: np.ndarray,
+    y_true_eta: np.ndarray,
+    y_pred_eta: np.ndarray,
+) -> dict[str, float]:
+    mask = y_true_class >= 0.5
+    if not np.any(mask):
+        return {
+            "mae": 0.0,
+            "rmse": 0.0,
+            "median_absolute_error": 0.0,
+            "p90_absolute_error": 0.0,
+            "positive_samples": 0,
+            "horizon_buckets": [],
+        }
+    errors = y_pred_eta[mask] - y_true_eta[mask]
+    abs_errors = np.abs(errors)
+    horizon_buckets = _eta_horizon_buckets(y_true_eta[mask], abs_errors)
+    return {
+        "mae": float(np.mean(np.abs(errors))),
+        "rmse": float(np.sqrt(np.mean(np.square(errors)))),
+        "median_absolute_error": float(np.median(abs_errors)),
+        "p90_absolute_error": float(np.percentile(abs_errors, 90)),
+        "positive_samples": int(mask.sum()),
+        "horizon_buckets": horizon_buckets,
+    }
+
+
+def _eta_horizon_buckets(y_true_eta: np.ndarray, abs_errors: np.ndarray) -> list[dict[str, float | int | str]]:
+    buckets = [
+        ("0-15m", 0, 900),
+        ("15-60m", 900, 3600),
+        ("1-2h", 3600, 7200),
+        ("2-4h", 7200, 14_400),
+        ("4h+", 14_400, float("inf")),
+    ]
+    results: list[dict[str, float | int | str]] = []
+    for label, lower, upper in buckets:
+        mask = (y_true_eta >= lower) & (y_true_eta < upper)
+        count = int(np.sum(mask))
+        if count == 0:
+            results.append({"bucket": label, "count": 0, "mae": 0.0, "median_absolute_error": 0.0})
+            continue
+        results.append(
+            {
+                "bucket": label,
+                "count": count,
+                "mae": float(np.mean(abs_errors[mask])),
+                "median_absolute_error": float(np.median(abs_errors[mask])),
+            }
+        )
+    return results
+
+
+def _select_thresholds(y_true: np.ndarray, probs: np.ndarray) -> dict[str, Any]:
+    candidates = [round(value, 2) for value in np.arange(0.30, 0.86, 0.05)]
+    sweep: list[dict[str, float]] = []
+    for threshold in candidates:
+        metrics = _classification_metrics(y_true, probs, threshold)
+        sweep.append(
+            {
+                "threshold": float(threshold),
+                "precision": metrics["precision"],
+                "recall": metrics["recall"],
+                "f1": metrics["f1"],
+                "balanced_accuracy": metrics["balanced_accuracy"],
+                "predicted_positive_rate": metrics["predicted_positive_rate"],
+                "false_positive_rate": metrics["false_positive_rate"],
+            }
+        )
+
+    execute_candidates = [
+        item for item in sweep if item["predicted_positive_rate"] > 0.0 and item["precision"] >= 0.50
+    ] or [item for item in sweep if item["predicted_positive_rate"] > 0.0] or sweep
+    execute_choice = max(
+        execute_candidates,
+        key=lambda item: (
+            item["f1"] + 0.20 * item["precision"] + 0.15 * item["balanced_accuracy"] - 0.10 * item["false_positive_rate"],
+            item["precision"],
+            -item["false_positive_rate"],
+        ),
+    )
+
+    strong_candidates = [
+        item
+        for item in sweep
+        if item["threshold"] >= execute_choice["threshold"] + 0.05 and item["precision"] >= max(0.65, execute_choice["precision"])
+    ] or [
+        item for item in sweep if item["threshold"] >= execute_choice["threshold"] + 0.05
+    ] or [execute_choice]
+    strong_choice = max(
+        strong_candidates,
+        key=lambda item: (
+            item["precision"] + 0.20 * item["balanced_accuracy"] + 0.10 * item["f1"],
+            -item["false_positive_rate"],
+            item["threshold"],
+        ),
+    )
+
+    execute_threshold = float(execute_choice["threshold"])
+    strong_threshold = float(max(strong_choice["threshold"], execute_threshold + 0.05))
+    strong_threshold = min(0.95, strong_threshold)
+
+    execute_metrics = _classification_metrics(y_true, probs, execute_threshold)
+    strong_metrics = _classification_metrics(y_true, probs, strong_threshold)
+
+    return {
+        "execute_threshold": execute_threshold,
+        "strong_threshold": strong_threshold,
+        "sweep": sweep,
+        "execute": {
+            "threshold": execute_threshold,
+            "objective": "maximize f1 with recall and balanced-accuracy support under a precision floor",
+            "metrics": execute_metrics,
+        },
+        "strong": {
+            "threshold": strong_threshold,
+            "objective": "favor higher precision and specificity for strong signals",
+            "metrics": strong_metrics,
+        },
+    }
+
+
+def _label_diversity(labels: np.ndarray) -> int:
+    if labels.size == 0:
+        return 0
+    return int(len(np.unique(labels.astype(int))))
+
+
+def _partition_validation_chronologically(
+    timestamps: np.ndarray,
+    labels: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    if timestamps.size == 0:
+        empty = np.array([], dtype=int)
+        return empty, empty, {
+            "mode": "chronological",
+            "calibration_count": 0,
+            "selection_count": 0,
+            "calibration_start_ts": 0.0,
+            "calibration_end_ts": 0.0,
+            "selection_start_ts": 0.0,
+            "selection_end_ts": 0.0,
+            "calibration_class_diversity": 0,
+            "selection_class_diversity": 0,
+        }
+
+    order = np.argsort(timestamps)
+    if order.size == 1:
+        single_idx = order.astype(int)
+        only_ts = float(timestamps[single_idx[0]])
+        diversity = _label_diversity(labels[single_idx])
+        return single_idx, single_idx, {
+            "mode": "chronological_fallback",
+            "calibration_count": 1,
+            "selection_count": 1,
+            "calibration_start_ts": only_ts,
+            "calibration_end_ts": only_ts,
+            "selection_start_ts": only_ts,
+            "selection_end_ts": only_ts,
+            "calibration_class_diversity": diversity,
+            "selection_class_diversity": diversity,
+        }
+
+    best_split = 1
+    best_score: tuple[float, float, float] | None = None
+    total = float(order.size)
+    for split_point in range(1, order.size):
+        cal_idx = order[:split_point]
+        sel_idx = order[split_point:]
+        score = (
+            float(_label_diversity(labels[cal_idx]) + _label_diversity(labels[sel_idx])),
+            -abs((split_point / total) - 0.5),
+            -abs(split_point - (order.size / 2.0)),
+        )
+        if best_score is None or score > best_score:
+            best_score = score
+            best_split = split_point
+
+    cal_idx = order[:best_split].astype(int)
+    sel_idx = order[best_split:].astype(int)
+    if sel_idx.size == 0:
+        sel_idx = cal_idx.copy()
+    return cal_idx, sel_idx, {
+        "mode": "chronological",
+        "calibration_count": int(cal_idx.size),
+        "selection_count": int(sel_idx.size),
+        "calibration_start_ts": float(timestamps[cal_idx[0]]) if cal_idx.size else 0.0,
+        "calibration_end_ts": float(timestamps[cal_idx[-1]]) if cal_idx.size else 0.0,
+        "selection_start_ts": float(timestamps[sel_idx[0]]) if sel_idx.size else 0.0,
+        "selection_end_ts": float(timestamps[sel_idx[-1]]) if sel_idx.size else 0.0,
+        "calibration_class_diversity": _label_diversity(labels[cal_idx]),
+        "selection_class_diversity": _label_diversity(labels[sel_idx]),
+    }
+
+
+def _bucket_classification_metrics(
+    y_true: np.ndarray,
+    probs: np.ndarray,
+    values: np.ndarray,
+    threshold: float,
+    bins: list[tuple[str, float, float]],
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for label, lower, upper in bins:
+        mask = (values >= lower) & (values < upper)
+        count = int(np.sum(mask))
+        if count == 0:
+            results.append({"bucket": label, "count": 0})
+            continue
+        metrics = _classification_metrics(y_true[mask], probs[mask], threshold)
+        results.append(
+            {
+                "bucket": label,
+                "count": count,
+                "positive_rate": float(np.mean(y_true[mask])),
+                "avg_probability": float(np.mean(probs[mask])),
+                "precision": metrics["precision"],
+                "recall": metrics["recall"],
+                "f1": metrics["f1"],
+            }
+        )
+    return results
+
+
+def _subgroup_metrics(
+    evaluation: dict[str, Any],
+    threshold: float,
+) -> dict[str, Any]:
+    y_true = evaluation["y_class"]
+    probs = evaluation["probs"]
+    entry_values = evaluation["last_entries"]
+    volatility_values = evaluation["entry_volatility"]
+    return {
+        "entry_spread_buckets": _bucket_classification_metrics(
+            y_true,
+            probs,
+            entry_values,
+            threshold,
+            [
+                ("lt_0_10", -float("inf"), 0.10),
+                ("0_10_to_0_30", 0.10, 0.30),
+                ("0_30_to_0_60", 0.30, 0.60),
+                ("ge_0_60", 0.60, float("inf")),
+            ],
+        ),
+        "volatility_buckets": _bucket_classification_metrics(
+            y_true,
+            probs,
+            volatility_values,
+            threshold,
+            [
+                ("lt_0_05", -float("inf"), 0.05),
+                ("0_05_to_0_10", 0.05, 0.10),
+                ("0_10_to_0_20", 0.10, 0.20),
+                ("ge_0_20", 0.20, float("inf")),
+            ],
+        ),
+    }
+
+
+def _temporal_walk_forward_report(
+    evaluation: dict[str, Any],
+    threshold: float,
+    windows: int = 4,
+) -> dict[str, Any]:
+    timestamps = evaluation["timestamps"]
+    if timestamps.size == 0:
+        return {"num_windows": 0, "windows": [], "summary": {}}
+
+    order = np.argsort(timestamps)
+    y_true = evaluation["y_class"][order]
+    probs = evaluation["probs"][order]
+    ordered_timestamps = timestamps[order]
+
+    chunk_size = max(1, int(math.ceil(len(ordered_timestamps) / windows)))
+    window_reports: list[dict[str, Any]] = []
+    for index in range(windows):
+        start = index * chunk_size
+        end = min(len(ordered_timestamps), start + chunk_size)
+        if start >= end:
+            continue
+        metrics = _classification_metrics(y_true[start:end], probs[start:end], threshold)
+        window_reports.append(
+            {
+                "window_index": index + 1,
+                "start_ts": float(ordered_timestamps[start]),
+                "end_ts": float(ordered_timestamps[end - 1]),
+                "count": int(end - start),
+                "metrics": metrics,
+            }
+        )
+
+    if not window_reports:
+        return {"num_windows": 0, "windows": [], "summary": {}}
+
+    ap_values = [window["metrics"]["average_precision"] for window in window_reports]
+    recall_values = [window["metrics"]["recall"] for window in window_reports]
+    return {
+        "num_windows": len(window_reports),
+        "windows": window_reports,
+        "summary": {
+            "min_average_precision": float(min(ap_values)),
+            "avg_average_precision": float(np.mean(ap_values)),
+            "min_recall": float(min(recall_values)),
+            "avg_recall": float(np.mean(recall_values)),
+        },
+    }
+
+
+def _evaluate_split(
+    model: SpreadSequenceLSTM,
+    bundle: DatasetBundle,
+    device: torch.device,
+    scale: float,
+    bias: float,
+    threshold: float,
+) -> dict[str, Any]:
+    loader = _make_loader(bundle, batch_size=256, shuffle=False)
+    logits_list: list[np.ndarray] = []
+    eta_list: list[np.ndarray] = []
+    y_class_list: list[np.ndarray] = []
+    y_eta_list: list[np.ndarray] = []
+
+    model.eval()
+    with torch.no_grad():
+        for batch_x, batch_y_class, batch_y_eta in loader:
+            batch_x = batch_x.to(device)
+            logits, eta_raw = model(batch_x)
+            logits_list.append(logits.squeeze(1).cpu().numpy())
+            eta_list.append(torch.expm1(eta_raw.squeeze(1)).clamp(min=0.0).cpu().numpy())
+            y_class_list.append(batch_y_class.numpy())
+            y_eta_list.append(batch_y_eta.numpy())
+
+    logits_np = np.concatenate(logits_list) if logits_list else np.array([], dtype=float)
+    probs_np = _apply_platt_scaling(logits_np, scale, bias) if logits_np.size else np.array([], dtype=float)
+    eta_np = np.concatenate(eta_list) if eta_list else np.array([], dtype=float)
+    y_class_np = np.concatenate(y_class_list) if y_class_list else np.array([], dtype=float)
+    y_eta_np = np.concatenate(y_eta_list) if y_eta_list else np.array([], dtype=float)
+    timestamps_np = np.asarray(bundle.timestamps, dtype=float)
+    last_entries_np = np.asarray(bundle.last_entries, dtype=float)
+    entry_volatility_np = bundle.X[:, :, 0].detach().cpu().std(dim=1).numpy() if bundle.summary["num_samples"] else np.array([], dtype=float)
+
+    return {
+        "classification": _classification_metrics(y_class_np, probs_np, threshold),
+        "eta": _eta_metrics(y_class_np, y_eta_np, eta_np),
+        "logits": logits_np,
+        "probs": probs_np,
+        "y_class": y_class_np,
+        "y_eta": y_eta_np,
+        "eta_pred": eta_np,
+        "timestamps": timestamps_np,
+        "last_entries": last_entries_np,
+        "entry_volatility": entry_volatility_np,
+        "pair_ids": list(bundle.pair_ids),
+    }
+
+
+def _baseline_metrics(
+    train_bundle: DatasetBundle,
+    target_bundle: DatasetBundle,
+) -> dict[str, dict[str, float]]:
+    y_true = target_bundle.y_class.numpy()
+
+    always_negative_probs = np.zeros_like(y_true, dtype=float)
+    always_negative = _classification_metrics(y_true, always_negative_probs, threshold=0.5)
+
+    percentile_threshold = float(np.quantile(np.array(train_bundle.last_entries, dtype=float), 0.75))
+    percentile_probs = np.array(
+        [1.0 if value >= percentile_threshold else 0.0 for value in target_bundle.last_entries],
+        dtype=float,
+    )
+    percentile_rule = _classification_metrics(y_true, percentile_probs, threshold=0.5)
+    percentile_rule["entry_threshold"] = percentile_threshold
+
+    return {
+        "always_negative": always_negative,
+        "percentile_rule": percentile_rule,
+    }
+
+
+def _build_split_summary(splits: dict[str, DatasetBundle]) -> dict[str, Any]:
+    train_pairs = set(splits["train"].pair_ids)
+    val_pairs = set(splits["val"].pair_ids)
+    test_pairs = set(splits["test"].pair_ids)
+    train_blocks = set(splits["train"].block_ids)
+    val_blocks = set(splits["val"].block_ids)
+    test_blocks = set(splits["test"].block_ids)
+    train_timestamps = splits["train"].timestamps
+    val_timestamps = splits["val"].timestamps
+    test_timestamps = splits["test"].timestamps
+    shared_split_summary = splits["train"].summary.get("split_summary", {})
+    pair_overlap_breakdown = {
+        "train_val": len(train_pairs & val_pairs),
+        "train_test": len(train_pairs & test_pairs),
+        "val_test": len(val_pairs & test_pairs),
+    }
+    unique_overlap_pairs = (train_pairs & val_pairs) | (train_pairs & test_pairs) | (val_pairs & test_pairs)
+    pair_overlap = len(unique_overlap_pairs)
+    pair_overlap_pairwise_sum = sum(pair_overlap_breakdown.values())
+    total_unique_pairs = len(train_pairs | val_pairs | test_pairs)
+    return {
+        "train_pairs": len(train_pairs),
+        "val_pairs": len(val_pairs),
+        "test_pairs": len(test_pairs),
+        "train_blocks": len(train_blocks),
+        "val_blocks": len(val_blocks),
+        "test_blocks": len(test_blocks),
+        "pair_overlap": pair_overlap,
+        "pair_overlap_pairwise_sum": pair_overlap_pairwise_sum,
+        "pair_overlap_breakdown": pair_overlap_breakdown,
+        "pair_overlap_rate": float(pair_overlap / total_unique_pairs) if total_unique_pairs else 0.0,
+        "train_samples": splits["train"].summary["num_samples"],
+        "val_samples": splits["val"].summary["num_samples"],
+        "test_samples": splits["test"].summary["num_samples"],
+        "train_start_ts": min(train_timestamps) if train_timestamps else 0.0,
+        "train_end_ts": max(train_timestamps) if train_timestamps else 0.0,
+        "val_start_ts": min(val_timestamps) if val_timestamps else 0.0,
+        "val_end_ts": max(val_timestamps) if val_timestamps else 0.0,
+        "test_start_ts": min(test_timestamps) if test_timestamps else 0.0,
+        "test_end_ts": max(test_timestamps) if test_timestamps else 0.0,
+        "train_positive_pairs": int(shared_split_summary.get("train_positive_pairs", 0)),
+        "val_positive_pairs": int(shared_split_summary.get("val_positive_pairs", 0)),
+        "test_positive_pairs": int(shared_split_summary.get("test_positive_pairs", 0)),
+        "train_negative_pairs": int(shared_split_summary.get("train_negative_pairs", 0)),
+        "val_negative_pairs": int(shared_split_summary.get("val_negative_pairs", 0)),
+        "test_negative_pairs": int(shared_split_summary.get("test_negative_pairs", 0)),
+        "embargo_samples": int(shared_split_summary.get("embargo_samples", 0)),
+        "split_mode": str(shared_split_summary.get("split_mode", "sample_chronological")),
+        "train_session_ids": list(shared_split_summary.get("train_session_ids", [])),
+        "val_session_ids": list(shared_split_summary.get("val_session_ids", [])),
+        "test_session_ids": list(shared_split_summary.get("test_session_ids", [])),
+        "global_temporal_order": bool(
+            (max(train_timestamps) if train_timestamps else 0.0) <= (min(val_timestamps) if val_timestamps else float("inf"))
+            and (max(val_timestamps) if val_timestamps else 0.0) <= (min(test_timestamps) if test_timestamps else float("inf"))
+        ),
+    }
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def write_audit_report(report: dict[str, Any], audit_path: Path) -> Path:
+    dataset_summary = report["dataset_summary"]
+    split_summary = report["split_summary"]
+    metrics = report["metrics"]["test"]
+    baselines = report["baselines"]
+    calibration = report["calibration"]["test"]
+    temporal_summary = report["temporal_walk_forward"]["test"]["summary"]
+    validation_partition = report["validation_partition"]
+    feature_monitoring = report["feature_monitoring"]
+    checks = {
+        "dataset_non_degenerate": bool(dataset_summary["num_samples"] > 0 and dataset_summary["feature_abs_sum"] > 0.0),
+        "windows_respect_blocks": int(dataset_summary.get("num_cross_block_windows", 0)) == 0,
+        "global_temporal_order": bool(split_summary["global_temporal_order"]),
+        "embargo_active": bool(split_summary["embargo_samples"] > 0),
+        "beats_negative_baseline_recall": bool(metrics["recall"] > baselines["always_negative"]["recall"]),
+        "beats_negative_baseline_ap": bool(
+            metrics["average_precision"] >= baselines["always_negative"]["average_precision"]
+        ),
+        "nonzero_positive_predictions": bool(metrics["predicted_positive_rate"] > 0.0),
+        "calibration_within_guardrail": bool(calibration["ece"] <= 0.12),
+        "temporal_ap_above_baseline": bool(
+            temporal_summary.get("min_average_precision", 0.0) >= baselines["always_negative"]["average_precision"]
+        ),
+        "strong_precision_guardrail": bool(report["strong_signal_metrics"]["test"]["precision"] >= 0.80),
+    }
+
+    findings: list[str] = []
+    if not checks["dataset_non_degenerate"]:
+        findings.append("- Crítico: o dataset continua degenerado ou vazio.")
+    if not checks["windows_respect_blocks"]:
+        findings.append("- Crítico: existem janelas cruzando blocos temporais, violando a continuidade do treino.")
+    if not checks["global_temporal_order"]:
+        findings.append("- Crítico: treino, validação e teste ainda se sobrepõem no tempo global.")
+    if not checks["embargo_active"]:
+        findings.append("- Alto: o split temporal ficou sem embargo entre fronteiras e pode compartilhar contexto entre janelas adjacentes.")
+    if not checks["beats_negative_baseline_recall"]:
+        findings.append("- Alto: o modelo não superou o baseline sempre-negativo em recall.")
+    if not checks["beats_negative_baseline_ap"]:
+        findings.append("- Alto: o modelo não superou o baseline sempre-negativo em average precision.")
+    if not checks["nonzero_positive_predictions"]:
+        findings.append("- Alto: o modelo colapsou para zero previsões positivas no threshold operacional.")
+    if not checks["temporal_ap_above_baseline"]:
+        findings.append("- Alto: o bloco temporal mais fraco caiu abaixo do baseline sempre-negativo em PR-AUC.")
+    if not checks["calibration_within_guardrail"]:
+        findings.append("- Médio: a calibração ficou acima do guardrail de ECE e exige threshold mais conservador.")
+    if not checks["strong_precision_guardrail"]:
+        findings.append("- Médio: o threshold de STRONG_EXECUTE não atingiu a precisão mínima esperada para sinal forte.")
+    if not findings:
+        findings.append("- Médio: os gates offline passaram, mas drift temporal e qualidade do histórico ainda precisam de monitoramento contínuo.")
+
+    lines = [
+        "# ArbML LSTM Audit",
+        "",
+        "## Findings",
+        *findings,
+        "",
+        "## Dataset",
+        f"- Samples: {dataset_summary['num_samples']}",
+        f"- Positive samples: {dataset_summary['num_positive_samples']}",
+        f"- Negative samples: {dataset_summary['num_negative_samples']}",
+        f"- Pair count: {dataset_summary['num_pairs']}",
+        f"- Session count: {dataset_summary.get('num_sessions', 0)}",
+        f"- Block count: {dataset_summary.get('num_blocks', 0)}",
+        f"- Blocks used: {dataset_summary.get('blocks_used', 0)}",
+        f"- Skipped short blocks: {dataset_summary.get('skipped_blocks_too_short', 0)}",
+        f"- Cross-block windows: {dataset_summary.get('num_cross_block_windows', 0)}",
+        f"- Feature abs sum: {dataset_summary['feature_abs_sum']:.4f}",
+        "",
+        "## Split Integrity",
+        f"- Train pairs: {split_summary['train_pairs']}",
+        f"- Validation pairs: {split_summary['val_pairs']}",
+        f"- Test pairs: {split_summary['test_pairs']}",
+        f"- Train blocks: {split_summary.get('train_blocks', 0)}",
+        f"- Validation blocks: {split_summary.get('val_blocks', 0)}",
+        f"- Test blocks: {split_summary.get('test_blocks', 0)}",
+        f"- Unique overlapping pairs: {split_summary['pair_overlap']}",
+        f"- Pairwise overlap sum: {split_summary['pair_overlap_pairwise_sum']}",
+        f"- Unique pair overlap rate: {split_summary['pair_overlap_rate']:.4f}",
+        f"- Embargo samples: {split_summary['embargo_samples']}",
+        f"- Global temporal order: {split_summary['global_temporal_order']}",
+        f"- Train time range: {split_summary['train_start_ts']:.0f} -> {split_summary['train_end_ts']:.0f}",
+        f"- Validation time range: {split_summary['val_start_ts']:.0f} -> {split_summary['val_end_ts']:.0f}",
+        f"- Test time range: {split_summary['test_start_ts']:.0f} -> {split_summary['test_end_ts']:.0f}",
+        "",
+        "## Test Metrics",
+        f"- Accuracy: {metrics['accuracy']:.4f}",
+        f"- Precision: {metrics['precision']:.4f}",
+        f"- Recall: {metrics['recall']:.4f}",
+        f"- F1: {metrics['f1']:.4f}",
+        f"- ROC-AUC: {metrics['roc_auc']:.4f}",
+        f"- PR-AUC: {metrics['average_precision']:.4f}",
+        f"- Balanced accuracy: {metrics['balanced_accuracy']:.4f}",
+        f"- Specificity: {metrics['specificity']:.4f}",
+        f"- False positive rate: {metrics['false_positive_rate']:.4f}",
+        f"- False negative rate: {metrics['false_negative_rate']:.4f}",
+        f"- ETA MAE (s): {report['eta_metrics']['test']['mae']:.2f}",
+        f"- ETA RMSE (s): {report['eta_metrics']['test']['rmse']:.2f}",
+        f"- ETA median AE (s): {report['eta_metrics']['test']['median_absolute_error']:.2f}",
+        f"- ETA p90 AE (s): {report['eta_metrics']['test']['p90_absolute_error']:.2f}",
+        "",
+        "## Baselines",
+        f"- Always-negative recall: {baselines['always_negative']['recall']:.4f}",
+        f"- Always-negative PR-AUC: {baselines['always_negative']['average_precision']:.4f}",
+        f"- Percentile-rule recall: {baselines['percentile_rule']['recall']:.4f}",
+        f"- Percentile-rule PR-AUC: {baselines['percentile_rule']['average_precision']:.4f}",
+        "",
+        "## Thresholds",
+        f"- Execute threshold: {report['thresholds']['execute_threshold']:.2f}",
+        f"- Strong threshold: {report['thresholds']['strong_threshold']:.2f}",
+        f"- Validation precision @ execute: {report['threshold_selection']['execute']['metrics']['precision']:.4f}",
+        f"- Validation recall @ execute: {report['threshold_selection']['execute']['metrics']['recall']:.4f}",
+        f"- Validation precision @ strong: {report['threshold_selection']['strong']['metrics']['precision']:.4f}",
+        f"- Test precision @ strong: {report['strong_signal_metrics']['test']['precision']:.4f}",
+        f"- Test recall @ strong: {report['strong_signal_metrics']['test']['recall']:.4f}",
+        "",
+        "## Calibration",
+        f"- Validation ECE: {report['calibration']['val']['ece']:.4f}",
+        f"- Test ECE: {report['calibration']['test']['ece']:.4f}",
+        f"- Test Brier score: {calibration['brier_score']:.4f}",
+        f"- Test log loss: {calibration['log_loss']:.4f}",
+        "",
+        "## Validation Partition",
+        f"- Mode: {validation_partition['mode']}",
+        f"- Calibration samples: {validation_partition['calibration_count']}",
+        f"- Selection samples: {validation_partition['selection_count']}",
+        f"- Calibration range: {validation_partition['calibration_start_ts']:.0f} -> {validation_partition['calibration_end_ts']:.0f}",
+        f"- Selection range: {validation_partition['selection_start_ts']:.0f} -> {validation_partition['selection_end_ts']:.0f}",
+        f"- Calibration class diversity: {validation_partition['calibration_class_diversity']}",
+        f"- Selection class diversity: {validation_partition['selection_class_diversity']}",
+        "",
+        "## Temporal Audit",
+        f"- Windows: {report['temporal_walk_forward']['test']['num_windows']}",
+        f"- Min PR-AUC across windows: {temporal_summary.get('min_average_precision', 0.0):.4f}",
+        f"- Avg PR-AUC across windows: {temporal_summary.get('avg_average_precision', 0.0):.4f}",
+        f"- Min recall across windows: {temporal_summary.get('min_recall', 0.0):.4f}",
+        "",
+        "## Feature Monitoring",
+        f"- Feature count: {feature_monitoring['feature_count']}",
+        f"- Mean abs runtime z-score (test): {feature_monitoring['mean_abs_zscore_test']:.4f}",
+        f"- Max train variance: {feature_monitoring['max_variance']:.4f}",
+        f"- Min train variance: {feature_monitoring['min_variance']:.4f}",
+        "",
+        "## Subgroups",
+        f"- Entry buckets analysed: {len(report['subgroup_metrics']['test']['entry_spread_buckets'])}",
+        f"- Volatility buckets analysed: {len(report['subgroup_metrics']['test']['volatility_buckets'])}",
+        "",
+        "## Runtime Gates",
+        f"- Model status: {report['model_status']}",
+        f"- Artifact version: {report['artifact_metadata']['version']}",
+        f"- Execute threshold: {report['thresholds']['execute_threshold']:.2f}",
+        f"- Strong threshold: {report['thresholds']['strong_threshold']:.2f}",
+        "",
+        "## Residual Risks",
+        "- A auditoria offline mede janelas cronológicas, mas não substitui monitoramento contínuo de drift em produção.",
+        "- A cabeça de ETA é mais sensível a mudança de regime do que a cabeça de classificação.",
+        "- O bootstrap do servidor continua caro porque discovery e feeds não fazem parte desta refatoração de ML.",
+    ]
+
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    audit_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return audit_path
+
+
+def run_training_loop(
+    state_file: Path | None = None,
+    artifact_dir: Path | None = None,
+    sequence_length: int = 15,
+    prediction_horizon_sec: int = 14_400,
+    selected_session_ids: list[int] | None = None,
+    selected_block_ids: list[int] | None = None,
+    hidden_size: int = 64,
+    num_layers: int = 2,
+    dropout: float = 0.3,
+    batch_size: int = 128,
+    max_epochs: int = 80,
+    patience: int = 5,
+    learning_rate: float = 0.001,
+    weight_decay: float = 1e-4,
+    focal_alpha: float = 0.25,
+    focal_gamma: float = 2.0,
+    seed: int = 42,
+    audit_output: Path | None = None,
+) -> dict[str, Any]:
+    logger.info("Initializing robust ArbML training pipeline...")
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    default_state = Path(__file__).resolve().parent.parent.parent / "out" / "config" / "tracker_history.sqlite"
+    state_path = Path(state_file) if state_file is not None else default_state
+    artifact_root = Path(artifact_dir) if artifact_dir is not None else get_default_artifact_dir()
+    if audit_output is None:
+        audit_path = (
+            artifact_root / f"{ARTIFACT_BASENAME}.audit.md"
+            if artifact_dir is not None
+            else Path(__file__).resolve().parent.parent.parent / "ml_diagnostic_report.md"
+        )
+    else:
+        audit_path = Path(audit_output)
+
+    bundle = build_dataset_bundle(
+        state_path=state_path,
+        sequence_length=sequence_length,
+        prediction_horizon_sec=prediction_horizon_sec,
+        selected_session_ids=selected_session_ids,
+        selected_block_ids=selected_block_ids,
+    )
+    if bundle.summary["num_samples"] < 30:
+        raise ValueError("Dataset construction failed or too small for robust training.")
+
+    splits = build_group_splits(bundle)
+    split_summary = _build_split_summary(splits)
+    if not split_summary["global_temporal_order"]:
+        raise ValueError("Global temporal separation failed in split construction.")
+    if split_summary["split_mode"] == "sample_chronological" and split_summary["embargo_samples"] <= 0:
+        raise ValueError("Temporal split did not reserve an embargo between boundaries.")
+    if min(splits["train"].summary["num_samples"], splits["val"].summary["num_samples"], splits["test"].summary["num_samples"]) == 0:
+        raise ValueError("At least one split is empty; need more disjoint pairs.")
+
+    feature_mean, feature_std = compute_feature_stats(splits["train"].X)
+    for split_bundle in splits.values():
+        split_bundle.X = normalize_features(split_bundle.X, feature_mean, feature_std)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = SpreadSequenceLSTM(
+        input_sz=splits["train"].X.shape[-1],
+        hidden_sz=hidden_size,
+        num_layers=num_layers,
+        dropout=dropout,
+        use_attention=True,
+    ).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-6,
+    )
+
+    criterion_prob = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+    criterion_eta = nn.SmoothL1Loss()
+
+    train_loader = _make_loader(splits["train"], batch_size=batch_size, shuffle=True)
+    val_loader = _make_loader(splits["val"], batch_size=batch_size, shuffle=False)
+
+    best_state: dict[str, torch.Tensor] | None = None
+    best_val_loss = float("inf")
+    best_epoch = 0
+    epochs_without_improvement = 0
+    epoch_history: list[dict[str, float | int]] = []
+    training_started_at = _time.time()
+
+    for epoch in range(max_epochs):
+        model.train()
+        train_losses: list[float] = []
+        gradient_norms: list[float] = []
+        for batch_x, batch_y_class, batch_y_eta in train_loader:
+            batch_x = batch_x.to(device)
+            batch_y_class = batch_y_class.to(device)
+            batch_y_eta = batch_y_eta.to(device)
+
+            optimizer.zero_grad()
+            logits, eta_raw = model(batch_x)
+            loss_prob = criterion_prob(logits.squeeze(1), batch_y_class)
+            loss_eta = _eta_loss(criterion_eta, eta_raw, batch_y_eta, batch_y_class)
+            loss = loss_prob + 0.25 * loss_eta
+            loss.backward()
+            gradient_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0))
+            optimizer.step()
+            train_losses.append(float(loss.item()))
+            gradient_norms.append(gradient_norm)
+
+        model.eval()
+        val_losses: list[float] = []
+        with torch.no_grad():
+            for batch_x, batch_y_class, batch_y_eta in val_loader:
+                batch_x = batch_x.to(device)
+                batch_y_class = batch_y_class.to(device)
+                batch_y_eta = batch_y_eta.to(device)
+                logits, eta_raw = model(batch_x)
+                loss_prob = criterion_prob(logits.squeeze(1), batch_y_class)
+                loss_eta = _eta_loss(criterion_eta, eta_raw, batch_y_eta, batch_y_class)
+                val_losses.append(float((loss_prob + 0.25 * loss_eta).item()))
+
+        avg_train_loss = float(np.mean(train_losses)) if train_losses else float("inf")
+        avg_val_loss = float(np.mean(val_losses)) if val_losses else float("inf")
+        current_lr = optimizer.param_groups[0]["lr"]
+        logger.info(
+            "Epoch %s/%s | train_loss=%.4f | val_loss=%.4f | lr=%.2e",
+            epoch + 1,
+            max_epochs,
+            avg_train_loss,
+            avg_val_loss,
+            current_lr,
+        )
+        scheduler.step(avg_val_loss)
+        epoch_history.append(
+            {
+                "epoch": int(epoch + 1),
+                "train_loss": avg_train_loss,
+                "val_loss": avg_val_loss,
+                "learning_rate": float(current_lr),
+                "avg_gradient_norm": float(np.mean(gradient_norms)) if gradient_norms else 0.0,
+                "max_gradient_norm": float(np.max(gradient_norms)) if gradient_norms else 0.0,
+            }
+        )
+
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_epoch = epoch + 1
+            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= patience:
+                logger.info("Early stopping triggered at epoch %s", epoch + 1)
+                break
+
+    if best_state is None:
+        raise RuntimeError("Training failed to produce a valid checkpoint.")
+
+    model.load_state_dict(best_state)
+    model.to(device)
+
+    val_eval_uncalibrated = _evaluate_split(model, splits["val"], device, scale=1.0, bias=0.0, threshold=0.5)
+    val_logits = val_eval_uncalibrated["logits"]
+    val_labels = val_eval_uncalibrated["y_class"]
+    cal_idx, sel_idx, validation_partition = _partition_validation_chronologically(
+        val_eval_uncalibrated["timestamps"],
+        val_labels,
+    )
+    platt_scale, platt_bias = _fit_platt_scaler(val_logits[cal_idx], val_labels[cal_idx])
+    sel_probs = _apply_platt_scaling(val_logits[sel_idx], platt_scale, platt_bias)
+    threshold_selection = _select_thresholds(val_labels[sel_idx], sel_probs)
+    execute_threshold = threshold_selection["execute_threshold"]
+    strong_threshold = threshold_selection["strong_threshold"]
+    evaluations = {
+        split_name: _evaluate_split(model, split_bundle, device, platt_scale, platt_bias, execute_threshold)
+        for split_name, split_bundle in splits.items()
+    }
+    baselines = _baseline_metrics(splits["train"], splits["test"])
+
+    dataset_summary = dict(bundle.summary)
+    dataset_summary["feature_abs_sum"] = float(bundle.X.abs().sum().item())
+    test_x = splits["test"].X.detach().cpu().numpy() if splits["test"].summary["num_samples"] else np.empty((0, 0, 0), dtype=float)
+    feature_std_np = feature_std.detach().cpu().numpy()
+    mean_abs_zscore_test = 0.0
+    if test_x.size:
+        test_feature_means = test_x.reshape(-1, test_x.shape[-1]).mean(axis=0)
+        mean_abs_zscore_test = float(np.mean(np.abs(test_feature_means)))
+    feature_monitoring = {
+        "feature_count": int(len(bundle.feature_names)),
+        "feature_names": list(bundle.feature_names),
+        "min_variance": float(np.min(np.square(feature_std_np))) if feature_std_np.size else 0.0,
+        "max_variance": float(np.max(np.square(feature_std_np))) if feature_std_np.size else 0.0,
+        "mean_abs_zscore_test": mean_abs_zscore_test,
+    }
+    calibration = {
+        split_name: _calibration_report(evaluation["y_class"], evaluation["probs"])
+        for split_name, evaluation in evaluations.items()
+    }
+    subgroup_metrics = {
+        split_name: _subgroup_metrics(evaluation, execute_threshold)
+        for split_name, evaluation in evaluations.items()
+    }
+    temporal_walk_forward = {
+        split_name: _temporal_walk_forward_report(evaluation, execute_threshold)
+        for split_name, evaluation in evaluations.items()
+    }
+    strong_signal_metrics = {
+        split_name: _classification_metrics(evaluation["y_class"], evaluation["probs"], strong_threshold)
+        for split_name, evaluation in evaluations.items()
+    }
+
+    report = {
+        "model_status": "trained",
+        "device": str(device),
+        "dataset_summary": dataset_summary,
+        "split_summary": split_summary,
+        "metrics": {
+            split_name: evaluation["classification"]
+            for split_name, evaluation in evaluations.items()
+        },
+        "eta_metrics": {
+            split_name: evaluation["eta"]
+            for split_name, evaluation in evaluations.items()
+        },
+        "baselines": baselines,
+        "thresholds": {
+            "execute_threshold": execute_threshold,
+            "strong_threshold": strong_threshold,
+        },
+        "threshold_selection": threshold_selection,
+        "strong_signal_metrics": strong_signal_metrics,
+        "calibration": calibration,
+        "subgroup_metrics": subgroup_metrics,
+        "temporal_walk_forward": temporal_walk_forward,
+        "validation_partition": validation_partition,
+        "feature_monitoring": feature_monitoring,
+        "training": {
+            "best_epoch": best_epoch,
+            "best_val_loss": best_val_loss,
+            "max_epochs": max_epochs,
+            "patience": patience,
+            "learning_rate": learning_rate,
+            "weight_decay": weight_decay,
+            "focal_alpha": focal_alpha,
+            "focal_gamma": focal_gamma,
+            "platt_scale": platt_scale,
+            "platt_bias": platt_bias,
+            "train_seconds": float(_time.time() - training_started_at),
+            "epoch_history": epoch_history,
+            "parameter_count": int(sum(parameter.numel() for parameter in model.parameters())),
+        },
+    }
+
+    metadata = ModelArtifactMetadata(
+        version="arbml-lstm-v3-seed{}-t{}-d{}".format(
+            seed,
+            int(_time.time()),
+            hashlib.sha1(
+                f"{bundle.summary['num_samples']}:{bundle.summary['num_pairs']}:{bundle.summary['num_positive_samples']}".encode()
+            ).hexdigest()[:8],
+        ),
+        sequence_length=sequence_length,
+        input_size=int(splits["train"].X.shape[-1]),
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        dropout=dropout,
+        feature_names=list(bundle.feature_names),
+        feature_mean=[float(value) for value in feature_mean.tolist()],
+        feature_std=[float(value) for value in feature_std.tolist()],
+        platt_scale=float(platt_scale),
+        platt_bias=float(platt_bias),
+        execute_threshold=execute_threshold,
+        strong_threshold=strong_threshold,
+        min_history_points=sequence_length,
+        min_empirical_events=2,
+        validation_metrics=report["metrics"]["val"],
+        test_metrics=report["metrics"]["test"],
+        baselines=baselines,
+        dataset_summary=dataset_summary,
+        split_summary=split_summary,
+        training_config={
+            "prediction_horizon_sec": prediction_horizon_sec,
+            "batch_size": batch_size,
+            "max_epochs": max_epochs,
+            "patience": patience,
+            "learning_rate": learning_rate,
+            "weight_decay": weight_decay,
+            "focal_alpha": focal_alpha,
+            "focal_gamma": focal_gamma,
+            "threshold_selection": threshold_selection["execute"]["objective"],
+            "validation_partition_mode": validation_partition["mode"],
+            "selected_session_ids": list(selected_session_ids or []),
+            "selected_block_ids": list(selected_block_ids or []),
+        },
+        use_attention=True,
+        trained_at_utc=datetime.now(timezone.utc).isoformat(),
+        dataset_fingerprint=hashlib.sha1(
+            (
+                f"{state_path.resolve()}:{state_path.stat().st_mtime_ns}:"
+                f"{dataset_summary['num_samples']}:{dataset_summary['num_positive_samples']}:"
+                f"{dataset_summary['num_pairs']}:{dataset_summary.get('blocks_used', 0)}:{dataset_summary.get('sessions_used', 0)}:"
+                f"{','.join(str(session_id) for session_id in dataset_summary.get('session_ids_used', []))}:"
+                f"{','.join(str(block_id) for block_id in dataset_summary.get('block_ids_used', []))}"
+            ).encode()
+        ).hexdigest(),
+        feature_schema_hash=current_feature_schema_hash(),
+    )
+    report["artifact_metadata"] = metadata.to_dict()
+
+    model_path, meta_path = save_artifact_bundle(model.cpu(), metadata, artifact_root)
+    report_path = artifact_root / f"{ARTIFACT_BASENAME}.report.json"
+    _write_json(report_path, report)
+    audit_report_path = write_audit_report(report, audit_path)
+
+    report["artifacts"] = {
+        "model_path": str(model_path),
+        "metadata_path": str(meta_path),
+        "report_path": str(report_path),
+        "audit_path": str(audit_report_path),
+    }
+    _write_json(report_path, report)
+    logger.info("Training complete. Artifacts saved to %s", artifact_root)
+    return report
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    run_training_loop()

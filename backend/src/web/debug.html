@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Monitor de Debug</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { background: #0b1120; color: #cbd5e1; font-family: 'Inter', system-ui, -apple-system, sans-serif; }
+    .card { background: #151d2e; border: 1px solid #1e293b; border-radius: 0.75rem; transition: border-color 0.2s; }
+    .card:hover { border-color: #334155; }
+    table { border-collapse: collapse; width: 100%; }
+    th { background: #1a2236; position: sticky; top: 0; cursor: pointer; user-select: none; }
+    th:hover { background: #1e293b; }
+    th, td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid #1e293b; white-space: nowrap; font-size: 0.8125rem; }
+    tr:hover td { background: #1a2a4a; }
+    .kpi-val { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.02em; }
+    .sparkline { fill: none; stroke-width: 1.5; }
+    .spark-area { opacity: 0.15; }
+    .dot-green { color: #4ade80; }
+    .dot-yellow { color: #facc15; }
+    .dot-red { color: #f87171; }
+    .expand-btn { cursor: pointer; transition: transform 0.2s; }
+    .expand-btn.open { transform: rotate(90deg); }
+    .log-line { font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 0.6875rem; line-height: 1.4; }
+    .log-ERROR { color: #f87171; }
+    .log-WARNING { color: #facc15; }
+    .log-INFO { color: #94a3b8; }
+    .log-DEBUG { color: #475569; }
+    input[type="text"] { background: #1a2236; border: 1px solid #334155; color: #e2e8f0; border-radius: 0.5rem; padding: 0.375rem 0.75rem; font-size: 0.8125rem; outline: none; }
+    input[type="text"]:focus { border-color: #60a5fa; }
+    select { background: #1a2236; border: 1px solid #334155; color: #e2e8f0; border-radius: 0.375rem; padding: 0.25rem 0.5rem; font-size: 0.8125rem; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+  </style>
+</head>
+<body class="min-h-screen p-4 md:p-6">
+  <div class="max-w-7xl mx-auto space-y-5">
+
+    <!-- Header -->
+    <div class="flex items-center justify-between flex-wrap gap-3">
+      <div>
+        <h1 class="text-xl font-bold text-white tracking-tight" id="h-title">Monitor de Debug</h1>
+        <p class="text-xs text-slate-500 mt-0.5" id="update-time"></p>
+      </div>
+      <div class="flex items-center gap-3 flex-wrap">
+        <button id="lang-toggle" class="px-2.5 py-1 rounded-md text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors">EN</button>
+        <div class="flex items-center gap-2">
+          <span class="text-xs text-slate-500" id="h-refresh">Atualizar:</span>
+          <select id="refresh-interval">
+            <option value="1000">1s</option>
+            <option value="3000" selected>3s</option>
+            <option value="5000">5s</option>
+            <option value="10000">10s</option>
+          </select>
+        </div>
+        <div id="status-dot" class="w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse"></div>
+      </div>
+    </div>
+
+    <!-- KPI Cards -->
+    <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3" id="kpi-grid">
+      <div class="card p-3">
+        <div class="text-[10px] text-slate-500 uppercase tracking-wider font-medium" data-t="books">Books Totais</div>
+        <div class="kpi-val text-white mt-1" id="kpi-books">-</div>
+      </div>
+      <div class="card p-3">
+        <div class="text-[10px] text-slate-500 uppercase tracking-wider font-medium" data-t="symbols">Simbolos</div>
+        <div class="kpi-val text-white mt-1" id="kpi-symbols">-</div>
+      </div>
+      <div class="card p-3">
+        <div class="text-[10px] text-slate-500 uppercase tracking-wider font-medium" data-t="opportunities">Oportunidades</div>
+        <div class="kpi-val text-cyan-400 mt-1" id="kpi-opps">-</div>
+      </div>
+      <div class="card p-3">
+        <div class="text-[10px] text-slate-500 uppercase tracking-wider font-medium" data-t="wsClients">Clientes WS</div>
+        <div class="kpi-val text-white mt-1" id="kpi-clients">-</div>
+      </div>
+      <div class="card p-3">
+        <div class="text-[10px] text-slate-500 uppercase tracking-wider font-medium" data-t="engine">Engine</div>
+        <div class="kpi-val mt-1" id="kpi-engine">-</div>
+      </div>
+      <div class="card p-3">
+        <div class="text-[10px] text-slate-500 uppercase tracking-wider font-medium" data-t="lastCalc">Ultimo Calculo</div>
+        <div class="kpi-val text-white mt-1" id="kpi-lastcalc">-</div>
+      </div>
+      <div class="card p-3">
+        <div class="text-[10px] text-slate-500 uppercase tracking-wider font-medium" data-t="calcCycle">Ciclo (ms)</div>
+        <div class="kpi-val text-white mt-1" id="kpi-cycle">-</div>
+      </div>
+      <div class="card p-3">
+        <div class="text-[10px] text-slate-500 uppercase tracking-wider font-medium" data-t="marketData">Dados Mercado</div>
+        <div class="kpi-val text-white mt-1" id="kpi-mdata">-</div>
+      </div>
+    </div>
+
+    <!-- Sparkline Charts -->
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+      <div class="card p-3">
+        <div class="text-[10px] text-slate-500 uppercase tracking-wider font-medium mb-2" data-t="booksChart">Books (tendencia)</div>
+        <svg id="spark-books" viewBox="0 0 200 50" class="w-full h-12"></svg>
+      </div>
+      <div class="card p-3">
+        <div class="text-[10px] text-slate-500 uppercase tracking-wider font-medium mb-2" data-t="oppsChart">Oportunidades (tendencia)</div>
+        <svg id="spark-opps" viewBox="0 0 200 50" class="w-full h-12"></svg>
+      </div>
+      <div class="card p-3">
+        <div class="text-[10px] text-slate-500 uppercase tracking-wider font-medium mb-2" data-t="calcChart">Latencia Calculo (ms)</div>
+        <svg id="spark-calc" viewBox="0 0 200 50" class="w-full h-12"></svg>
+      </div>
+    </div>
+
+    <!-- Exchange Table -->
+    <div class="card overflow-x-auto">
+      <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+        <h2 class="text-sm font-semibold text-white" data-t="exchangeStatus">Status das Exchanges</h2>
+      </div>
+      <table>
+        <thead>
+          <tr class="text-[10px] text-slate-400 uppercase tracking-wider">
+            <th data-t="thExchange">Exchange</th>
+            <th data-t="thWsStatus">WS Status</th>
+            <th data-t="thSpotBooks">Spot Books</th>
+            <th data-t="thFutBooks">Futures Books</th>
+            <th data-t="thAvgLatency">Latencia Media</th>
+            <th data-t="thMedianLatency">Mediana</th>
+            <th data-t="thFreshest">Mais Recente</th>
+            <th data-t="thOldest">Mais Antigo</th>
+            <th data-t="thAgeDistribution">Distribuicao de Idade</th>
+            <th>Overflow (S/F)</th>
+            <th data-t="thNoUpdate">Sem Update</th>
+          </tr>
+        </thead>
+        <tbody id="exchange-table">
+          <tr><td colspan="10" class="text-center text-slate-600 py-4" data-t="loading">Carregando...</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Engine Details (expandable) -->
+    <div class="card">
+      <div class="px-4 py-3 border-b border-slate-800 flex items-center gap-2 cursor-pointer" onclick="toggleSection('engine-details')">
+        <span class="expand-btn text-slate-400" id="engine-details-arrow">&#9654;</span>
+        <h2 class="text-sm font-semibold text-white" data-t="engineDetails">Detalhes da Engine</h2>
+      </div>
+      <div id="engine-details" class="hidden p-4 grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+        <div>
+          <div class="text-[10px] text-slate-500 uppercase" data-t="dirtySymbols">Simbolos Sujos</div>
+          <div class="font-medium text-white" id="eng-dirty">-</div>
+        </div>
+        <div>
+          <div class="text-[10px] text-slate-500 uppercase" data-t="staleBooks">Books Expirados</div>
+          <div class="font-medium text-white" id="eng-stale">-</div>
+        </div>
+        <div>
+          <div class="text-[10px] text-slate-500 uppercase" data-t="pairsTracked">Pares Rastreados</div>
+          <div class="font-medium text-white" id="eng-pairs">-</div>
+        </div>
+        <div>
+          <div class="text-[10px] text-slate-500 uppercase" data-t="totalRecords">Total Registros</div>
+          <div class="font-medium text-white" id="eng-records">-</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Config Grid (expandable) -->
+    <div class="card">
+      <div class="px-4 py-3 border-b border-slate-800 flex items-center gap-2 cursor-pointer" onclick="toggleSection('config-section')">
+        <span class="expand-btn text-slate-400" id="config-section-arrow">&#9654;</span>
+        <h2 class="text-sm font-semibold text-white" data-t="configuration">Configuracao</h2>
+      </div>
+      <div id="config-section" class="hidden p-4 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4" id="config-grid"></div>
+    </div>
+
+    <!-- Symbol Search -->
+    <div class="card">
+      <div class="px-4 py-3 border-b border-slate-800">
+        <h2 class="text-sm font-semibold text-white mb-2" data-t="symbolSearch">Buscar Simbolo</h2>
+        <div class="flex gap-2">
+          <input type="text" id="symbol-input" placeholder="BTC, ETH, SOL..." class="w-48" onkeydown="if(event.key==='Enter')searchSymbol()">
+          <button onclick="searchSymbol()" class="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium rounded-md transition-colors" data-t="search">Buscar</button>
+        </div>
+      </div>
+      <div id="symbol-result" class="p-4 text-sm hidden"></div>
+    </div>
+
+    <!-- Log Tail -->
+    <div class="card">
+      <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+        <h2 class="text-sm font-semibold text-white" data-t="recentLogs">Logs Recentes</h2>
+        <button onclick="fetchLogs()" class="text-xs text-slate-400 hover:text-white transition-colors" data-t="refreshLogs">Atualizar</button>
+      </div>
+      <div id="log-container" class="p-3 max-h-64 overflow-y-auto space-y-0.5">
+        <div class="text-slate-600 text-xs" data-t="clickRefresh">Clique em Atualizar para ver os logs</div>
+      </div>
+    </div>
+
+    <!-- Error banner -->
+    <div id="error-banner" class="hidden card p-3 border-red-900 bg-red-950/50 text-red-400 text-xs"></div>
+  </div>
+
+  <script>
+    // ---- Translation ----
+    const LANG = {
+      pt: {
+        title: "Monitor de Debug", refresh: "Atualizar:", books: "Books Totais", symbols: "Simbolos",
+        opportunities: "Oportunidades", wsClients: "Clientes WS", engine: "Engine", lastCalc: "Ultimo Calculo",
+        calcCycle: "Ciclo (ms)", marketData: "Dados Mercado", booksChart: "Books (tendencia)",
+        oppsChart: "Oportunidades (tendencia)", calcChart: "Latencia Calculo (ms)",
+        exchangeStatus: "Status das Exchanges", thExchange: "Exchange", thWsStatus: "WS Status",
+        thSpotBooks: "Spot Books", thFutBooks: "Futures Books", thSpotSym: "Spot Syms", thFutSym: "Futures Syms",
+        thAvgLatency: "Latencia Media", thMedianLatency: "Mediana",
+        thFreshest: "Mais Recente", thOldest: "Mais Antigo", thAgeDistribution: "Distribuicao de Idade",
+        thNoUpdate: "Sem Update",
+        engineDetails: "Detalhes da Engine", dirtySymbols: "Simbolos Sujos", staleBooks: "Books Expirados",
+        pairsTracked: "Pares Rastreados", totalRecords: "Total Registros", configuration: "Configuracao",
+        symbolSearch: "Buscar Simbolo", search: "Buscar", recentLogs: "Logs Recentes",
+        refreshLogs: "Atualizar", clickRefresh: "Clique em Atualizar para ver os logs",
+        loading: "Carregando...", connected: "Conectado", disconnected: "Desconectado",
+        running: "Ativo", stopped: "Parado", never: "Nunca", noExchanges: "Nenhuma exchange",
+        langBtn: "EN",
+        broadcastInterval: "Intervalo Broadcast", depthLimit: "Limite Profundidade",
+        minSpread: "Spread Min %", maxSpread: "Spread Max %", minVolume: "Volume Min USD",
+        maxSymbols: "Max Simbolos", symbolDiscovery: "Descoberta Simbolos",
+        trackingWindow: "Janela Tracker (s)", trackerInterval: "Intervalo Tracker", trackerDbPath: "Tracker DB",
+        configSymbols: "Simbolos Config", configExchanges: "Exchanges Config",
+        enabled: "Ativado", disabled: "Desativado", unlimited: "Ilimitado",
+      },
+      en: {
+        title: "Debug Monitor", refresh: "Refresh:", books: "Total Books", symbols: "Symbols",
+        opportunities: "Opportunities", wsClients: "WS Clients", engine: "Engine", lastCalc: "Last Calc",
+        calcCycle: "Cycle (ms)", marketData: "Market Data", booksChart: "Books (trend)",
+        oppsChart: "Opportunities (trend)", calcChart: "Calc Latency (ms)",
+        exchangeStatus: "Exchange Status", thExchange: "Exchange", thWsStatus: "WS Status",
+        thSpotBooks: "Spot Books", thFutBooks: "Futures Books", thSpotSym: "Spot Syms", thFutSym: "Futures Syms",
+        thAvgLatency: "Avg Latency", thMedianLatency: "Median",
+        thFreshest: "Freshest", thOldest: "Oldest", thAgeDistribution: "Age Distribution",
+        thNoUpdate: "No Update",
+        engineDetails: "Engine Details", dirtySymbols: "Dirty Symbols", staleBooks: "Stale Books",
+        pairsTracked: "Pairs Tracked", totalRecords: "Total Records", configuration: "Configuration",
+        symbolSearch: "Search Symbol", search: "Search", recentLogs: "Recent Logs",
+        refreshLogs: "Refresh", clickRefresh: "Click Refresh to view logs",
+        loading: "Loading...", connected: "Connected", disconnected: "Disconnected",
+        running: "Running", stopped: "Stopped", never: "Never", noExchanges: "No exchanges",
+        langBtn: "PT",
+        broadcastInterval: "Broadcast Interval", depthLimit: "Depth Limit",
+        minSpread: "Min Spread %", maxSpread: "Max Spread %", minVolume: "Min Volume USD",
+        maxSymbols: "Max Symbols", symbolDiscovery: "Symbol Discovery",
+        trackingWindow: "Tracker Window (s)", trackerInterval: "Tracker Interval", trackerDbPath: "Tracker DB",
+        configSymbols: "Config Symbols", configExchanges: "Config Exchanges",
+        enabled: "Enabled", disabled: "Disabled", unlimited: "Unlimited",
+      },
+    };
+
+    let lang = localStorage.getItem("debug-lang") || "pt";
+    const t = (key) => LANG[lang]?.[key] || LANG.pt[key] || key;
+
+    function applyLang() {
+      document.getElementById("h-title").textContent = t("title");
+      document.getElementById("h-refresh").textContent = t("refresh");
+      document.getElementById("lang-toggle").textContent = t("langBtn");
+      document.title = t("title");
+      document.querySelectorAll("[data-t]").forEach(el => {
+        const key = el.dataset.t;
+        if (LANG[lang]?.[key]) el.textContent = LANG[lang][key];
+      });
+    }
+
+    document.getElementById("lang-toggle").addEventListener("click", () => {
+      lang = lang === "pt" ? "en" : "pt";
+      localStorage.setItem("debug-lang", lang);
+      applyLang();
+    });
+
+    // ---- Sparkline data ----
+    const MAX_POINTS = 60;
+    const sparkData = { books: [], opps: [], calc: [] };
+
+    function pushSparkData(key, val) {
+      sparkData[key].push(val);
+      if (sparkData[key].length > MAX_POINTS) sparkData[key].shift();
+    }
+
+    function renderSparkline(svgId, data, color) {
+      const svg = document.getElementById(svgId);
+      if (!data.length) return;
+      const w = 200, h = 50, pad = 2;
+      const min = Math.min(...data), max = Math.max(...data);
+      const range = max - min || 1;
+      const pts = data.map((v, i) => {
+        const x = pad + (i / (MAX_POINTS - 1)) * (w - 2 * pad);
+        const y = h - pad - ((v - min) / range) * (h - 2 * pad);
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+      });
+      const lineD = `M${pts.join("L")}`;
+      const areaD = `${lineD}L${(pad + ((data.length - 1) / (MAX_POINTS - 1)) * (w - 2 * pad)).toFixed(1)},${h}L${pad},${h}Z`;
+      svg.innerHTML = `<path d="${areaD}" fill="${color}" class="spark-area"/>` +
+                       `<path d="${lineD}" stroke="${color}" class="sparkline"/>`;
+    }
+
+    // ---- Sections toggle ----
+    function toggleSection(id) {
+      const el = document.getElementById(id);
+      const arrow = document.getElementById(id + "-arrow");
+      el.classList.toggle("hidden");
+      arrow.classList.toggle("open");
+    }
+
+    // ---- Age formatting ----
+    function ageColor(age) {
+      if (age < 0) return "text-slate-600";
+      if (age < 10) return "dot-green";
+      if (age <= 30) return "dot-yellow";
+      return "dot-red";
+    }
+    function fmtAge(age) {
+      if (age < 0) return "N/A";
+      if (age < 60) return age.toFixed(1) + "s";
+      return (age / 60).toFixed(1) + "m";
+    }
+
+    // ---- Age distribution bar ----
+    function renderAgeDist(dist, total) {
+      if (!total || total === 0) return '<span class="text-slate-600">-</span>';
+      const buckets = [
+        { key: "lt5",   color: "#4ade80", label: "<5s" },
+        { key: "lt15",  color: "#a3e635", label: "<15s" },
+        { key: "lt30",  color: "#facc15", label: "<30s" },
+        { key: "lt60",  color: "#fb923c", label: "<60s" },
+        { key: "lt300", color: "#f87171", label: "<5m" },
+        { key: "gt300", color: "#dc2626", label: ">5m" },
+      ];
+      let html = '<div style="display:flex;height:14px;border-radius:4px;overflow:hidden;gap:1px">';
+      let tooltip = [];
+      for (const b of buckets) {
+        const count = dist[b.key] || 0;
+        if (count === 0) continue;
+        const pct = (count / total * 100);
+        html += `<div style="width:${Math.max(pct, 2)}%;background:${b.color};opacity:0.85" title="${b.label}: ${count}"></div>`;
+        tooltip.push(`${b.label}:${count}`);
+      }
+      html += '</div>';
+      html += `<div style="font-size:9px;color:#64748b;margin-top:2px">${tooltip.join(' ')}</div>`;
+      return html;
+    }
+
+    // ---- Fetch & Render ----
+    let refreshTimer = null;
+    let fetchCount = 0;
+
+    async function fetchStatus() {
+      try {
+        const resp = await fetch("/api/spread/debug/status");
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        fetchCount++;
+        render(data);
+        document.getElementById("error-banner").classList.add("hidden");
+        document.getElementById("status-dot").className = "w-2.5 h-2.5 rounded-full bg-emerald-500";
+      } catch (err) {
+        document.getElementById("error-banner").textContent = `Erro: ${err.message}`;
+        document.getElementById("error-banner").classList.remove("hidden");
+        document.getElementById("status-dot").className = "w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse";
+      }
+    }
+
+    function render(data) {
+      const now = new Date();
+      document.getElementById("update-time").textContent =
+        `${now.toLocaleTimeString()} (#${fetchCount})`;
+
+      const tot = data.totals || {};
+
+      // KPIs
+      document.getElementById("kpi-books").textContent = tot.books ?? "-";
+      document.getElementById("kpi-symbols").textContent = tot.symbols ?? "-";
+      document.getElementById("kpi-opps").textContent = tot.opportunities ?? "-";
+      document.getElementById("kpi-clients").textContent = tot.ws_clients ?? "-";
+
+      const engineEl = document.getElementById("kpi-engine");
+      if (data.engine_running) {
+        engineEl.textContent = t("running");
+        engineEl.className = "kpi-val mt-1 dot-green";
+      } else {
+        engineEl.textContent = t("stopped");
+        engineEl.className = "kpi-val mt-1 dot-red";
+      }
+
+      const lastCalc = tot.last_calc;
+      const calcEl = document.getElementById("kpi-lastcalc");
+      if (lastCalc > 0) {
+        const ago = data.ts - lastCalc;
+        calcEl.textContent = ago.toFixed(1) + "s";
+        calcEl.className = `kpi-val mt-1 ${ageColor(ago)}`;
+      } else {
+        calcEl.textContent = t("never");
+        calcEl.className = "kpi-val mt-1 text-slate-600";
+      }
+
+      // Cycle time
+      const cycleMs = data.engine?.calc_cycle_ms ?? 0;
+      document.getElementById("kpi-cycle").textContent = cycleMs > 0 ? Math.round(cycleMs) : "-";
+
+      // Market data
+      const mdAge = data.market_data?.oldest_age ?? -1;
+      const mdEl = document.getElementById("kpi-mdata");
+      if (mdAge >= 0) {
+        mdEl.textContent = fmtAge(mdAge);
+        mdEl.className = `kpi-val mt-1 ${ageColor(mdAge > 120 ? mdAge : 5)}`;
+      } else {
+        mdEl.textContent = "-";
+      }
+
+      // Sparklines
+      pushSparkData("books", tot.books ?? 0);
+      pushSparkData("opps", tot.opportunities ?? 0);
+      pushSparkData("calc", cycleMs);
+      renderSparkline("spark-books", sparkData.books, "#60a5fa");
+      renderSparkline("spark-opps", sparkData.opps, "#22d3ee");
+      renderSparkline("spark-calc", sparkData.calc, "#a78bfa");
+
+      // Exchange table
+      const tbody = document.getElementById("exchange-table");
+      if (!data.exchanges?.length) {
+        tbody.innerHTML = `<tr><td colspan="11" class="text-center text-slate-600 py-4">${t("noExchanges")}</td></tr>`;
+      } else {
+        let html = "";
+        for (const ex of data.exchanges) {
+          const wsClass = ex.ws_running ? "dot-green" : "dot-red";
+          const wsText = ex.ws_running ? t("connected") : t("disconnected");
+          const dist = ex.age_distribution || {};
+          const distBar = renderAgeDist(dist, ex.total_book_keys);
+          html += `<tr>
+            <td class="font-medium text-white">${ex.name.toUpperCase()}</td>
+            <td><span class="${wsClass} font-medium">${wsText}</span></td>
+            <td>${ex.spot_books}</td>
+            <td>${ex.futures_books}</td>
+            <td class="${ageColor(ex.avg_age)}">${fmtAge(ex.avg_age)}</td>
+            <td class="${ageColor(ex.median_age)}">${fmtAge(ex.median_age)}</td>
+            <td class="${ageColor(ex.freshest_age)}">${fmtAge(ex.freshest_age)}</td>
+            <td class="${ageColor(ex.oldest_age)}">${fmtAge(ex.oldest_age)}</td>
+            <td style="min-width:180px">${distBar}</td>
+            <td>${ex.overflow_spot} / ${ex.overflow_futures}</td>
+            <td class="${(ex.no_update_books || 0) > 0 ? 'dot-red' : 'text-slate-400'}">${ex.no_update_books || 0}</td>
+          </tr>`;
+        }
+        tbody.innerHTML = html;
+      }
+
+      // Engine details
+      const eng = data.engine || {};
+      const trk = data.tracker || {};
+      document.getElementById("eng-dirty").textContent = eng.dirty_count ?? "-";
+      document.getElementById("eng-stale").textContent = eng.last_stale_count ?? "-";
+      document.getElementById("eng-pairs").textContent = trk.pairs_tracked ?? "-";
+      document.getElementById("eng-records").textContent = trk.total_records ?? "-";
+
+      // Config
+      const cfg = data.config || {};
+      const configEl = document.getElementById("config-section");
+      const labels = {
+        broadcast_interval_sec: "broadcastInterval",
+        depth_limit: "depthLimit",
+        min_spread_pct: "minSpread",
+        max_spread_pct: "maxSpread",
+        min_volume_usd: "minVolume",
+        max_symbols: "maxSymbols",
+        symbol_discovery_enabled: "symbolDiscovery",
+        tracking_window_sec: "trackingWindow",
+        tracker_record_interval_sec: "trackerInterval",
+        tracker_db_path: "trackerDbPath",
+        total_configured_symbols: "configSymbols",
+        total_configured_exchanges: "configExchanges",
+      };
+      let cfgHtml = "";
+      for (const [key, labelKey] of Object.entries(labels)) {
+        let val = cfg[key];
+        if (val === true) val = t("enabled");
+        else if (val === false) val = t("disabled");
+        else if (val === 0 && key.includes("max_symbols")) val = t("unlimited");
+        cfgHtml += `<div>
+          <div class="text-[10px] text-slate-500 uppercase">${t(labelKey)}</div>
+          <div class="text-sm font-medium text-white">${val ?? "-"}</div>
+        </div>`;
+      }
+      configEl.innerHTML = cfgHtml;
+    }
+
+    // ---- Symbol Search ----
+    async function searchSymbol() {
+      const sym = document.getElementById("symbol-input").value.trim().toUpperCase();
+      if (!sym) return;
+      const resultEl = document.getElementById("symbol-result");
+      resultEl.classList.remove("hidden");
+      resultEl.innerHTML = '<span class="text-slate-500">' + t("loading") + '</span>';
+      try {
+        const resp = await fetch(`/api/spread/debug/books?symbol=${sym}`);
+        const data = await resp.json();
+        if (data.books && Object.keys(data.books).length > 0) {
+          let html = `<div class="font-semibold text-white mb-2">${data.symbol}</div><div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">`;
+          for (const [ex, markets] of Object.entries(data.books)) {
+            for (const [mt, info] of Object.entries(markets)) {
+              const ageC = ageColor(info.age);
+              html += `<div class="bg-slate-900/50 rounded-lg p-3 border border-slate-800">
+                <div class="flex items-center justify-between mb-1">
+                  <span class="font-medium text-white text-xs">${ex.toUpperCase()}</span>
+                  <span class="text-[10px] px-1.5 py-0.5 rounded ${mt === 'spot' ? 'bg-blue-900/40 text-blue-300' : 'bg-purple-900/40 text-purple-300'}">${mt}</span>
+                </div>
+                <div class="text-[11px] space-y-0.5">
+                  <div>Bid: <span class="text-emerald-400">${info.best_bid}</span> Ask: <span class="text-red-400">${info.best_ask}</span></div>
+                  <div>Depth: ${info.bids_count}/${info.asks_count} &middot; Age: <span class="${ageC}">${fmtAge(info.age)}</span></div>
+                </div>
+              </div>`;
+            }
+          }
+          html += "</div>";
+          resultEl.innerHTML = html;
+        } else if (data.symbols) {
+          resultEl.innerHTML = `<span class="text-slate-400">${data.symbols_with_books} simbolos com books</span>`;
+        } else {
+          resultEl.innerHTML = '<span class="text-slate-500">Nenhum book encontrado</span>';
+        }
+      } catch (err) {
+        resultEl.innerHTML = `<span class="text-red-400">Erro: ${err.message}</span>`;
+      }
+    }
+
+    // ---- Logs ----
+    async function fetchLogs() {
+      try {
+        const resp = await fetch("/api/spread/debug/logs?limit=30");
+        const data = await resp.json();
+        const container = document.getElementById("log-container");
+        if (!data.logs?.length) {
+          container.innerHTML = '<div class="text-slate-600 text-xs">Nenhum log disponivel</div>';
+          return;
+        }
+        container.innerHTML = data.logs.reverse().map(l => {
+          const lvl = l.level || "INFO";
+          return `<div class="log-line log-${lvl}">${l.msg || ""}</div>`;
+        }).join("");
+      } catch (err) {
+        document.getElementById("log-container").innerHTML = `<div class="text-red-400 text-xs">Erro: ${err.message}</div>`;
+      }
+    }
+
+    // ---- Start ----
+    function startRefresh() {
+      if (refreshTimer) clearInterval(refreshTimer);
+      const interval = parseInt(document.getElementById("refresh-interval").value);
+      fetchStatus();
+      refreshTimer = setInterval(fetchStatus, interval);
+    }
+
+    document.getElementById("refresh-interval").addEventListener("change", startRefresh);
+    applyLang();
+    startRefresh();
+  </script>
+</body>
+</html>

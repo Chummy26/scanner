@@ -1,0 +1,9 @@
+ccxt
+pytest
+aiohttp
+websockets
+protobuf
+scikit-learn
+numpy
+torch
+psutil

@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Scanner - Fila de Ação LSTM</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root{
+      --bg:#07101a;--panel:rgba(13,21,33,.9);--panel-2:rgba(9,15,24,.94);--border:rgba(147,168,194,.14);--text:#edf3fb;--muted:#91a5bd;
+      --accent:#79d8ff;--accent-2:#7ef0c1;--warn:#f4c97c;--danger:#ff8b8b;--info:#a8bbff;--shadow:0 18px 60px rgba(0,0,0,.28)
+    }
+    *{box-sizing:border-box} body{margin:0;min-height:100vh;color:var(--text);font-family:"Space Grotesk",sans-serif;background:radial-gradient(circle at top left,rgba(121,216,255,.12),transparent 24%),radial-gradient(circle at top right,rgba(126,240,193,.10),transparent 22%),linear-gradient(180deg,#07101a 0%,#0b1521 100%)}
+    button,input,select{font:inherit} button{cursor:pointer} .page{max-width:1580px;margin:0 auto;padding:24px 18px 44px}
+    .panel{background:var(--panel);border:1px solid var(--border);border-radius:24px;backdrop-filter:blur(12px);box-shadow:var(--shadow)}
+    .header,.toolbar,.section{padding:22px}
+    .header{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;flex-wrap:wrap}
+    .eyebrow{display:flex;gap:10px;align-items:center;font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)} .eyebrow a{color:inherit;text-decoration:none}
+    h1{margin:12px 0 10px;font-size:clamp(34px,5vw,54px);line-height:.98} .subtitle{max-width:860px;margin:0;color:var(--muted);line-height:1.7;font-size:15px}
+    .actions,.filter-row,.button-row{display:flex;gap:10px;flex-wrap:wrap}
+    .btn{border-radius:999px;border:1px solid transparent;padding:11px 16px;font-weight:700;color:var(--text);background:rgba(18,28,42,.92)}
+    .btn.primary{background:linear-gradient(135deg,var(--accent),var(--accent-2));color:#03111b}
+    .btn.ghost{border-color:var(--border)}
+    .btn.warn{background:rgba(244,201,124,.10);border-color:rgba(244,201,124,.26);color:#ffd890}
+    .summary{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:14px;margin-top:18px}
+    .metric{padding:18px;border-radius:22px;background:linear-gradient(180deg,rgba(121,216,255,.09),rgba(9,15,24,.94));border:1px solid rgba(147,168,194,.12)}
+    .metric .label{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.14em}.metric .value{margin-top:10px;font-size:clamp(22px,2.5vw,32px);font-weight:700}.metric .detail{margin-top:8px;font-size:13px;line-height:1.5;color:var(--muted)}
+    .toolbar{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;align-items:end;margin-top:18px}
+    .field{display:block;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.14em;margin-bottom:8px}
+    .input,.select{border-radius:16px;border:1px solid rgba(147,168,194,.18);background:rgba(6,11,18,.72);color:var(--text);padding:12px 14px}
+    .layout{display:flex;flex-direction:column;gap:18px;margin-top:18px}
+    .section-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:16px}.title{margin:0;font-size:24px}.note{margin:6px 0 0;color:var(--muted);font-size:14px;line-height:1.6}
+    .badge{display:inline-flex;align-items:center;gap:8px;border-radius:999px;border:1px solid var(--border);padding:7px 11px;font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:700;background:rgba(17,26,38,.82)}
+    .badge.good{color:#b7f8df;border-color:rgba(126,240,193,.22);background:rgba(126,240,193,.10)} .badge.warn{color:#ffd890;border-color:rgba(244,201,124,.24);background:rgba(244,201,124,.10)}
+    .badge.danger{color:#ffc2c2;border-color:rgba(255,139,139,.24);background:rgba(255,139,139,.10)} .badge.info{color:#cdd9ff;border-color:rgba(168,187,255,.24);background:rgba(168,187,255,.10)}
+    .mode-bar{display:flex;gap:10px;flex-wrap:wrap}.mode-btn.active{background:linear-gradient(135deg,var(--accent),var(--accent-2));color:#03111b;border-color:transparent}
+    .lane-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+    .lane{border-radius:22px;border:1px solid var(--border);background:linear-gradient(180deg,rgba(16,27,41,.95),rgba(10,16,24,.95));padding:18px}
+    .lane[data-lane="execute_now"]{box-shadow:inset 0 0 0 1px rgba(126,240,193,.08)} .lane[data-lane="blocked"]{box-shadow:inset 0 0 0 1px rgba(255,139,139,.08)}
+    .lane-cards{display:flex;flex-direction:column;gap:12px;margin-top:16px}
+    .signal-card{border-radius:18px;border:1px solid rgba(147,168,194,.12);background:rgba(7,11,18,.62);padding:15px}
+    .signal-top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
+    .symbol{font-size:20px;font-weight:700}.route{font-size:13px;color:var(--muted);margin-top:6px}
+    .spread{font-family:"IBM Plex Mono",monospace;font-size:22px;font-weight:700}
+    .spread.good{color:var(--accent-2)} .spread.warn{color:var(--warn)} .spread.danger{color:var(--danger)}
+    .card-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:14px}
+    .mini{border-radius:14px;border:1px solid rgba(147,168,194,.10);background:rgba(5,9,16,.55);padding:10px 11px}.mini .k{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em}.mini .v{margin-top:6px;font-size:14px;font-weight:700}
+    .chip-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+    .chip{border-radius:999px;padding:6px 10px;font-size:12px;font-weight:700;background:rgba(17,26,38,.8);border:1px solid var(--border);color:var(--muted)}
+    .chip.good{color:#b7f8df}.chip.warn{color:#ffd890}.chip.danger{color:#ffc2c2}.chip.info{color:#cdd9ff}
+    .operator{margin-top:12px;color:var(--text);line-height:1.6;font-size:14px}.muted{color:var(--muted)} .mono{font-family:"IBM Plex Mono",monospace}
+    .table-shell{overflow:auto;border-radius:20px;border:1px solid var(--border);background:var(--panel-2)}
+    table{width:100%;border-collapse:collapse;font-size:14px} thead th{text-align:left;padding:12px 14px;font-size:12px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);border-bottom:1px solid rgba(147,168,194,.12)} tbody td{padding:14px;border-bottom:1px solid rgba(147,168,194,.08);vertical-align:top}
+    .empty{border-radius:20px;border:1px solid var(--border);background:var(--panel-2);padding:18px;color:var(--muted);line-height:1.6}
+    .hidden{display:none !important}
+    @media (max-width:1320px){.summary{grid-template-columns:repeat(4,minmax(0,1fr))}.lane-grid{grid-template-columns:1fr}.toolbar{grid-template-columns:1fr}}
+    @media (max-width:860px){.page{padding:16px 12px 30px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.card-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header class="panel header">
+      <div>
+        <div class="eyebrow"><span>Dashboard de sinais</span><span>/</span><a href="/dashboard/training">Curadoria de treino</a></div>
+        <h1>Fila de ação do LSTM</h1>
+        <p class="subtitle">A tela principal agora prioriza o que fazer agora, o que apenas observar e o que está bloqueado. O modo analítico continua disponível, mas deixa de ser a visão primária do operador.</p>
+      </div>
+      <div class="actions">
+        <div id="model-badge" class="badge">Status desconhecido</div>
+        <button id="refresh-btn" class="btn ghost">Atualizar</button>
+      </div>
+    </header>
+
+    <section class="summary">
+      <article class="metric"><div class="label">Oportunidades</div><div id="sum-total" class="value">0</div><div class="detail">Linhas processadas pelo scanner</div></article>
+      <article class="metric"><div class="label">Agir agora</div><div id="sum-execute" class="value" style="color:var(--accent-2)">0</div><div class="detail">Fila acionável</div></article>
+      <article class="metric"><div class="label">Observar</div><div id="sum-observe" class="value" style="color:var(--warn)">0</div><div class="detail">Contexto favorável, mas sem prioridade imediata</div></article>
+      <article class="metric"><div class="label">Bloqueadas</div><div id="sum-blocked" class="value" style="color:var(--danger)">0</div><div class="detail">Sem contexto confiável para agir</div></article>
+      <article class="metric"><div class="label">Prontas com drift</div><div id="sum-drift" class="value" style="color:var(--danger)">0</div><div class="detail">Linhas ready sob atenção</div></article>
+      <article class="metric"><div class="label">Prob. média pronta</div><div id="sum-prob" class="value">0%</div><div class="detail">Somente linhas ready</div></article>
+      <article class="metric"><div class="label">Bundle ativo</div><div id="sum-bundle" class="value" style="font-size:20px">--</div><div id="sum-bundle-detail" class="detail">Versão dominante e estado</div></article>
+      <article class="metric"><div class="label">P99 inferência</div><div id="sum-latency" class="value" style="color:var(--accent)">0ms</div><div class="detail">Somente linhas ready</div></article>
+    </section>
+
+    <section class="panel toolbar">
+      <div class="filter-row">
+        <div>
+          <label class="field" for="search-input">Buscar símbolo</label>
+          <input id="search-input" class="input" type="search" placeholder="BTC, ETH, SOL...">
+        </div>
+        <div>
+          <label class="field" for="lane-filter">Fila</label>
+          <select id="lane-filter" class="select">
+            <option value="all">Todas</option>
+            <option value="execute_now">Agir agora</option>
+            <option value="observe">Observar</option>
+            <option value="blocked">Bloqueadas</option>
+          </select>
+        </div>
+      </div>
+      <div class="mode-bar">
+        <button id="board-mode-btn" class="btn ghost mode-btn active">Fila de ação</button>
+        <button id="table-mode-btn" class="btn ghost mode-btn">Modo analítico</button>
+      </div>
+    </section>
+
+    <div class="layout">
+      <section class="panel section" id="board-section">
+        <div class="section-head">
+          <div>
+            <h2 class="title">Prioridades operacionais</h2>
+            <p class="note">O board separa o que é acionável, o que exige observação e o que está bloqueado. Cada card explica o motivo e a próxima ação sugerida.</p>
+          </div>
+          <div id="updated-at" class="badge info">Sem atualização</div>
+        </div>
+        <div id="lane-grid" class="lane-grid"></div>
+      </section>
+
+      <section class="panel section hidden" id="table-section">
+        <div class="section-head">
+          <div>
+            <h2 class="title">Modo analítico</h2>
+            <p class="note">Tabela densa para inspeção detalhada e auditoria rápida das mesmas oportunidades exibidas na fila de ação.</p>
+          </div>
+        </div>
+        <div id="table-shell" class="table-shell"></div>
+      </section>
+    </div>
+  </div>
+  <script>
+    let dashboardPayload = {data: [], summary: {}};
+    let currentMode = "board";
+    const laneMeta = {
+      execute_now: {title: "Agir agora", description: "Poucas oportunidades com sinal operacional claro.", badge: "good"},
+      observe: {title: "Observar", description: "Contexto interessante, mas ainda sem prioridade de execução.", badge: "warn"},
+      blocked: {title: "Bloqueadas", description: "Sem segurança operacional para agir neste momento.", badge: "danger"},
+    };
+    const esc = (value) => String(value || "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
+    const fmtPct = (value) => `${Number(value || 0).toFixed(1)}%`;
+    const spreadClass = (value) => Number(value || 0) >= 0.8 ? "good" : Number(value || 0) >= 0.3 ? "warn" : "danger";
+    const prettyCode = (value) => String(value || "").replaceAll("_", " ");
+
+    async function fetchDashboard() {
+      const response = await fetch("/api/v1/ml/dashboard");
+      const payload = await response.json();
+      dashboardPayload = {data: payload.data || [], summary: payload.summary || {}};
+      renderAll();
+    }
+
+    function filteredData() {
+      const search = (document.getElementById("search-input").value || "").trim().toLowerCase();
+      const lane = document.getElementById("lane-filter").value || "all";
+      return (dashboardPayload.data || []).filter((opp) => {
+        const symbol = String(opp.symbol || "").toLowerCase();
+        const actionLane = String(opp.action_lane || "blocked");
+        if (search && !symbol.includes(search)) return false;
+        if (lane !== "all" && actionLane !== lane) return false;
+        return true;
+      });
+    }
+
+    function setModelBadge(summary) {
+      const badge = document.getElementById("model-badge");
+      const bundleStatus = summary.bundle_status || "degraded";
+      const bundleVersion = summary.bundle_version || "unavailable";
+      if (bundleStatus === "fully_ready") {
+        badge.className = "badge good";
+        badge.textContent = `Bundle pronto • ${bundleVersion}`;
+        return;
+      }
+      if (bundleStatus === "ready_with_drift") {
+        badge.className = "badge warn";
+        badge.textContent = `Bundle com drift • ${bundleVersion}`;
+        return;
+      }
+      if (bundleStatus === "mixed") {
+        badge.className = "badge info";
+        badge.textContent = `Estado misto • ${bundleVersion}`;
+        return;
+      }
+      badge.className = "badge danger";
+      badge.textContent = `Bundle degradado • ${bundleVersion}`;
+    }
+
+    function renderSummary(summary, data) {
+      const laneCounts = summary.lane_counts || {};
+      document.getElementById("sum-total").textContent = summary.total || 0;
+      document.getElementById("sum-execute").textContent = laneCounts.execute_now || 0;
+      document.getElementById("sum-observe").textContent = laneCounts.observe || 0;
+      document.getElementById("sum-blocked").textContent = laneCounts.blocked || 0;
+      document.getElementById("sum-drift").textContent = summary.drifted_ready || 0;
+      document.getElementById("sum-prob").textContent = fmtPct(summary.avg_success_probability_ready || 0);
+      document.getElementById("sum-bundle").textContent = summary.bundle_version || "--";
+      document.getElementById("sum-bundle-detail").textContent = summary.bundle_status || "sem bundle";
+      document.getElementById("sum-latency").textContent = `${Number(summary.p99_inference_latency_ms_ready || 0).toFixed(1)}ms`;
+      document.getElementById("updated-at").textContent = summary.updated_at ? `Atualizado em ${new Date(summary.updated_at).toLocaleTimeString("pt-BR", {hour12:false})}` : "Sem atualização";
+      setModelBadge(summary);
+    }
+
+    function statusBadge(status) {
+      if (status === "ready") return '<span class="badge good">Ready</span>';
+      if (status === "insufficient_history") return '<span class="badge warn">Histórico curto</span>';
+      if (status === "stale_artifact") return '<span class="badge danger">Artefato desatualizado</span>';
+      if (status === "missing_artifact") return '<span class="badge danger">Sem artefato</span>';
+      return '<span class="badge warn">Sem ML</span>';
+    }
+
+    function signalBadge(signal) {
+      if (signal === "STRONG_EXECUTE") return '<span class="badge good">Executar forte</span>';
+      if (signal === "EXECUTE") return '<span class="badge info">Executar</span>';
+      return '<span class="badge warn">Aguardar</span>';
+    }
+
+    function riskChips(flags) {
+      const list = Array.isArray(flags) ? flags : [];
+      if (!list.length) return '<span class="chip good">sem flags</span>';
+      return list.map((flag) => {
+        const klass = flag === "drift" || flag === "stale_artifact" || flag === "missing_artifact" ? "danger" : (flag === "latency_alert" ? "warn" : "info");
+        return `<span class="chip ${klass}">${esc(prettyCode(flag))}</span>`;
+      }).join("");
+    }
+
+    function signalCard(opp) {
+      const ml = opp.mlContext || {};
+      const lane = opp.action_lane || "blocked";
+      const rangeStatus = String(ml.range_status || "unknown");
+      const entryPosition = String(ml.entry_position_label || "unknown");
+      const hideProbEta = lane === "blocked" && rangeStatus === "insufficient_empirical_context";
+      const supportText = `${Number(ml.empirical_support_short || 0)} curta / ${Number(ml.empirical_support_long || 0)} longa`;
+      const etaDiag = ml.estimated_time_to_close || "--";
+      const empiricalEtaDiag = Number(ml.empirical_eta_q25_seconds || 0) > 0
+        ? `${Math.round(Number(ml.empirical_eta_q25_seconds || 0) / 60)}-${Math.round(Number(ml.empirical_eta_q75_seconds || 0) / 60)}m`
+        : "--";
+      const metricsHtml = hideProbEta ? `
+            <div class="mini"><div class="k">Faixa</div><div class="v">${esc("Contexto insuficiente")}</div></div>
+            <div class="mini"><div class="k">Suporte</div><div class="v mono">${esc(supportText)}</div></div>
+            <div class="mini"><div class="k">Status ML</div><div class="v">${esc(prettyCode(ml.model_status || "missing_ml_context"))}</div></div>
+            <div class="mini"><div class="k">Motivo</div><div class="v">${esc(prettyCode(opp.signal_reason_code || ""))}</div></div>
+      ` : `
+            <div class="mini"><div class="k">Entrada</div><div class="v mono">${esc(ml.recommended_entry_range || "--")}</div></div>
+            <div class="mini"><div class="k">Saída</div><div class="v mono">${esc(ml.recommended_exit_range || "--")}</div></div>
+            <div class="mini"><div class="k">ETA</div><div class="v">${esc(etaDiag)}</div></div>
+            <div class="mini"><div class="k">Prob./Score</div><div class="v mono">${fmtPct(ml.success_probability || 0)} / ${Number(ml.ml_score || opp.mlScore || 0).toFixed(0)}</div></div>
+      `;
+      return `
+        <article class="signal-card">
+          <div class="signal-top">
+            <div>
+              <div class="symbol">${esc(opp.symbol || "--")}</div>
+              <div class="route">${esc(opp.buyFrom || "--")} -> ${esc(opp.sellTo || "--")}</div>
+            </div>
+            <div style="text-align:right">
+              <div class="spread ${spreadClass(opp.entrySpread)}">${Number(opp.entrySpread || 0).toFixed(2)}%</div>
+              <div class="muted mono" style="margin-top:6px">${esc(lane.replaceAll("_", " "))}</div>
+            </div>
+          </div>
+          <div class="card-metrics">
+            ${metricsHtml}
+          </div>
+          <div class="chip-row">
+            ${signalBadge(ml.signal_action || "WAIT")}
+            ${statusBadge(ml.model_status || "missing_ml_context")}
+            <span class="chip info">${esc(prettyCode(ml.context_strength || "sem_contexto"))}</span>
+            <span class="chip info">${esc(prettyCode(rangeStatus))}</span>
+            <span class="chip ${entryPosition === "inside_core" ? "good" : (entryPosition === "inside_outer" ? "warn" : "danger")}">${esc(prettyCode(entryPosition))}</span>
+            <span class="chip ${ml.eta_alignment_status === "divergent" ? "danger" : (ml.eta_alignment_status === "aligned" ? "good" : "info")}">${esc(prettyCode(ml.eta_alignment_status || "unknown"))}</span>
+            ${ml.drift_status === "drifted" ? '<span class="chip danger">drift</span>' : '<span class="chip good">sem drift</span>'}
+            ${riskChips(opp.risk_flags)}
+          </div>
+          <div class="operator"><strong>Próxima ação:</strong> ${esc(opp.operator_message || "Sem orientação operacional.")}</div>
+          <div class="muted" style="margin-top:8px;line-height:1.6">Motivo: ${esc(ml.signal_reason || prettyCode(opp.signal_reason_code || ""))}</div>
+          <details style="margin-top:12px">
+            <summary class="muted" style="cursor:pointer">Detalhes do bundle e contexto</summary>
+            <div class="muted" style="margin-top:8px;line-height:1.6">
+              Bundle: ${esc(ml.model_version || "unavailable")} • Latência: ${Number(ml.inference_latency_ms || 0).toFixed(2)}ms<br>
+              Contexto: ${esc(ml.nlp_context || "--")}<br>
+              Faixa recorrente: ${esc(ml.recommended_entry_range || "--")} / ${esc(ml.recommended_exit_range || "--")}<br>
+              Suporte: ${esc(supportText)} • Percentil nas excursões: ${Number(ml.context_percentile_excursions || ml.context_percentile || 0).toFixed(2)}<br>
+              ETA modelo: ${esc(etaDiag)} • ETA empírico Q25-Q75: ${esc(empiricalEtaDiag)}<br>
+              Código: ${esc(opp.signal_reason_code || "--")}
+            </div>
+          </details>
+        </article>
+      `;
+    }
+
+    function renderBoard(data) {
+      const grouped = {execute_now: [], observe: [], blocked: []};
+      data.forEach((opp) => { grouped[opp.action_lane || "blocked"].push(opp); });
+      document.getElementById("lane-grid").innerHTML = Object.entries(laneMeta).map(([lane, meta]) => `
+        <section class="lane" data-lane="${lane}">
+          <div class="section-head" style="margin-bottom:0">
+            <div>
+              <h3 class="title" style="font-size:20px">${meta.title}</h3>
+              <p class="note">${meta.description}</p>
+            </div>
+            <span class="badge ${meta.badge}">${grouped[lane].length}</span>
+          </div>
+          <div class="lane-cards">
+            ${grouped[lane].length ? grouped[lane].map(signalCard).join("") : '<div class="empty">Nenhuma oportunidade nesta fila.</div>'}
+          </div>
+        </section>
+      `).join("");
+    }
+
+    function renderTable(data) {
+      const shell = document.getElementById("table-shell");
+      if (!data.length) {
+        shell.innerHTML = '<div class="empty">Nenhuma oportunidade corresponde aos filtros ativos.</div>';
+        return;
+      }
+      shell.innerHTML = `
+        <table>
+          <thead>
+            <tr>
+              <th>Fila</th>
+              <th>Par</th>
+              <th>Corretoras</th>
+              <th>Spread</th>
+              <th>Prob./Score</th>
+              <th>Ação</th>
+              <th>Status</th>
+              <th>Motivo</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${data.map((opp) => {
+              const ml = opp.mlContext || {};
+              return `<tr>
+                <td><span class="badge ${opp.action_lane === "execute_now" ? "good" : (opp.action_lane === "observe" ? "warn" : "danger")}">${esc(prettyCode(opp.action_lane || "blocked"))}</span></td>
+                <td><strong>${esc(opp.symbol || "--")}</strong></td>
+                <td>${esc(opp.buyFrom || "--")} -> ${esc(opp.sellTo || "--")}</td>
+                <td class="mono">${Number(opp.entrySpread || 0).toFixed(2)}%</td>
+                <td class="mono">${fmtPct(ml.success_probability || 0)} / ${Number(ml.ml_score || opp.mlScore || 0).toFixed(0)}</td>
+                <td>${esc(ml.signal_action || "WAIT")}</td>
+                <td>${esc(ml.model_status || "missing_ml_context")}</td>
+                <td>${esc(opp.operator_message || ml.signal_reason || "--")}</td>
+              </tr>`;
+            }).join("")}
+          </tbody>
+        </table>
+      `;
+    }
+
+    function renderMode() {
+      const board = document.getElementById("board-section");
+      const table = document.getElementById("table-section");
+      document.getElementById("board-mode-btn").classList.toggle("active", currentMode === "board");
+      document.getElementById("table-mode-btn").classList.toggle("active", currentMode === "table");
+      board.classList.toggle("hidden", currentMode !== "board");
+      table.classList.toggle("hidden", currentMode !== "table");
+    }
+
+    function renderAll() {
+      const data = filteredData();
+      renderSummary(dashboardPayload.summary || {}, data);
+      renderBoard(data);
+      renderTable(data);
+      renderMode();
+    }
+
+    document.getElementById("refresh-btn").addEventListener("click", fetchDashboard);
+    document.getElementById("search-input").addEventListener("input", renderAll);
+    document.getElementById("lane-filter").addEventListener("change", renderAll);
+    document.getElementById("board-mode-btn").addEventListener("click", () => { currentMode = "board"; renderMode(); });
+    document.getElementById("table-mode-btn").addEventListener("click", () => { currentMode = "table"; renderMode(); });
+
+    fetchDashboard().catch((error) => {
+      console.error("Failed to load ML API", error);
+      document.getElementById("lane-grid").innerHTML = '<div class="empty">Falha ao carregar o dashboard de sinais.</div>';
+      document.getElementById("table-shell").innerHTML = '<div class="empty">Falha ao carregar o dashboard de sinais.</div>';
+    });
+    window.setInterval(() => fetchDashboard().catch((error) => console.error("Failed to refresh ML API", error)), 2000);
+  </script>
+</body>
+</html>

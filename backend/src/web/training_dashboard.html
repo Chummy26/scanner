@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Scanner - Curadoria de Treino LSTM</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root{
+      --bg:#081019;--bg-soft:#0c1622;--panel:rgba(13,22,34,.88);--panel-2:rgba(9,15,24,.92);
+      --border:rgba(146,167,194,.14);--border-strong:rgba(146,167,194,.22);--text:#ebf2fb;--muted:#94a5ba;
+      --accent:#7dd3fc;--accent-2:#85f0c8;--warn:#f4c97c;--danger:#ff8b8b;--info:#9cb6ff;
+      --shadow:0 18px 60px rgba(0,0,0,.28);--radius:24px
+    }
+    *{box-sizing:border-box} body{margin:0;min-height:100vh;color:var(--text);font-family:"Space Grotesk",sans-serif;background:radial-gradient(circle at top left,rgba(125,211,252,.12),transparent 24%),radial-gradient(circle at top right,rgba(133,240,200,.10),transparent 22%),linear-gradient(180deg,#081019 0%,#0b1522 100%)}
+    button,input{font:inherit} button{cursor:pointer} .page{max-width:1560px;margin:0 auto;padding:24px 18px 44px}
+    .panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);backdrop-filter:blur(12px)}
+    .header,.controls,.section,.aside-card{padding:22px}
+    .header{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;flex-wrap:wrap}
+    .eyebrow{display:flex;gap:10px;align-items:center;font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)} .eyebrow a{color:inherit;text-decoration:none}
+    h1{margin:12px 0 10px;font-size:clamp(32px,5vw,52px);line-height:.98} .subtitle{max-width:820px;margin:0;color:var(--muted);line-height:1.7;font-size:15px}
+    .actions,.button-row{display:flex;gap:10px;flex-wrap:wrap}
+    .btn{border-radius:999px;border:1px solid transparent;padding:11px 16px;font-weight:700;color:var(--text);background:rgba(18,28,42,.92)}
+    .btn.primary{background:linear-gradient(135deg,var(--accent),var(--accent-2));color:#03111b}
+    .btn.warn{background:rgba(244,201,124,.12);border-color:rgba(244,201,124,.26);color:#ffd890}
+    .btn.ghost{border-color:var(--border)} .btn.danger{background:rgba(255,139,139,.10);border-color:rgba(255,139,139,.26);color:#ffc2c2}
+    .btn.good{background:rgba(133,240,200,.10);border-color:rgba(133,240,200,.24);color:#b6f8de}
+    .summary{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:14px;margin-top:18px}
+    .metric{padding:18px;border-radius:22px;background:linear-gradient(180deg,rgba(125,211,252,.10),rgba(9,15,24,.92));border:1px solid rgba(146,167,194,.12)}
+    .metric .label{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.14em}.metric .value{margin-top:10px;font-size:clamp(24px,3vw,34px);font-weight:700}.metric .detail{margin-top:8px;font-size:13px;line-height:1.5;color:var(--muted)}
+    .controls{margin-top:18px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr)) auto;gap:14px;align-items:end}
+    .field{display:block;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.14em;margin-bottom:8px}
+    .input{width:100%;border-radius:16px;border:1px solid var(--border-strong);background:rgba(6,11,18,.72);color:var(--text);padding:13px 14px}
+    .layout{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(360px,.92fr);gap:18px;margin-top:18px}.stack{display:flex;flex-direction:column;gap:18px}
+    .section-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:16px}.title{margin:0;font-size:24px}.note{margin:6px 0 0;color:var(--muted);font-size:14px;line-height:1.6}
+    .badge{display:inline-flex;align-items:center;gap:8px;border-radius:999px;border:1px solid var(--border);padding:7px 11px;font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:700;background:rgba(17,26,38,.82);color:var(--text)}
+    .badge.good{color:#b6f8de;border-color:rgba(133,240,200,.24);background:rgba(133,240,200,.10)} .badge.warn{color:#ffd890;border-color:rgba(244,201,124,.24);background:rgba(244,201,124,.10)}
+    .badge.danger{color:#ffc2c2;border-color:rgba(255,139,139,.24);background:rgba(255,139,139,.10)} .badge.info{color:#c8d6ff;border-color:rgba(156,182,255,.24);background:rgba(156,182,255,.10)}
+    .empty,.callout,.inline-panel{border-radius:20px;border:1px solid var(--border);background:var(--panel-2);color:var(--muted);padding:18px;line-height:1.65}
+    .session-list{display:flex;flex-direction:column;gap:14px}
+    .session-card{border-radius:22px;border:1px solid var(--border);background:linear-gradient(180deg,rgba(16,27,41,.95),rgba(10,16,24,.95));padding:18px}
+    .session-top{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1.1fr) auto;gap:14px;align-items:start}
+    .session-meta{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+    .stat{border-radius:16px;border:1px solid rgba(146,167,194,.10);background:rgba(7,11,18,.55);padding:12px 13px}
+    .stat .k{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em}.stat .v{margin-top:7px;font-size:15px;font-weight:700}
+    .mono{font-family:"IBM Plex Mono",monospace}.muted{color:var(--muted)}
+    .chip-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.chip{border-radius:999px;padding:6px 10px;font-size:12px;font-weight:700;background:rgba(17,26,38,.8);border:1px solid var(--border);color:var(--muted)}
+    .chip.warn{color:#ffd890}.chip.good{color:#b6f8de}.chip.danger{color:#ffc2c2}
+    .exception-list{margin-top:16px;display:flex;flex-direction:column;gap:12px}
+    .exception-card{border-radius:18px;border:1px solid rgba(146,167,194,.12);background:rgba(7,11,18,.62);padding:14px}
+    .exception-grid{display:grid;grid-template-columns:minmax(0,1.2fr) repeat(4,minmax(0,.75fr)) auto;gap:10px;align-items:start}
+    .aside-card{position:sticky;top:18px}.folds{display:flex;flex-direction:column;gap:12px;margin-top:16px}
+    .fold{border-radius:18px;border:1px solid rgba(146,167,194,.12);background:rgba(7,11,18,.62);padding:15px}.fold h3{margin:0 0 10px;font-size:16px}.fold p{margin:4px 0;color:var(--muted);font-size:13px}
+    .pill-link{font-size:13px;color:var(--accent);text-decoration:none}
+    @media (max-width:1260px){.summary{grid-template-columns:repeat(3,minmax(0,1fr))}.layout{grid-template-columns:1fr}.aside-card{position:static}.controls{grid-template-columns:repeat(2,minmax(0,1fr))}}
+    @media (max-width:860px){.page{padding:16px 12px 30px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.controls{grid-template-columns:1fr}.session-top,.exception-grid,.session-meta{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header class="panel header">
+      <div>
+        <div class="eyebrow"><a href="/dashboard">Dashboard de sinais</a><span>/</span><span>Curadoria de treino</span></div>
+        <h1>Sessões contínuas do LSTM</h1>
+        <p class="subtitle">Fluxo padrão: sessões contínuas e sem anomalia entram automaticamente na coorte. O operador só intervém nas exceções, bloqueios e rupturas reais antes de treinar.</p>
+      </div>
+      <div class="actions">
+        <button id="refresh-btn" class="btn ghost">Atualizar</button>
+        <button id="preview-btn" class="btn ghost">Refazer preview</button>
+        <button id="resegment-btn" class="btn warn">Resegmentar fechadas</button>
+        <button id="train-btn" class="btn primary">Iniciar treino</button>
+      </div>
+    </header>
+
+    <section class="summary">
+      <article class="metric"><div class="label">Sessões</div><div id="sum-sessions" class="value">0</div><div id="sum-sessions-detail" class="detail">Persistidas no SQLite</div></article>
+      <article class="metric"><div class="label">Auto-aprovadas</div><div id="sum-auto" class="value">0</div><div id="sum-auto-detail" class="detail">Entram por política</div></article>
+      <article class="metric"><div class="label">Inbox de exceções</div><div id="sum-review" class="value" style="color:var(--warn)">0</div><div id="sum-review-detail" class="detail">Pedem revisão humana</div></article>
+      <article class="metric"><div class="label">Elegíveis p/ treino</div><div id="sum-trainable" class="value" style="color:var(--accent-2)">0</div><div id="sum-trainable-detail" class="detail">Fechadas e aprovadas</div></article>
+      <article class="metric"><div class="label">Folds walk-forward</div><div id="sum-folds" class="value">0</div><div id="sum-folds-detail" class="detail">Preview atual</div></article>
+      <article class="metric"><div class="label">Run atual</div><div id="sum-run" class="value" style="font-size:24px">Nenhum</div><div id="sum-run-detail" class="detail">Sem treino em andamento</div></article>
+    </section>
+
+    <section class="panel controls">
+      <div>
+        <label class="field" for="gap-input">Threshold de ruptura (s)</label>
+        <input id="gap-input" class="input" type="number" min="1" step="1">
+      </div>
+      <div>
+        <label class="field" for="sequence-input">Sequence length</label>
+        <input id="sequence-input" class="input" type="number" min="2" step="1" value="15">
+      </div>
+      <div>
+        <label class="field" for="horizon-input">Horizonte de previsão (s)</label>
+        <input id="horizon-input" class="input" type="number" min="60" step="60" value="14400">
+      </div>
+      <div class="button-row">
+        <button id="save-gap-btn" class="btn ghost">Salvar threshold</button>
+      </div>
+    </section>
+
+    <div class="layout">
+      <div class="stack">
+        <section class="panel section">
+          <div class="section-head">
+            <div>
+              <h2 class="title">Inbox de exceções</h2>
+              <p class="note">Sessões com gap automático, blocos abertos, exclusões manuais ou splits ficam aqui. O treino padrão ignora essa fila até revisão.</p>
+            </div>
+            <div id="session-status" class="badge">Carregando</div>
+          </div>
+          <div id="exceptions-shell"></div>
+        </section>
+
+        <section class="panel section">
+          <div class="section-head">
+            <div>
+              <h2 class="title">Sessões elegíveis</h2>
+              <p class="note">Sessões auto-aprovadas ou aprovadas após revisão. Este é o pool usado no preview walk-forward e no treino.</p>
+            </div>
+            <a class="pill-link" href="/dashboard">Abrir dashboard de sinais</a>
+          </div>
+          <div id="approved-shell"></div>
+        </section>
+
+        <section class="panel section">
+          <div class="section-head">
+            <div>
+              <h2 class="title">Sessões excluídas</h2>
+              <p class="note">Exclusões explícitas continuam visíveis para facilitar revisão e reversão.</p>
+            </div>
+          </div>
+          <div id="excluded-shell"></div>
+        </section>
+      </div>
+
+      <aside class="stack">
+        <section class="panel aside-card">
+          <div class="section-head">
+            <div>
+              <h2 class="title">Preview da coorte</h2>
+              <p class="note">Mostra apenas as sessões elegíveis e os folds expandentes usados para validação walk-forward.</p>
+            </div>
+            <div id="preview-status" class="badge">Sem preview</div>
+          </div>
+          <div id="preview-shell"></div>
+          <div class="callout" style="margin-top:16px">
+            <strong>Regra operacional:</strong> se uma sessão cair na inbox de exceções, ela precisa de decisão humana antes de entrar no preview. O operador não precisa varrer bloco a bloco em sessões normais.
+          </div>
+        </section>
+      </aside>
+    </div>
+  </div>
+  <script>
+    let sessionsPayload = {sessions: [], summary: {}, config: {}};
+    let previewPayload = {sessions: [], folds: [], summary: {}};
+    let currentRunId = null;
+    const exceptionCache = new Map();
+    const expanded = new Set();
+    const fmtTs = (ts) => ts ? new Date(Number(ts) * 1000).toLocaleString("pt-BR", {hour12: false}) : "--";
+    const fmtDuration = (seconds) => { const v = Math.max(0, Number(seconds || 0)); if (!v) return "--"; if (v >= 86400) return `${(v / 86400).toFixed(1)}d`; if (v >= 3600) return `${(v / 3600).toFixed(1)}h`; if (v >= 60) return `${(v / 60).toFixed(1)}m`; return `${v.toFixed(0)}s`; };
+    const esc = (value) => String(value || "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
+
+    async function fetchJson(url, options) {
+      const response = await fetch(url, options);
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      return payload;
+    }
+    function approvedSessionIds() { return (previewPayload.sessions || []).map((session) => Number(session.id)); }
+    function setBadge(id, text, kind = "") { const node = document.getElementById(id); node.className = `badge ${kind}`.trim(); node.textContent = text; }
+    function reasonLabel(reason) {
+      const labels = {auto_gap:"Gap detectado",manual_split:"Split manual",manual_merge:"Merge manual",block_excluded:"Bloco excluído",open_block:"Bloco aberto",too_short:"Bloco curto",manual_override:"Override manual"};
+      return labels[reason] || reason;
+    }
+    function reviewBadge(session) {
+      const state = session.review_state || "needs_review";
+      if (state === "auto_approved") return '<span class="badge good">Auto-aprovada</span>';
+      if (state === "reviewed_ok") return '<span class="badge info">Aprovada após revisão</span>';
+      if (state === "excluded") return '<span class="badge danger">Excluída</span>';
+      if (state === "open") return '<span class="badge warn">Sessão aberta</span>';
+      return '<span class="badge warn">Precisa revisão</span>';
+    }
+    function sessionBuckets() {
+      const sessions = sessionsPayload.sessions || [];
+      return {
+        exceptions: sessions.filter((session) => ["needs_review", "open"].includes(session.review_state)),
+        approved: sessions.filter((session) => ["auto_approved", "reviewed_ok"].includes(session.review_state) && session.can_train),
+        excluded: sessions.filter((session) => session.review_state === "excluded"),
+      };
+    }
+    function renderSummary() {
+      const summary = sessionsPayload.summary || {};
+      const previewSummary = previewPayload.summary || {};
+      document.getElementById("sum-sessions").textContent = summary.total_sessions || 0;
+      document.getElementById("sum-sessions-detail").textContent = `${summary.exception_sessions || 0} com exceções • ${summary.approved_sessions || 0} aprovadas`;
+      document.getElementById("sum-auto").textContent = summary.auto_approved_sessions || 0;
+      document.getElementById("sum-auto-detail").textContent = `${summary.review_state_counts?.reviewed_ok || 0} revisadas manualmente`;
+      document.getElementById("sum-review").textContent = summary.review_state_counts?.needs_review || 0;
+      document.getElementById("sum-review-detail").textContent = `${summary.review_state_counts?.open || 0} abertas • ${summary.exception_sessions || 0} com exceções`;
+      document.getElementById("sum-trainable").textContent = summary.trainable_sessions || 0;
+      document.getElementById("sum-trainable-detail").textContent = `${previewSummary.eligible_sessions || 0} sessões no preview`;
+      document.getElementById("sum-folds").textContent = previewSummary.fold_count || 0;
+      document.getElementById("sum-folds-detail").textContent = `${previewSummary.eligible_blocks || 0} blocos elegíveis`;
+      document.getElementById("gap-input").value = Number((sessionsPayload.config || {}).gap_threshold_sec || 0).toFixed(0);
+    }
+    function metricGrid(session) {
+      return `<div class="session-meta"><div class="stat"><div class="k">Captura</div><div class="v">${fmtTs(session.started_at)}</div><div class="muted">${fmtDuration(session.capture_duration_sec)}</div></div><div class="stat"><div class="k">Dados</div><div class="v">${fmtTs(session.data_start_ts)}</div><div class="muted">${fmtTs(session.data_end_ts)} • ${fmtDuration(session.data_duration_sec)}</div></div><div class="stat"><div class="k">Cobertura</div><div class="v">${session.symbol_count} símbolos</div><div class="muted">${session.pair_count} pares</div></div><div class="stat"><div class="k">Blocos</div><div class="v">${session.block_count}</div><div class="muted">${session.trainable_block_count} treináveis</div></div></div>`;
+    }
+    function reasonChips(counts) {
+      const entries = Object.entries(counts || {});
+      if (!entries.length) return '<div class="muted">Sem razões de exceção agregadas.</div>';
+      return `<div class="chip-row">${entries.map(([reason, count]) => `<span class="chip warn">${esc(reasonLabel(reason))}: ${count}</span>`).join("")}</div>`;
+    }
+    function actionButton(label, klass, onclick, testId = "") { return `<button ${testId ? `data-testid="${testId}"` : ""} class="btn ${klass}" onclick="${onclick}">${label}</button>`; }
+    function renderExceptionRow(sessionId) {
+      const payload = exceptionCache.get(Number(sessionId));
+      if (!payload) return '<div class="inline-panel">Carregando blocos de exceção...</div>';
+      const blocks = payload.blocks || [];
+      if (!blocks.length) return '<div class="inline-panel">Nenhum bloco excepcional restante nesta sessão.</div>';
+      return `<div class="exception-list">${blocks.map((block) => `<article class="exception-card"><div class="exception-grid"><div><strong>${esc(block.symbol || block.pair_key || "")}</strong><div class="muted mono" style="margin-top:6px">#${block.id} • ${esc(block.boundary_reason || "sem motivo")}</div></div><div><div class="muted">Início</div><div>${fmtTs(block.start_ts)}</div></div><div><div class="muted">Fim</div><div>${fmtTs(block.end_ts)}</div></div><div><div class="muted">Records</div><div>${block.record_count}</div></div><div><div class="muted">Maior gap</div><div>${Number(block.max_gap_sec || 0).toFixed(1)}s</div></div><div class="button-row">${block.selected_for_training ? actionButton("Desmarcar", "danger", `toggleBlock(${block.id}, false, ${sessionId})`) : actionButton("Selecionar", "good", `toggleBlock(${block.id}, true, ${sessionId})`)}${actionButton("Split", "warn", `splitBlock(${block.id}, ${sessionId})`)}${actionButton("Merge +", "ghost", `mergeBlock(${block.id}, ${sessionId})`)}</div></div></article>`).join("")}</div>`;
+    }
+    function renderExceptionCard(session) {
+      const isOpen = expanded.has(Number(session.id));
+      const approvalButton = session.review_state !== "open" ? actionButton("Aprovar após revisão", "good", `approveAfterReview(${session.id})`, `approve-session-${session.id}`) : "";
+      return `<article class="session-card"><div class="session-top"><div><div class="eyebrow"><span>Sessão #${session.id}</span><span>${esc(session.status)}</span></div><div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:10px">${reviewBadge(session)}${session.dominant_exception_reason ? `<span class="badge warn">${esc(reasonLabel(session.dominant_exception_reason))}</span>` : ""}</div><p class="note" style="margin-top:12px">Esta sessão saiu do fluxo automático. Revise apenas os blocos problemáticos e decida se ela pode voltar para a coorte.</p>${reasonChips(session.exception_reason_counts)}</div>${metricGrid(session)}<div class="button-row" style="justify-content:flex-end">${approvalButton}${actionButton("Excluir", "danger", `toggleSessionApproval(${session.id}, false)`, `exclude-session-${session.id}`)}${actionButton(isOpen ? "Fechar exceções" : "Ver exceções", "warn", `toggleExceptions(${session.id})`, `exceptions-session-${session.id}`)}${actionButton("Resegmentar", "ghost", `resegmentOne(${session.id})`, `resegment-session-${session.id}`)}</div></div>${isOpen ? renderExceptionRow(session.id) : ""}</article>`;
+    }
+    function renderApprovedCard(session) {
+      const reviewed = session.review_state === "reviewed_ok";
+      return `<article class="session-card"><div class="session-top"><div><div class="eyebrow"><span>Sessão #${session.id}</span><span>${esc(session.status)}</span></div><div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:10px">${reviewBadge(session)}${session.can_train ? '<span class="badge good">Elegível para treino</span>' : '<span class="badge warn">Fora da coorte</span>'}</div><p class="note" style="margin-top:12px">${reviewed ? "A sessão teve intervenção manual e voltou para a coorte." : "Sessão contínua e estável. Nenhuma revisão bloco a bloco é necessária."}</p></div>${metricGrid(session)}<div class="button-row" style="justify-content:flex-end">${actionButton("Excluir", "danger", `toggleSessionApproval(${session.id}, false)`)}</div></div></article>`;
+    }
+    function renderExcludedCard(session) {
+      return `<article class="session-card"><div class="session-top"><div><div class="eyebrow"><span>Sessão #${session.id}</span><span>${esc(session.status)}</span></div><div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:10px">${reviewBadge(session)}</div><p class="note" style="margin-top:12px">Motivo da exclusão: <strong>${esc(session.excluded_reason || "não informado")}</strong></p></div>${metricGrid(session)}<div class="button-row" style="justify-content:flex-end">${actionButton("Reaprovar", "good", `approveAfterReview(${session.id})`, `approve-session-${session.id}`)}</div></div></article>`;
+    }
+    function renderBuckets() {
+      const buckets = sessionBuckets();
+      document.getElementById("exceptions-shell").innerHTML = buckets.exceptions.length ? `<div class="session-list">${buckets.exceptions.map(renderExceptionCard).join("")}</div>` : '<div class="empty">Nenhuma sessão exige revisão manual no momento.</div>';
+      document.getElementById("approved-shell").innerHTML = buckets.approved.length ? `<div class="session-list">${buckets.approved.map(renderApprovedCard).join("")}</div>` : '<div class="empty">Ainda não há sessões elegíveis para treino.</div>';
+      document.getElementById("excluded-shell").innerHTML = buckets.excluded.length ? `<div class="session-list">${buckets.excluded.map(renderExcludedCard).join("")}</div>` : '<div class="empty">Nenhuma sessão excluída manualmente.</div>';
+    }
+    function renderPreview() {
+      const root = document.getElementById("preview-shell");
+      const sessions = previewPayload.sessions || [];
+      const folds = previewPayload.folds || [];
+      const summary = previewPayload.summary || {};
+      if (!sessions.length) { setBadge("preview-status", "Sem coorte elegível", "danger"); root.innerHTML = '<div class="empty">Nenhuma sessão fechada e aprovada está pronta para treino. Resolva a inbox de exceções ou aguarde mais coleta.</div>'; return; }
+      setBadge("preview-status", folds.length ? `${folds.length} folds` : "Poucas sessões", folds.length ? "good" : "warn");
+      root.innerHTML = `<div class="inline-panel"><div class="eyebrow"><span>Coorte ativa</span><span>${sessions.length} sessões</span></div><div style="margin-top:10px;font-size:18px;font-weight:700">Cobertura de ${fmtTs(summary.coverage_start_ts)} até ${fmtTs(summary.coverage_end_ts)}</div><div class="chip-row" style="margin-top:12px"><span class="chip good">${summary.eligible_blocks || 0} blocos elegíveis</span><span class="chip">${sessions.map((session) => `#${session.id}`).join(" ")}</span></div></div><div class="folds">${folds.length ? folds.map((fold) => `<div class="fold"><h3>Fold ${fold.fold}</h3><p><strong>Treino:</strong> ${fold.train_session_ids.join(", ")}</p><p><strong>Validação:</strong> ${fold.validation_session_ids.join(", ")}</p><p><strong>Teste:</strong> ${fold.test_session_ids.join(", ")}</p><p>Fim do treino: ${fmtTs(fold.train_data_end_ts)}</p><p>Fim da validação: ${fmtTs(fold.validation_data_end_ts)}</p><p>Fim do teste: ${fmtTs(fold.test_data_end_ts)}</p></div>`).join("") : '<div class="empty">São necessárias pelo menos 3 sessões elegíveis para gerar folds walk-forward.</div>'}</div>`;
+    }
+    async function refreshSessions() { sessionsPayload = await fetchJson("/api/v1/ml/training/sessions?include_open=1"); renderSummary(); renderBuckets(); }
+    async function refreshPreview() { previewPayload = await fetchJson("/api/v1/ml/training/cohorts/preview", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({})}); renderSummary(); renderPreview(); }
+    async function refreshLatestRun() {
+      try {
+        const latest = await fetchJson("/api/v1/ml/training/runs/latest");
+        currentRunId = latest.id;
+        updateRun(latest);
+      } catch (error) {
+        currentRunId = null;
+        document.getElementById("sum-run").textContent = "Nenhum";
+        document.getElementById("sum-run-detail").textContent = "Sem treino em andamento";
+      }
+    }
+    async function refreshAll() { setBadge("session-status", "Atualizando"); try { await Promise.all([refreshSessions(), refreshPreview(), refreshLatestRun()]); setBadge("session-status", "Fluxo coerente", "good"); } catch (error) { setBadge("session-status", error.message, "danger"); } }
+    async function toggleSessionApproval(sessionId, approved) {
+      const payload = {approved_for_training: approved};
+      if (!approved) { const reason = window.prompt("Motivo curto para excluir a sessão do treino:", "continuidade ruim"); if (reason === null) return; payload.excluded_reason = reason; }
+      await fetchJson(`/api/v1/ml/training/sessions/${sessionId}`, {method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+      await refreshAll();
+    }
+    async function approveAfterReview(sessionId) {
+      await fetchJson(`/api/v1/ml/training/sessions/${sessionId}`, {method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({approved_for_training:true})});
+      await refreshAll();
+    }
+    async function toggleExceptions(sessionId) {
+      const id = Number(sessionId);
+      if (expanded.has(id)) { expanded.delete(id); renderBuckets(); return; }
+      expanded.add(id); renderBuckets();
+      try { exceptionCache.set(id, await fetchJson(`/api/v1/ml/training/sessions/${id}/exceptions`)); } catch (error) { exceptionCache.set(id, {blocks: [], error: error.message}); }
+      renderBuckets();
+    }
+    async function reloadExceptions(sessionId) { const id = Number(sessionId); if (!expanded.has(id)) return; exceptionCache.set(id, await fetchJson(`/api/v1/ml/training/sessions/${id}/exceptions`)); renderBuckets(); }
+    async function toggleBlock(blockId, selected, sessionId) { await fetchJson(`/api/v1/ml/training/blocks/${blockId}`, {method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({selected_for_training:selected})}); await Promise.all([refreshSessions(), refreshPreview(), reloadExceptions(sessionId)]); }
+    async function splitBlock(blockId, sessionId) { const splitTs = window.prompt("Timestamp UNIX em segundos para dividir o bloco:"); if (!splitTs) return; await fetchJson(`/api/v1/ml/training/blocks/${blockId}/split`, {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({split_ts:Number(splitTs)})}); await Promise.all([refreshSessions(), refreshPreview(), reloadExceptions(sessionId)]); }
+    async function mergeBlock(blockId, sessionId) { await fetchJson(`/api/v1/ml/training/blocks/${blockId}/merge-next`, {method:"POST"}); await Promise.all([refreshSessions(), refreshPreview(), reloadExceptions(sessionId)]); }
+    async function saveGap() { await fetchJson("/api/v1/ml/training/config", {method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({gap_threshold_sec:Number(document.getElementById("gap-input").value || 0)})}); await refreshAll(); }
+    async function resegmentAll() { await fetchJson("/api/v1/ml/training/resegment", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({})}); await refreshAll(); }
+    async function resegmentOne(sessionId) { await fetchJson("/api/v1/ml/training/resegment", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({session_ids:[Number(sessionId)]})}); await Promise.all([refreshSessions(), refreshPreview(), reloadExceptions(sessionId)]); }
+    function updateRun(payload) {
+      document.getElementById("sum-run").textContent = `Run #${payload.id} • ${payload.status}`;
+      if (payload.status === "failed") {
+        document.getElementById("sum-run-detail").textContent = payload.error || "Falha sem detalhe adicional.";
+        return;
+      }
+      if (payload.status === "completed") {
+        document.getElementById("sum-run-detail").textContent = `${(payload.sessions || []).length} sessão(ões) • ${(payload.blocks || []).length} bloco(s) • concluído`;
+        return;
+      }
+      document.getElementById("sum-run-detail").textContent = `${(payload.sessions || []).length} sessão(ões) • ${(payload.blocks || []).length} bloco(s)`;
+    }
+    async function startTraining() {
+      const sessionIds = approvedSessionIds();
+      if (!sessionIds.length) { window.alert("Não há sessões elegíveis para treino."); return; }
+      const sequenceLength = Number(document.getElementById("sequence-input").value || 15);
+      const horizon = Number(document.getElementById("horizon-input").value || 14400);
+      try {
+        const payload = await fetchJson("/api/v1/ml/training/runs", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({session_ids:sessionIds,sequence_length:sequenceLength,prediction_horizon_sec:horizon})});
+        currentRunId = payload.id; updateRun(payload); pollRun();
+      } catch (error) {
+        document.getElementById("sum-run").textContent = "Bloqueado"; document.getElementById("sum-run-detail").textContent = error.message; window.alert(error.message);
+      }
+    }
+    async function pollRun() { if (!currentRunId) return; const payload = await fetchJson(`/api/v1/ml/training/runs/${currentRunId}`); updateRun(payload); if (payload.status === "queued" || payload.status === "running") window.setTimeout(pollRun, 1400); }
+    document.getElementById("refresh-btn").addEventListener("click", refreshAll);
+    document.getElementById("preview-btn").addEventListener("click", refreshPreview);
+    document.getElementById("save-gap-btn").addEventListener("click", saveGap);
+    document.getElementById("resegment-btn").addEventListener("click", resegmentAll);
+    document.getElementById("train-btn").addEventListener("click", startTraining);
+    refreshAll();
+    window.setInterval(refreshAll, 7000);
+  </script>
+</body>
+</html>
