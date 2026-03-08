@@ -38,10 +38,12 @@ class SpreadMLAnalyzer:
         sequence_length: int = 15,
         artifact_dir: Path | None = None,
         allow_stale_artifacts: bool = False,
+        min_total_spread_pct: float = 0.0,
     ):
         self.sequence_length = int(sequence_length)
         self.artifact_dir = Path(artifact_dir) if artifact_dir is not None else None
         self.allow_stale_artifacts = bool(allow_stale_artifacts)
+        self.min_total_spread_pct = max(0.0, float(min_total_spread_pct or 0.0))
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.model: Optional[SpreadSequenceLSTM] = None
@@ -133,8 +135,9 @@ class SpreadMLAnalyzer:
         self,
         *,
         current_entry: float,
-        history: list[dict[str, float]],
+        history: list[dict[str, float]] | None = None,
         pair_key: Any = None,
+        now_ts: float | None = None,
     ) -> dict[str, Any]:
         normalized_key = self._normalize_pair_key(pair_key)
         if self.tracker is not None and normalized_key is not None:
@@ -143,11 +146,12 @@ class SpreadMLAnalyzer:
                     self.tracker.get_pair_recurring_context(
                         *normalized_key,
                         current_entry=float(current_entry),
-                        now_ts=float(history[-1]["timestamp"]) if history else time.time(),
+                        now_ts=float(now_ts) if now_ts is not None else (float(history[-1]["timestamp"]) if history else time.time()),
                     )
                 )
             except Exception as exc:
                 logger.debug("[ML] Falling back to local recurring context for %s: %s", normalized_key, exc)
+        history = history or []
         records = [
             SpreadRecord(
                 timestamp=float(record["timestamp"]),
@@ -164,6 +168,7 @@ class SpreadMLAnalyzer:
                 episodes,
                 current_entry=float(current_entry),
                 now_ts=float(history[-1]["timestamp"]) if history else time.time(),
+                min_total_spread_pct=self.min_total_spread_pct,
             )
         )
 
@@ -337,10 +342,15 @@ class SpreadMLAnalyzer:
             "empirical_support": context["empirical_support"],
             "empirical_support_short": context["empirical_support_short"],
             "empirical_support_long": context["empirical_support_long"],
+            "raw_empirical_support": context.get("raw_empirical_support", 0),
+            "raw_empirical_support_short": context.get("raw_empirical_support_short", 0),
+            "raw_empirical_support_long": context.get("raw_empirical_support_long", 0),
             "context_strength": context["context_strength"],
             "is_entry_inside_range": context["is_entry_inside_range"],
             "range_status": context["range_status"],
             "range_window": context["range_window"],
+            "median_total_spread": float(context.get("median_total_spread", 0.0) or 0.0),
+            "min_total_spread_threshold": float(context.get("min_total_spread_threshold", self.min_total_spread_pct) or 0.0),
             "entry_outer_range_min": context["entry_outer_range_min"],
             "entry_outer_range_max": context["entry_outer_range_max"],
             "entry_core_range_min": context["entry_core_range_min"],
@@ -359,6 +369,7 @@ class SpreadMLAnalyzer:
             "empirical_eta_q90_seconds": context["empirical_eta_q90_seconds"],
             "execute_threshold_used": float(self.metadata.execute_threshold) if self.metadata is not None else 0.0,
             "strong_threshold_used": float(self.metadata.strong_threshold) if self.metadata is not None else 0.0,
+            "signal_reason_code": model_status,
             "signal_reason": signal_reason,
             "drift_status": self.last_drift_status,
             "drifted_features": list(self.last_drifted_features),
@@ -368,56 +379,123 @@ class SpreadMLAnalyzer:
             "artifact_dataset_samples": int(self.metadata.dataset_summary.get("num_samples", 0)) if self.metadata is not None else 0,
         }
 
-    def analyze_pair(self, current_entry: float, history: list[Any], *, pair_key: Any = None) -> Optional[dict[str, Any]]:
+    def predict_history(self, history: list[Any]) -> dict[str, Any]:
         canonical_history = self._coerce_history(history)
-        if len(canonical_history) < max(4, self.sequence_length):
-            return self._safe_wait_payload(
-                current_entry=current_entry,
-                history=canonical_history,
-                model_status="insufficient_history",
-                signal_reason="not enough structured history for inference",
-                pair_key=pair_key,
-            )
+        history_points = len(canonical_history)
+        history_last_ts = float(canonical_history[-1]["timestamp"]) if canonical_history else 0.0
+        if history_points < max(4, self.sequence_length):
+            return {
+                "prediction_status": "insufficient_history",
+                "model_status": "insufficient_history",
+                "signal_reason": "not enough structured history for inference",
+                "history_points": history_points,
+                "history_last_ts": history_last_ts,
+                "canonical_history": canonical_history,
+            }
         if self.model is None or self.metadata is None:
-            return self._safe_wait_payload(
-                current_entry=current_entry,
-                history=canonical_history,
-                model_status=self.model_status,
-                signal_reason=self.signal_reason,
-                pair_key=pair_key,
-            )
+            return {
+                "prediction_status": self.model_status,
+                "model_status": self.model_status,
+                "signal_reason": self.signal_reason,
+                "history_points": history_points,
+                "history_last_ts": history_last_ts,
+                "canonical_history": canonical_history,
+            }
 
         min_history_points = max(self.metadata.min_history_points, self.sequence_length)
-        if len(canonical_history) < min_history_points:
-            return self._safe_wait_payload(
-                current_entry=current_entry,
-                history=canonical_history,
-                model_status="insufficient_history",
-                signal_reason=f"need at least {min_history_points} structured history points",
-                pair_key=pair_key,
-            )
+        if history_points < min_history_points:
+            return {
+                "prediction_status": "insufficient_history",
+                "model_status": "insufficient_history",
+                "signal_reason": f"need at least {min_history_points} structured history points",
+                "history_points": history_points,
+                "history_last_ts": history_last_ts,
+                "canonical_history": canonical_history,
+            }
 
         start_time = time.perf_counter()
         inversion_probability, eta_seconds = self._predict(canonical_history)
         inference_time_ms = (time.perf_counter() - start_time) * 1000.0
         if inference_time_ms > 50.0:
             logger.warning("[ML] Inference latency alert: %.2fms", inference_time_ms)
+        return {
+            "prediction_status": "ready",
+            "model_status": "ready",
+            "signal_reason": "trained artifact ready",
+            "history_points": history_points,
+            "history_last_ts": history_last_ts,
+            "canonical_history": canonical_history,
+            "inversion_probability": float(inversion_probability),
+            "model_eta_seconds": int(eta_seconds),
+            "inference_latency_ms": float(inference_time_ms),
+            "drift_status": self.last_drift_status,
+            "drifted_features": list(self.last_drifted_features),
+            "artifact_feature_count": len(self.metadata.feature_names),
+            "artifact_trained_at_utc": self.metadata.trained_at_utc,
+            "artifact_dataset_samples": int(self.metadata.dataset_summary.get("num_samples", 0)),
+        }
 
-        context = self._range_context(current_entry=current_entry, history=canonical_history, pair_key=pair_key)
+    def render_prediction(
+        self,
+        current_entry: float,
+        prediction: dict[str, Any],
+        *,
+        pair_key: Any = None,
+    ) -> dict[str, Any]:
+        model_status = str(prediction.get("model_status") or self.model_status)
+        signal_reason = str(prediction.get("signal_reason") or self.signal_reason)
+        history_points = int(prediction.get("history_points", 0) or 0)
+        history_last_ts = float(prediction.get("history_last_ts", 0.0) or 0.0)
+        canonical_history = list(prediction.get("canonical_history") or [])
+        if str(prediction.get("prediction_status") or "") != "ready":
+            return self._safe_wait_payload(
+                current_entry=current_entry,
+                history=canonical_history,
+                model_status=model_status,
+                signal_reason=signal_reason,
+                pair_key=pair_key,
+            )
+
+        inversion_probability = float(prediction["inversion_probability"])
+        eta_seconds = int(prediction["model_eta_seconds"])
+        inference_time_ms = float(prediction.get("inference_latency_ms", 0.0) or 0.0)
+        context = self._range_context(
+            current_entry=current_entry,
+            history=canonical_history,
+            pair_key=pair_key,
+            now_ts=history_last_ts,
+        )
         eta_payload = self._eta_payload(int(eta_seconds), context)
         ml_score = round(inversion_probability * 100)
 
         execute_threshold = self.metadata.execute_threshold
         strong_threshold = self.metadata.strong_threshold
         signal_action = "WAIT"
+        signal_reason_code = "insufficient_empirical_context"
         signal_reason = "Faixa recorrente indisponível: ainda não há recorrência suficiente em blocos fechados recentes."
         if str(context["range_status"]) == "insufficient_empirical_context":
-            signal_reason = "Faixa recorrente indisponível: ainda não há recorrência suficiente em blocos fechados recentes."
+            if (
+                float(context.get("min_total_spread_threshold", 0.0) or 0.0) > 0.0
+                and float(context.get("median_total_spread", 0.0) or 0.0) < float(context.get("min_total_spread_threshold", 0.0) or 0.0)
+                and (
+                    bool(context.get("raw_short_ready"))
+                    or bool(context.get("raw_long_ready"))
+                    or int(context.get("raw_empirical_support", 0) or 0) > 0
+                )
+            ):
+                signal_reason_code = "median_total_spread_below_threshold"
+                signal_reason = "Deslocamento total mediano abaixo do mínimo operacional."
+            else:
+                signal_reason_code = "insufficient_empirical_context"
+                signal_reason = "Faixa recorrente indisponível: ainda não há recorrência suficiente em blocos fechados recentes."
         elif str(context["entry_position_label"]) == "below_band":
+            signal_reason_code = "entry_outside_recurring_band"
             signal_reason = "Spread atual abaixo da faixa recorrente de entrada."
         elif str(context["entry_position_label"]) == "above_band":
+            signal_reason_code = "entry_above_recurring_band"
             signal_reason = "Spread atual acima da faixa recorrente de entrada; caso bloqueado nesta versão."
         elif inversion_probability < execute_threshold:
+            signal_reason_code = "probability_below_threshold"
             signal_reason = "Faixa recorrente válida, mas a probabilidade calibrada ainda está abaixo do limiar de execução."
         elif (
             inversion_probability >= strong_threshold
@@ -429,20 +507,16 @@ class SpreadMLAnalyzer:
             and str(eta_payload["eta_alignment_status"]) != "divergent"
         ):
             signal_action = "STRONG_EXECUTE"
+            signal_reason_code = "strong_execute_ready"
             signal_reason = "Contexto forte confirmado. Probabilidade alta e janela empírica alinhada."
         elif inversion_probability >= execute_threshold:
             signal_action = "EXECUTE"
             if str(eta_payload["eta_alignment_status"]) == "divergent":
+                signal_reason_code = "eta_divergent"
                 signal_reason = "Contexto recorrente válido, porém o ETA do modelo diverge do comportamento empírico recente."
             else:
+                signal_reason_code = "execute_ready"
                 signal_reason = "O modelo encontrou contexto favorável. Probabilidade e contexto passaram o limiar de execução."
-
-        if signal_action == "WAIT":
-            nlp_context = signal_reason
-        elif signal_action == "STRONG_EXECUTE":
-            nlp_context = signal_reason
-        else:
-            nlp_context = signal_reason
 
         return {
             "is_weak": signal_action == "WAIT",
@@ -453,7 +527,7 @@ class SpreadMLAnalyzer:
             "success_probability": round(inversion_probability * 100.0, 1),
             "estimated_time_to_close": eta_payload["estimated_time_to_close"],
             "signal_action": signal_action,
-            "nlp_context": nlp_context,
+            "nlp_context": signal_reason,
             "ml_score": int(ml_score),
             "model_status": "ready",
             "model_version": self.model_version,
@@ -463,16 +537,21 @@ class SpreadMLAnalyzer:
             "display_eta_seconds": int(eta_payload["display_eta_seconds"]),
             "eta_source": eta_payload["eta_source"],
             "eta_alignment_status": eta_payload["eta_alignment_status"],
-            "history_points": len(canonical_history),
+            "history_points": history_points,
             "context_percentile": context["context_percentile_excursions"],
             "context_percentile_excursions": context["context_percentile_excursions"],
             "empirical_support": context["empirical_support"],
             "empirical_support_short": context["empirical_support_short"],
             "empirical_support_long": context["empirical_support_long"],
+            "raw_empirical_support": context.get("raw_empirical_support", 0),
+            "raw_empirical_support_short": context.get("raw_empirical_support_short", 0),
+            "raw_empirical_support_long": context.get("raw_empirical_support_long", 0),
             "context_strength": context["context_strength"],
             "is_entry_inside_range": context["is_entry_inside_range"],
             "range_status": context["range_status"],
             "range_window": context["range_window"],
+            "median_total_spread": float(context.get("median_total_spread", 0.0) or 0.0),
+            "min_total_spread_threshold": float(context.get("min_total_spread_threshold", self.min_total_spread_pct) or 0.0),
             "entry_outer_range_min": context["entry_outer_range_min"],
             "entry_outer_range_max": context["entry_outer_range_max"],
             "entry_core_range_min": context["entry_core_range_min"],
@@ -491,14 +570,19 @@ class SpreadMLAnalyzer:
             "empirical_eta_q90_seconds": context["empirical_eta_q90_seconds"],
             "execute_threshold_used": float(execute_threshold),
             "strong_threshold_used": float(strong_threshold),
+            "signal_reason_code": signal_reason_code,
             "signal_reason": signal_reason,
-            "drift_status": self.last_drift_status,
-            "drifted_features": list(self.last_drifted_features),
+            "drift_status": str(prediction.get("drift_status") or self.last_drift_status),
+            "drifted_features": list(prediction.get("drifted_features") or self.last_drifted_features),
             "inference_latency_ms": round(float(inference_time_ms), 3),
-            "artifact_feature_count": len(self.metadata.feature_names),
-            "artifact_trained_at_utc": self.metadata.trained_at_utc,
-            "artifact_dataset_samples": int(self.metadata.dataset_summary.get("num_samples", 0)),
+            "artifact_feature_count": int(prediction.get("artifact_feature_count", len(self.metadata.feature_names))),
+            "artifact_trained_at_utc": str(prediction.get("artifact_trained_at_utc") or self.metadata.trained_at_utc),
+            "artifact_dataset_samples": int(prediction.get("artifact_dataset_samples", self.metadata.dataset_summary.get("num_samples", 0))),
         }
+
+    def analyze_pair(self, current_entry: float, history: list[Any], *, pair_key: Any = None) -> Optional[dict[str, Any]]:
+        prediction = self.predict_history(history)
+        return self.render_prediction(current_entry, prediction, pair_key=pair_key)
 
 
 __all__ = ["SpreadMLAnalyzer", "SpreadSequenceLSTM"]

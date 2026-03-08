@@ -1,29 +1,33 @@
 import json
 from pathlib import Path
 
+import pytest
+import torch
+
 from src.spread.train_model import (
+    FocalLoss,
     _build_split_summary,
+    _derive_focal_alpha,
     build_dataset_bundle,
     build_group_splits,
     run_training_loop,
 )
-from src.spread.ml_dataset import FEATURE_NAMES
-from src.spread.spread_tracker import SpreadTracker
+from src.spread.ml_dataset import FEATURE_NAMES, _label_window_from_episodes
+from src.spread.spread_tracker import SpreadTracker, TrackerEpisode
 
 
 def _make_pair(base_ts: int, positive: bool, offset: float) -> dict:
     records = []
     inverted_events = []
     entries_positive = [
-        0.08,
+        0.10,
+        0.11,
+        0.09,
+        0.10,
         0.12,
-        0.18,
-        0.28,
-        0.42,
-        0.58,
-        0.74,
-        0.88,
-        0.92,
+        1.05,
+        0.98,
+        0.36,
         -0.12,
         -0.18,
         -0.08,
@@ -31,24 +35,25 @@ def _make_pair(base_ts: int, positive: bool, offset: float) -> dict:
         0.10,
         0.14,
         0.12,
+        0.10,
     ]
     exits_positive = [
-        -0.40,
-        -0.36,
-        -0.31,
-        -0.26,
+        -0.22,
         -0.21,
-        -0.17,
-        -0.12,
-        -0.07,
-        -0.02,
+        -0.20,
+        -0.20,
+        -0.18,
+        -0.16,
+        -0.14,
+        -0.08,
+        0.18,
         0.14,
         0.18,
         0.10,
         0.02,
         -0.03,
         -0.06,
-        -0.04,
+        -0.05,
     ]
     entries_negative = [
         0.02,
@@ -98,7 +103,7 @@ def _make_pair(base_ts: int, positive: bool, offset: float) -> dict:
                 "exit": round(exit_spread - offset * 0.5, 6),
             }
         )
-        if positive and index == 9:
+        if positive and index == 8:
             inverted_events.append(ts)
 
     return {
@@ -156,6 +161,43 @@ def _write_low_total_spread_state(path: Path) -> Path:
                 "records": records,
             }
         },
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _write_multi_pair_low_total_spread_state(path: Path, *, count: int = 10) -> Path:
+    template_path = _write_low_total_spread_state(path.with_name(f"{path.stem}_template.json"))
+    template_payload = json.loads(template_path.read_text(encoding="utf-8"))
+    template_pair = next(iter(template_payload["pairs"].values()))
+    base_records = template_pair["records"]
+    pairs: dict[str, dict] = {}
+    last_seen_ts = 0.0
+    for index in range(count):
+        offset = index * 10_000
+        shifted_records = [
+            {
+                "ts": float(record["ts"] + offset),
+                "entry": float(record["entry"]),
+                "exit": float(record["exit"]),
+            }
+            for record in base_records
+        ]
+        last_seen_ts = max(last_seen_ts, shifted_records[-1]["ts"])
+        pairs[f"LOW{index:02d}|buy|spot|sell|futures"] = {
+            "last_state": int(template_pair["last_state"]),
+            "last_crossover_ts": float(template_pair["last_crossover_ts"] + offset),
+            "last_seen_ts": float(shifted_records[-1]["ts"]),
+            "history_enabled": True,
+            "inverted_events": [float(ts + offset) for ts in template_pair["inverted_events"]],
+            "entry_events": [],
+            "exit_events": [],
+            "records": shifted_records,
+        }
+    payload = {
+        "saved_at": last_seen_ts,
+        "window_sec": template_payload["window_sec"],
+        "pairs": pairs,
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path
@@ -239,6 +281,24 @@ def _write_overlapping_tracker_state(path: Path) -> Path:
     return path
 
 
+def _episode(*, start_ts: float, end_ts: float, peak_entry_spread: float, exit_spread_at_close: float) -> TrackerEpisode:
+    return TrackerEpisode(
+        start_ts=start_ts,
+        peak_ts=start_ts,
+        end_ts=end_ts,
+        duration_sec=max(0.0, end_ts - start_ts),
+        peak_entry_spread=peak_entry_spread,
+        exit_spread_at_close=exit_spread_at_close,
+        baseline_median=0.1,
+        baseline_mad=0.01,
+        activation_threshold=0.15,
+        release_threshold=0.12,
+        session_id=1,
+        block_id=1,
+        is_closed=True,
+    )
+
+
 def test_build_dataset_bundle_reads_tracker_sqlite_schema(tmp_path: Path):
     json_state = _write_tracker_state(tmp_path / "tracker_state.json")
     payload = json.loads(json_state.read_text(encoding="utf-8"))
@@ -298,6 +358,83 @@ def test_build_dataset_bundle_filters_low_total_spread_inversions_from_positive_
     assert filtered_bundle.summary["num_positive_samples"] == 0
     assert filtered_bundle.summary["num_negative_samples"] == filtered_bundle.summary["num_samples"]
     assert filtered_bundle.summary["min_total_spread_pct"] == 1.0
+    assert filtered_bundle.summary["labeling_method"] == "episode_take_profit_time_barrier"
+    assert filtered_bundle.summary["label_audit"]["timeouts_with_only_sub_threshold_episode"] > 0
+
+
+def test_label_window_requires_qualified_episode_to_close_within_horizon():
+    result = _label_window_from_episodes(
+        180.0,
+        episodes=[
+            _episode(
+                start_ts=200.0,
+                end_ts=360.0,
+                peak_entry_spread=0.92,
+                exit_spread_at_close=0.18,
+            )
+        ],
+        prediction_horizon_sec=120,
+        min_total_spread_pct=1.0,
+    )
+
+    assert result["y_class"] == 0.0
+    assert result["y_eta"] == 0.0
+    assert result["timeout_reason"] == "no_future_episode"
+
+
+def test_label_window_ignores_episode_that_started_before_current_ts():
+    result = _label_window_from_episodes(
+        150.0,
+        episodes=[
+            _episode(
+                start_ts=120.0,
+                end_ts=220.0,
+                peak_entry_spread=0.88,
+                exit_spread_at_close=0.20,
+            )
+        ],
+        prediction_horizon_sec=120,
+        min_total_spread_pct=1.0,
+    )
+
+    assert result["y_class"] == 0.0
+    assert result["y_eta"] == 0.0
+    assert result["timeout_reason"] == "no_future_episode"
+
+
+def test_label_window_uses_time_until_episode_close_as_eta():
+    result = _label_window_from_episodes(
+        150.0,
+        episodes=[
+            _episode(
+                start_ts=200.0,
+                end_ts=260.0,
+                peak_entry_spread=0.90,
+                exit_spread_at_close=0.22,
+            )
+        ],
+        prediction_horizon_sec=120,
+        min_total_spread_pct=1.0,
+    )
+
+    assert result["y_class"] == 1.0
+    assert result["y_eta"] == 110.0
+    assert result["qualified_episode_total_spread"] >= 1.0
+
+
+def test_focal_loss_alpha_high_weights_positive_class_more_than_negative():
+    positive_loss = FocalLoss(alpha=0.9, gamma=0.0)(
+        torch.tensor([0.0], dtype=torch.float32),
+        torch.tensor([1.0], dtype=torch.float32),
+    )
+    negative_loss = FocalLoss(alpha=0.9, gamma=0.0)(
+        torch.tensor([0.0], dtype=torch.float32),
+        torch.tensor([0.0], dtype=torch.float32),
+    )
+
+    assert positive_loss.item() > negative_loss.item()
+    assert _derive_focal_alpha(0.07) == pytest.approx(0.93)
+    assert _derive_focal_alpha(0.90) == pytest.approx(0.25)
 
 
 def test_group_splits_handle_overlapping_pair_histories_with_temporal_embargo(tmp_path: Path):
@@ -415,6 +552,9 @@ def test_run_training_loop_saves_artifacts_and_beats_negative_baseline(tmp_path:
         max_epochs=6,
         patience=3,
         learning_rate=0.01,
+        min_train_positive_samples=1,
+        min_val_positive_samples=0,
+        min_test_positive_samples=0,
     )
 
     assert report["model_status"] == "trained"
@@ -435,10 +575,15 @@ def test_run_training_loop_saves_artifacts_and_beats_negative_baseline(tmp_path:
     assert "subgroup_metrics" in report
     assert "temporal_walk_forward" in report
     assert "validation_partition" in report
+    assert "label_audit" in report
     assert "median_absolute_error" in report["eta_metrics"]["test"]
     assert "p90_absolute_error" in report["eta_metrics"]["test"]
     assert report["validation_partition"]["mode"] == "chronological"
     assert report["validation_partition"]["calibration_end_ts"] <= report["validation_partition"]["selection_start_ts"]
+    assert report["training"]["positive_rate_train"] > 0.0
+    assert 0.25 <= report["training"]["focal_alpha_effective"] <= 0.95
+    assert report["dataset_summary"]["labeling_method"] == "episode_take_profit_time_barrier"
+    assert "future_episode_total_spread_quantiles" in report["label_audit"]
 
     metadata_payload = json.loads(artifact_dir.joinpath("best_lstm_model.meta.json").read_text(encoding="utf-8"))
     assert metadata_payload["execute_threshold"] == report["thresholds"]["execute_threshold"]
@@ -446,6 +591,10 @@ def test_run_training_loop_saves_artifacts_and_beats_negative_baseline(tmp_path:
     assert metadata_payload["input_size"] == len(FEATURE_NAMES)
     assert len(metadata_payload["feature_names"]) == len(FEATURE_NAMES)
     assert metadata_payload["training_config"]["max_epochs"] == 6
+    assert metadata_payload["training_config"]["labeling_method"] == "episode_take_profit_time_barrier"
+    assert metadata_payload["training_config"]["labeling_timeout_only"] is True
+    assert metadata_payload["training_config"]["positive_rate_train"] > 0.0
+    assert 0.25 <= metadata_payload["training_config"]["focal_alpha_effective"] <= 0.95
     assert metadata_payload["trained_at_utc"]
     assert metadata_payload["dataset_fingerprint"]
     assert metadata_payload["feature_schema_hash"]
@@ -456,6 +605,7 @@ def test_run_training_loop_saves_artifacts_and_beats_negative_baseline(tmp_path:
     audit_text = Path(report["artifacts"]["audit_path"]).read_text(encoding="utf-8")
     assert "## Calibration" in audit_text
     assert "## Temporal Audit" in audit_text
+    assert "## Label Audit" in audit_text
     assert "Crítico" in audit_text or "Alto" in audit_text or "Médio" in audit_text
     assert "Correções Aplicadas" not in audit_text
     assert "Unique pair overlap rate" in audit_text
@@ -477,6 +627,9 @@ def test_run_training_loop_accepts_session_chronological_split(tmp_path: Path):
         max_epochs=3,
         patience=2,
         learning_rate=0.01,
+        min_train_positive_samples=0,
+        min_val_positive_samples=0,
+        min_test_positive_samples=0,
     )
 
     assert report["model_status"] == "trained"
@@ -484,6 +637,29 @@ def test_run_training_loop_accepts_session_chronological_split(tmp_path: Path):
     assert report["dataset_summary"]["sessions_used"] == 4
     assert set(report["split_summary"]["train_session_ids"]).isdisjoint(report["split_summary"]["val_session_ids"])
     assert set(report["split_summary"]["train_session_ids"]).isdisjoint(report["split_summary"]["test_session_ids"])
+
+
+def test_run_training_loop_aborts_when_filtered_dataset_has_too_few_positive_samples(tmp_path: Path):
+    state_path = _write_multi_pair_low_total_spread_state(tmp_path / "tracker_state_low_total_many.json", count=12)
+
+    with pytest.raises(ValueError, match="positive samples"):
+        run_training_loop(
+            state_file=state_path,
+            artifact_dir=tmp_path / "artifacts_guardrail",
+            sequence_length=3,
+            prediction_horizon_sec=180,
+            min_total_spread_pct=1.0,
+            hidden_size=8,
+            num_layers=1,
+            dropout=0.0,
+            batch_size=4,
+            max_epochs=2,
+            patience=1,
+            learning_rate=0.01,
+            min_train_positive_samples=1,
+            min_val_positive_samples=1,
+            min_test_positive_samples=1,
+        )
 
 
 def test_build_dataset_bundle_never_crosses_temporal_gap_blocks(tmp_path: Path):

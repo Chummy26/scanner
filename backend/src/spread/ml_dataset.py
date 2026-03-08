@@ -10,6 +10,8 @@ from typing import Any
 
 import torch
 
+from .spread_tracker import SpreadRecord, compute_closed_episodes
+
 FEATURE_NAMES = [
     "entry_spread", "exit_spread",
     "delta_entry", "delta_exit",
@@ -119,6 +121,55 @@ def _feature_window(window: list[dict[str, float]]) -> list[list[float]]:
         previous_delta_entry = delta_entry
         previous_delta_exit = delta_exit
     return features
+
+
+def _linear_percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return float(ordered[0])
+    pct = max(0.0, min(100.0, float(percentile)))
+    rank = (len(ordered) - 1) * (pct / 100.0)
+    lower = int(math.floor(rank))
+    upper = int(math.ceil(rank))
+    if lower == upper:
+        return float(ordered[lower])
+    return float(ordered[lower] + ((ordered[upper] - ordered[lower]) * (rank - lower)))
+
+
+def _bucket_count(
+    value: float,
+    buckets: list[tuple[str, float, float]],
+    counts: dict[str, int],
+) -> None:
+    numeric_value = float(value)
+    for label, lower, upper in buckets:
+        if lower <= numeric_value < upper:
+            counts[label] = int(counts.get(label, 0)) + 1
+            return
+    if buckets:
+        counts[buckets[-1][0]] = int(counts.get(buckets[-1][0], 0)) + 1
+
+
+def _quantile_summary(values: list[float]) -> dict[str, float]:
+    if not values:
+        return {
+            "p10": 0.0,
+            "p25": 0.0,
+            "p50": 0.0,
+            "p75": 0.0,
+            "p90": 0.0,
+            "max": 0.0,
+        }
+    return {
+        "p10": _linear_percentile(values, 10.0),
+        "p25": _linear_percentile(values, 25.0),
+        "p50": _linear_percentile(values, 50.0),
+        "p75": _linear_percentile(values, 75.0),
+        "p90": _linear_percentile(values, 90.0),
+        "max": max(float(value) for value in values),
+    }
 
 
 def _load_pairs_from_json(state_path: Path) -> tuple[dict[str, Any], float]:
@@ -393,11 +444,142 @@ def _load_pairs_payload(state_path: Path) -> tuple[dict[str, Any], float, str]:
     return pairs, saved_at, "sqlite"
 
 
+def _synthetic_block_id(raw_block_id: Any, index: int) -> int:
+    block_id = int(raw_block_id or 0)
+    if block_id > 0:
+        return block_id
+    return int(index + 1)
+
+
+def _build_closed_episodes(
+    records: list[dict[str, float]],
+    *,
+    block_id: int,
+    session_id: int,
+) -> list[Any]:
+    if not records:
+        return []
+    return sorted(
+        compute_closed_episodes(
+            [
+                SpreadRecord(
+                    timestamp=float(record["timestamp"]),
+                    entry_spread_pct=float(record["entry_spread"]),
+                    exit_spread_pct=float(record["exit_spread"]),
+                    session_id=int(session_id),
+                    block_id=int(block_id),
+                )
+                for record in records
+            ]
+        ),
+        key=lambda episode: (float(episode.end_ts), float(episode.start_ts)),
+    )
+
+
+def _label_window_from_episodes(
+    current_ts: float,
+    episodes: list[Any],
+    *,
+    prediction_horizon_sec: int,
+    min_total_spread_pct: float,
+) -> dict[str, Any]:
+    horizon_end_ts = float(current_ts) + float(prediction_horizon_sec)
+    future_episodes = [
+        episode
+        for episode in episodes
+        if float(episode.start_ts) > float(current_ts)
+        and float(episode.end_ts) <= horizon_end_ts
+    ]
+    future_total_spreads = [float(episode.total_spread) for episode in future_episodes]
+    qualified_episodes = [
+        episode
+        for episode in future_episodes
+        if float(episode.total_spread) >= float(min_total_spread_pct or 0.0)
+    ]
+    if qualified_episodes:
+        first_qualified = qualified_episodes[0]
+        return {
+            "y_class": 1.0,
+            "y_eta": float(first_qualified.end_ts) - float(current_ts),
+            "timeout_reason": "qualified_episode",
+            "peak_future_total_spread": max(future_total_spreads) if future_total_spreads else 0.0,
+            "qualified_episode_total_spread": float(first_qualified.total_spread),
+            "future_episode_total_spreads": future_total_spreads,
+        }
+    return {
+        "y_class": 0.0,
+        "y_eta": 0.0,
+        "timeout_reason": "sub_threshold_only" if future_episodes else "no_future_episode",
+        "peak_future_total_spread": max(future_total_spreads) if future_total_spreads else 0.0,
+        "qualified_episode_total_spread": 0.0,
+        "future_episode_total_spreads": future_total_spreads,
+    }
+
+
+def _empty_label_audit() -> dict[str, Any]:
+    return {
+        "positive_entry_spread_buckets": {
+            "lt_0_30": 0,
+            "0_30_to_0_50": 0,
+            "0_50_to_1_00": 0,
+            "1_00_to_2_00": 0,
+            "ge_2_00": 0,
+        },
+        "future_episode_total_spread_quantiles": {
+            "p10": 0.0,
+            "p25": 0.0,
+            "p50": 0.0,
+            "p75": 0.0,
+            "p90": 0.0,
+            "max": 0.0,
+        },
+        "timeout_peak_future_total_spread_buckets": {
+            "lt_0_30": 0,
+            "0_30_to_0_50": 0,
+            "0_50_to_0_80": 0,
+            "0_80_to_1_00": 0,
+            "ge_1_00": 0,
+        },
+        "timeouts_without_future_episode": 0,
+        "timeouts_with_only_sub_threshold_episode": 0,
+    }
+
+
+def _finalize_label_audit(
+    positive_entry_spread_buckets: dict[str, int],
+    future_episode_total_spreads: list[float],
+    timeout_peak_future_total_spread_buckets: dict[str, int],
+    *,
+    timeouts_without_future_episode: int,
+    timeouts_with_only_sub_threshold_episode: int,
+) -> dict[str, Any]:
+    return {
+        "positive_entry_spread_buckets": {
+            "lt_0_30": int(positive_entry_spread_buckets.get("lt_0_30", 0)),
+            "0_30_to_0_50": int(positive_entry_spread_buckets.get("0_30_to_0_50", 0)),
+            "0_50_to_1_00": int(positive_entry_spread_buckets.get("0_50_to_1_00", 0)),
+            "1_00_to_2_00": int(positive_entry_spread_buckets.get("1_00_to_2_00", 0)),
+            "ge_2_00": int(positive_entry_spread_buckets.get("ge_2_00", 0)),
+        },
+        "future_episode_total_spread_quantiles": _quantile_summary(future_episode_total_spreads),
+        "timeout_peak_future_total_spread_buckets": {
+            "lt_0_30": int(timeout_peak_future_total_spread_buckets.get("lt_0_30", 0)),
+            "0_30_to_0_50": int(timeout_peak_future_total_spread_buckets.get("0_30_to_0_50", 0)),
+            "0_50_to_0_80": int(timeout_peak_future_total_spread_buckets.get("0_50_to_0_80", 0)),
+            "0_80_to_1_00": int(timeout_peak_future_total_spread_buckets.get("0_80_to_1_00", 0)),
+            "ge_1_00": int(timeout_peak_future_total_spread_buckets.get("ge_1_00", 0)),
+        },
+        "timeouts_without_future_episode": int(timeouts_without_future_episode),
+        "timeouts_with_only_sub_threshold_episode": int(timeouts_with_only_sub_threshold_episode),
+    }
+
+
 def build_dataset_bundle(
     state_path: Path,
     sequence_length: int = 15,
     prediction_horizon_sec: int = 14_400,
     *,
+    min_total_spread_pct: float = 0.0,
     selected_block_ids: list[int] | None = None,
     selected_session_ids: list[int] | None = None,
     selected_only: bool | None = None,
@@ -415,6 +597,11 @@ def build_dataset_bundle(
     storage_kind = "json"
     saved_at = 0.0
     block_summary: dict[str, Any] = {"num_blocks": 0, "num_sessions": 0}
+    positive_entry_spread_buckets: dict[str, int] = {}
+    timeout_peak_future_total_spread_buckets: dict[str, int] = {}
+    future_episode_total_spreads: list[float] = []
+    timeouts_without_future_episode = 0
+    timeouts_with_only_sub_threshold_episode = 0
 
     if state_path.suffix.lower() == ".json":
         pairs, saved_at = _load_pairs_from_json(state_path)
@@ -441,8 +628,11 @@ def build_dataset_bundle(
         )
         storage_kind = str(block_summary.get("state_storage_kind", "sqlite"))
 
+    min_total_spread_pct = max(0.0, float(min_total_spread_pct or 0.0))
     skipped_blocks_too_short = 0
-    for block in blocks:
+    for block_index, block in enumerate(blocks):
+        normalized_block_id = _synthetic_block_id(block.get("block_id"), block_index)
+        normalized_session_id = int(block.get("session_id") or 0)
         records = [
             canonicalize_record(record, fallback_ts=float(index))
             for index, record in enumerate(block.get("records", []))
@@ -452,27 +642,60 @@ def build_dataset_bundle(
             skipped_blocks_too_short += 1
             continue
         records.sort(key=lambda record: record["timestamp"])
-        inv_events = sorted(_coerce_float(ts, 0.0) for ts in block.get("inverted_events", []))
+        episodes = _build_closed_episodes(
+            records,
+            block_id=normalized_block_id,
+            session_id=normalized_session_id,
+        )
 
         for start in range(len(records) - sequence_length):
             window = records[start : start + sequence_length]
             current_ts = window[-1]["timestamp"]
-            future_events = [
-                event_ts
-                for event_ts in inv_events
-                if current_ts < event_ts <= current_ts + prediction_horizon_sec
-            ]
-            did_invert = 1.0 if future_events else 0.0
-            eta_seconds = (future_events[0] - current_ts) if future_events else 0.0
+            label = _label_window_from_episodes(
+                current_ts,
+                episodes,
+                prediction_horizon_sec=prediction_horizon_sec,
+                min_total_spread_pct=min_total_spread_pct,
+            )
 
             X_samples.append(_feature_window(window))
-            y_class.append(did_invert)
-            y_eta.append(eta_seconds)
+            y_class.append(float(label["y_class"]))
+            y_eta.append(float(label["y_eta"]))
             pair_ids.append(str(block.get("pair_id") or ""))
             block_ids.append(int(block.get("block_id") or 0))
-            session_ids.append(int(block.get("session_id") or 0))
+            session_ids.append(normalized_session_id)
             timestamps.append(current_ts)
             last_entries.append(window[-1]["entry_spread"])
+
+            future_episode_total_spreads.extend(float(value) for value in label["future_episode_total_spreads"])
+            if float(label["y_class"]) >= 0.5:
+                _bucket_count(
+                    window[-1]["entry_spread"],
+                    [
+                        ("lt_0_30", -float("inf"), 0.30),
+                        ("0_30_to_0_50", 0.30, 0.50),
+                        ("0_50_to_1_00", 0.50, 1.00),
+                        ("1_00_to_2_00", 1.00, 2.00),
+                        ("ge_2_00", 2.00, float("inf")),
+                    ],
+                    positive_entry_spread_buckets,
+                )
+            else:
+                _bucket_count(
+                    float(label["peak_future_total_spread"]),
+                    [
+                        ("lt_0_30", -float("inf"), 0.30),
+                        ("0_30_to_0_50", 0.30, 0.50),
+                        ("0_50_to_0_80", 0.50, 0.80),
+                        ("0_80_to_1_00", 0.80, 1.00),
+                        ("ge_1_00", 1.00, float("inf")),
+                    ],
+                    timeout_peak_future_total_spread_buckets,
+                )
+                if label["timeout_reason"] == "no_future_episode":
+                    timeouts_without_future_episode += 1
+                elif label["timeout_reason"] == "sub_threshold_only":
+                    timeouts_with_only_sub_threshold_episode += 1
 
     if X_samples:
         X_tensor = torch.tensor(X_samples, dtype=torch.float32)
@@ -500,6 +723,16 @@ def build_dataset_bundle(
         "num_cross_block_windows": 0,
         "prediction_horizon_sec": int(prediction_horizon_sec),
         "sequence_length": int(sequence_length),
+        "min_total_spread_pct": float(min_total_spread_pct),
+        "labeling_method": "episode_take_profit_time_barrier",
+        "labeling_timeout_only": True,
+        "label_audit": _finalize_label_audit(
+            positive_entry_spread_buckets,
+            future_episode_total_spreads,
+            timeout_peak_future_total_spread_buckets,
+            timeouts_without_future_episode=timeouts_without_future_episode,
+            timeouts_with_only_sub_threshold_episode=timeouts_with_only_sub_threshold_episode,
+        ) if X_samples else _empty_label_audit(),
         "state_saved_at": float(saved_at),
         "state_storage_kind": storage_kind,
     }

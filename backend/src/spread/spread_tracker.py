@@ -23,11 +23,13 @@ _EPISODE_SOURCE_VERSION = "recurring_v1"
 _EPISODE_BASELINE_WINDOW = 32
 _SHORT_RANGE_WINDOW_SEC = 2 * 60 * 60
 _LONG_RANGE_WINDOW_SEC = 24 * 60 * 60
+_DEFAULT_MIN_TOTAL_SPREAD_PCT = 0.0
 _TRACKER_META_KEYS = (
     "schema_version",
     "record_interval_sec",
     "tracking_window_sec",
     "gap_threshold_sec",
+    "min_total_spread_pct",
     "created_at",
     "last_flush_at",
 )
@@ -74,6 +76,10 @@ class TrackerEpisode:
     block_id: int = 0
     source_version: str = _EPISODE_SOURCE_VERSION
     is_closed: bool = True
+
+    @property
+    def total_spread(self) -> float:
+        return float(self.peak_entry_spread + self.exit_spread_at_close)
 
 
 def _linear_percentile(values: Iterable[float], percentile: float) -> float:
@@ -166,6 +172,10 @@ def _episode_stats(episodes: list[TrackerEpisode]) -> dict[str, float]:
     }
 
 
+def _episode_total_spread(episode: TrackerEpisode) -> float:
+    return float(episode.peak_entry_spread) + float(episode.exit_spread_at_close)
+
+
 def compute_closed_episodes(records: Iterable[SpreadRecord]) -> list[TrackerEpisode]:
     ordered = sorted(
         (
@@ -239,10 +249,14 @@ def build_recurring_context_from_episodes(
     now_ts: float,
     short_window_sec: float = _SHORT_RANGE_WINDOW_SEC,
     long_window_sec: float = _LONG_RANGE_WINDOW_SEC,
+    min_total_spread_pct: float = _DEFAULT_MIN_TOTAL_SPREAD_PCT,
 ) -> dict[str, object]:
     closed = [episode for episode in episodes if episode.is_closed and episode.end_ts > 0.0 and episode.end_ts <= float(now_ts)]
-    short_episodes = [episode for episode in closed if episode.end_ts >= float(now_ts) - float(short_window_sec)]
-    long_episodes = [episode for episode in closed if episode.end_ts >= float(now_ts) - float(long_window_sec)]
+    short_raw_episodes = [episode for episode in closed if episode.end_ts >= float(now_ts) - float(short_window_sec)]
+    long_raw_episodes = [episode for episode in closed if episode.end_ts >= float(now_ts) - float(long_window_sec)]
+    min_total_threshold = float(min_total_spread_pct or 0.0)
+    short_episodes = [episode for episode in short_raw_episodes if _episode_total_spread(episode) >= min_total_threshold]
+    long_episodes = [episode for episode in long_raw_episodes if _episode_total_spread(episode) >= min_total_threshold]
 
     short_stats = _episode_stats(short_episodes)
     long_stats = _episode_stats(long_episodes)
@@ -251,6 +265,16 @@ def build_recurring_context_from_episodes(
     long_ready = int(long_stats["support"]) >= 3
     strong_short_ready = int(short_stats["support"]) >= 3
     strong_long_ready = int(long_stats["support"]) >= 5
+
+    raw_short_ready = len(short_raw_episodes) >= 2
+    raw_long_ready = len(long_raw_episodes) >= 3
+
+    if raw_short_ready:
+        active_raw_episodes = short_raw_episodes
+    elif raw_long_ready:
+        active_raw_episodes = long_raw_episodes
+    else:
+        active_raw_episodes = short_raw_episodes or long_raw_episodes
 
     if short_ready:
         active_stats = short_stats
@@ -267,6 +291,9 @@ def build_recurring_context_from_episodes(
         active_episodes = []
         range_status = "insufficient_empirical_context"
         range_window = "none"
+
+    total_spreads = [_episode_total_spread(episode) for episode in active_raw_episodes]
+    median_total_spread = _median(total_spreads) if total_spreads else 0.0
 
     current_value = float(current_entry)
     entry_position_label = "unknown"
@@ -321,6 +348,11 @@ def build_recurring_context_from_episodes(
         "empirical_support": int(active_stats["support"]),
         "empirical_support_short": int(short_stats["support"]),
         "empirical_support_long": int(long_stats["support"]),
+        "raw_empirical_support": len(active_raw_episodes),
+        "raw_empirical_support_short": len(short_raw_episodes),
+        "raw_empirical_support_long": len(long_raw_episodes),
+        "median_total_spread": float(median_total_spread),
+        "min_total_spread_threshold": float(min_total_threshold),
         "entry_outer_range_min": float(active_stats["entry_outer_range_min"]),
         "entry_outer_range_max": float(active_stats["entry_outer_range_max"]),
         "entry_core_range_min": float(active_stats["entry_core_range_min"]),
@@ -345,6 +377,8 @@ def build_recurring_context_from_episodes(
         "context_percentile_excursions": round(context_percentile_excursions, 4),
         "entry_coherent_short_long": bool(entry_coherent),
         "exit_coherent_short_long": bool(exit_coherent),
+        "raw_short_ready": bool(raw_short_ready),
+        "raw_long_ready": bool(raw_long_ready),
         "short_ready": bool(short_ready),
         "long_ready": bool(long_ready),
         "strong_short_ready": bool(strong_short_ready),
@@ -456,6 +490,7 @@ class SpreadTracker:
         max_pairs: int = 10_000,
         db_path: str | Path | None = None,
         gap_threshold_sec: float = 0.0,
+        min_total_spread_pct: float = _DEFAULT_MIN_TOTAL_SPREAD_PCT,
         audit_collector: Any | None = None,
     ):
         self.window_sec = int(window_sec)
@@ -467,6 +502,7 @@ class SpreadTracker:
         self.track_enable_entry_spread_pct = float(track_enable_entry_spread_pct)
         self.db_path = Path(db_path) if db_path is not None else None
         self.gap_threshold_sec = self._resolve_gap_threshold_sec(gap_threshold_sec, self.record_interval_sec)
+        self.min_total_spread_pct = self._resolve_min_total_spread_pct(min_total_spread_pct)
         self.audit_collector = audit_collector
         self._lock = threading.Lock()
         self._pairs: Dict[PairKey, PairStats] = defaultdict(PairStats)
@@ -516,6 +552,13 @@ class SpreadTracker:
         if float(gap_threshold_sec or 0.0) > 0.0:
             return float(gap_threshold_sec)
         return max(60.0, 4.0 * max(float(record_interval_sec), 0.0))
+
+    @staticmethod
+    def _resolve_min_total_spread_pct(min_total_spread_pct: float) -> float:
+        value = float(min_total_spread_pct or 0.0)
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError("min_total_spread_pct must be a finite value >= 0")
+        return value
 
     @staticmethod
     def _pair_key(symbol: str, buy_ex: str, buy_mt: str, sell_ex: str, sell_mt: str) -> PairKey:
@@ -789,6 +832,7 @@ class SpreadTracker:
                     "record_interval_sec": self.record_interval_sec,
                     "tracking_window_sec": self.window_sec,
                     "gap_threshold_sec": self.gap_threshold_sec,
+                    "min_total_spread_pct": self.min_total_spread_pct,
                     "last_flush_at": self._last_flush_at,
                 },
             )
@@ -800,13 +844,26 @@ class SpreadTracker:
             meta_rows = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM tracker_meta")}
             if meta_rows.get("schema_version") != _SCHEMA_VERSION:
                 self._migrate_to_v2(conn, meta_rows)
-            self._write_meta(conn, {"schema_version": _SCHEMA_VERSION})
+            self._write_meta(
+                conn,
+                {
+                    "schema_version": _SCHEMA_VERSION,
+                    "min_total_spread_pct": self.min_total_spread_pct,
+                },
+            )
 
     def _migrate_to_v2(self, conn: sqlite3.Connection, meta_rows: dict[str, str]):
         records_exist = int(conn.execute("SELECT COUNT(*) FROM tracker_records").fetchone()[0]) > 0
         sessions_exist = int(conn.execute("SELECT COUNT(*) FROM tracker_capture_sessions").fetchone()[0]) > 0
         if not records_exist or sessions_exist:
-            self._write_meta(conn, {"schema_version": _SCHEMA_VERSION, "gap_threshold_sec": self.gap_threshold_sec})
+            self._write_meta(
+                conn,
+                {
+                    "schema_version": _SCHEMA_VERSION,
+                    "gap_threshold_sec": self.gap_threshold_sec,
+                    "min_total_spread_pct": self.min_total_spread_pct,
+                },
+            )
             return
 
         now = time.time()
@@ -910,7 +967,14 @@ class SpreadTracker:
                     (legacy_session_id, event_block_id, pair_id, str(event_row["event_type"]), event_ts),
                 )
             self._rebuild_episodes_for_pair_conn(conn, pair_id)
-        self._write_meta(conn, {"schema_version": _SCHEMA_VERSION, "gap_threshold_sec": self.gap_threshold_sec})
+        self._write_meta(
+            conn,
+            {
+                "schema_version": _SCHEMA_VERSION,
+                "gap_threshold_sec": self.gap_threshold_sec,
+                "min_total_spread_pct": self.min_total_spread_pct,
+            },
+        )
 
     def _open_runtime_session(self):
         if self.db_path is None:
@@ -1247,6 +1311,7 @@ class SpreadTracker:
             "baseline_mad": float(episode.baseline_mad),
             "activation_threshold": float(episode.activation_threshold),
             "release_threshold": float(episode.release_threshold),
+            "total_spread": float(_episode_total_spread(episode)),
             "session_id": int(episode.session_id),
             "block_id": int(episode.block_id),
             "source_version": str(episode.source_version),
@@ -1629,6 +1694,7 @@ class SpreadTracker:
                     list(ps.episodes),
                     current_entry=float(current_entry),
                     now_ts=float(now_ts) if now_ts is not None else float(ps._last_record_ts or time.time()),
+                    min_total_spread_pct=self.min_total_spread_pct,
                 )
                 return context
 
@@ -1656,6 +1722,7 @@ class SpreadTracker:
             typed_episodes,
             current_entry=float(current_entry),
             now_ts=float(now_ts) if now_ts is not None else time.time(),
+            min_total_spread_pct=self.min_total_spread_pct,
         )
 
     def prune(self, *, now_ts: float | None = None):
@@ -1847,6 +1914,7 @@ class SpreadTracker:
                         "record_interval_sec": self.record_interval_sec,
                         "tracking_window_sec": self.window_sec,
                         "gap_threshold_sec": self.gap_threshold_sec,
+                        "min_total_spread_pct": self.min_total_spread_pct,
                         "last_flush_at": self._last_flush_at,
                     },
                 )
@@ -2004,6 +2072,7 @@ class SpreadTracker:
     def get_training_config(self) -> Dict[str, object]:
         return {
             "gap_threshold_sec": self.gap_threshold_sec,
+            "min_total_spread_pct": self.min_total_spread_pct,
             "record_interval_sec": self.record_interval_sec,
             "window_sec": self.window_sec,
             "active_session_id": self._active_session_id,
@@ -2024,6 +2093,13 @@ class SpreadTracker:
                         (self.gap_threshold_sec, time.time(), self._active_session_id),
                     )
         return self.gap_threshold_sec
+
+    def update_min_total_spread_pct(self, min_total_spread_pct: float) -> float:
+        self.min_total_spread_pct = self._resolve_min_total_spread_pct(min_total_spread_pct)
+        if self.db_path is not None:
+            with self._connect() as conn:
+                self._write_meta(conn, {"min_total_spread_pct": self.min_total_spread_pct})
+        return self.min_total_spread_pct
 
     @staticmethod
     def _training_exception_sql(alias: str = "b") -> str:
@@ -3196,6 +3272,7 @@ class SpreadTracker:
             "window_sec": self.window_sec,
             "max_records_per_pair": self.max_records_per_pair,
             "gap_threshold_sec": self.gap_threshold_sec,
+            "min_total_spread_pct": self.min_total_spread_pct,
             "active_session_id": self._active_session_id,
             "last_flush_at": self._last_flush_at,
             "pairs_in_memory": len(self._pairs),
@@ -3358,6 +3435,10 @@ class SpreadTracker:
                     "total_entries": len(ps.entry_events),
                     "total_exits": len(ps.exit_events),
                     "last_crossover_ts": ps.last_crossover_ts,
+                    "history_points": len(ps.records),
+                    "last_record_ts": float(ps._last_record_ts),
+                    "current_block_id": int(ps.current_block_id or 0),
+                    "history_enabled": bool(ps.history_enabled),
                 }
         return results
 

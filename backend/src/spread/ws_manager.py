@@ -50,13 +50,18 @@ class WSManager:
             max_pairs=10_000,
             db_path=tracker_db_path,
             gap_threshold_sec=getattr(self.config, "tracker_gap_threshold_sec", 0.0),
+            min_total_spread_pct=getattr(self.config, "min_total_spread_pct", 1.0),
         )
-        self.ml_analyzer = SpreadMLAnalyzer(sequence_length=15)
+        self.ml_analyzer = SpreadMLAnalyzer(
+            sequence_length=15,
+            min_total_spread_pct=getattr(self.config, "min_total_spread_pct", 1.0),
+        )
         self.ml_analyzer.attach_tracker(self.tracker)
         self.runtime_audit = None
         self.perf_monitor = None
         self._ml_cache: OrderedDict = OrderedDict()
         self._ML_CACHE_MAX = 2000
+        self._ML_PREDICTION_MAX_AGE_SEC = 30.0
         self._exchange_instances: Dict[str, BaseExchangeWS] = {}
         self._scanner_clients: Set[Any] = set()
         self._scanner_lite_clients: Set[Any] = set()
@@ -76,6 +81,32 @@ class WSManager:
         restored = self.tracker.load_from_storage()
         if restored:
             logger.info("[WSManager] Restored tracker SQLite state (%s pairs)", restored)
+
+    @staticmethod
+    def _tracker_marker_from_cache(cached: Optional[Dict[str, Any]]) -> tuple[int, float, int]:
+        if not cached:
+            return (0, 0.0, 0)
+        return (
+            int(cached.get("history_points", 0) or 0),
+            float(cached.get("last_record_ts", 0.0) or 0.0),
+            int(cached.get("current_block_id", 0) or 0),
+        )
+
+    def _cache_prediction_is_stale(
+        self,
+        cache_entry: Optional[Dict[str, Any]],
+        tracker_row: Optional[Dict[str, Any]],
+        *,
+        now_ts: float,
+    ) -> bool:
+        if not cache_entry:
+            return True
+        cached_marker = tuple(cache_entry.get("tracker_marker") or (0, 0.0, 0))
+        current_marker = self._tracker_marker_from_cache(tracker_row)
+        if cached_marker != current_marker:
+            return True
+        computed_at = float(cache_entry.get("computed_at", 0.0) or 0.0)
+        return (now_ts - computed_at) >= self._ML_PREDICTION_MAX_AGE_SEC
 
     def _build_scanner_lite_summary(self, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         spot_future = 0
@@ -584,6 +615,7 @@ class WSManager:
 
         _history_fetch_ms = 0.0
         _ml_analyze_ms = 0.0
+        _ml_render_ms = 0.0
         if tracker_cache:
             pair_key = self.tracker._pair_key
             for opp in opportunities:
@@ -597,38 +629,51 @@ class WSManager:
                     opp.total_exits = cached['total_exits']
                     opp.last_crossover_ts = cached['last_crossover_ts']
 
-                # --- ML Analysis --------------------------------------------
-                # Only perform ML analysis if we need to refresh (every ~4s) or if uncached.
-                if key not in self._ml_cache or refresh_tracker:
-                    # Fetch decimation history
+                cache_entry = self._ml_cache.get(key)
+                if self._cache_prediction_is_stale(cache_entry, cached, now_ts=now_ts):
                     _history_started = time.perf_counter()
                     history = self.tracker.get_history(
                         opp.asset, opp.buy_exchange, opp.buy_market_type,
                         opp.sell_exchange, opp.sell_market_type, limit=100
                     )
                     _history_fetch_ms += (time.perf_counter() - _history_started) * 1000.0
-                    if history and len(history) >= 5:
-                        _ml_started = time.perf_counter()
-                        ml_ctx = self.ml_analyzer.analyze_pair(opp.entry_spread_pct, history, pair_key=key)
-                        _ml_analyze_ms += (time.perf_counter() - _ml_started) * 1000.0
-                        if ml_ctx:
-                            self._ml_cache[key] = ml_ctx
-                            self._ml_cache.move_to_end(key)
-                            if self.runtime_audit is not None:
-                                end_to_end_ms = None
-                                started_at = record_started_at_by_key.get(key)
-                                if started_at is not None:
-                                    end_to_end_ms = (time.perf_counter() - started_at) * 1000.0
-                                self.runtime_audit.record_inference(
-                                    pair_id=self.tracker._pair_id(key),
-                                    result=ml_ctx,
-                                    end_to_end_ms=end_to_end_ms,
-                                )
-                            if len(self._ml_cache) > self._ML_CACHE_MAX:
-                                self._ml_cache.popitem(last=False)
-                
-                if key in self._ml_cache:
-                    ctx = self._ml_cache[key]
+                    _ml_started = time.perf_counter()
+                    prediction = self.ml_analyzer.predict_history(history)
+                    _ml_analyze_ms += (time.perf_counter() - _ml_started) * 1000.0
+                    cache_entry = {
+                        "prediction": prediction,
+                        "tracker_marker": self._tracker_marker_from_cache(cached),
+                        "computed_at": now_ts,
+                    }
+                    self._ml_cache[key] = cache_entry
+                    self._ml_cache.move_to_end(key)
+                    if len(self._ml_cache) > self._ML_CACHE_MAX:
+                        self._ml_cache.popitem(last=False)
+
+                if refresh_tracker and cache_entry and cache_entry.get("prediction") is not None:
+                    _render_started = time.perf_counter()
+                    rendered_ctx = self.ml_analyzer.render_prediction(
+                        opp.entry_spread_pct,
+                        cache_entry["prediction"],
+                        pair_key=key,
+                    )
+                    _ml_render_ms += (time.perf_counter() - _render_started) * 1000.0
+                    cache_entry["context"] = rendered_ctx
+                    cache_entry["rendered_at"] = now_ts
+                    cache_entry["rendered_entry_spread"] = float(opp.entry_spread_pct)
+                    if self.runtime_audit is not None and cache_entry.get("computed_at") == now_ts:
+                        end_to_end_ms = None
+                        started_at = record_started_at_by_key.get(key)
+                        if started_at is not None:
+                            end_to_end_ms = (time.perf_counter() - started_at) * 1000.0
+                        self.runtime_audit.record_inference(
+                            pair_id=self.tracker._pair_id(key),
+                            result=rendered_ctx,
+                            end_to_end_ms=end_to_end_ms,
+                        )
+
+                if cache_entry and cache_entry.get("context") is not None:
+                    ctx = cache_entry["context"]
                     opp.ml_context = ctx
                     opp.ml_score = ctx.get("ml_score", 0)
 
@@ -673,6 +718,7 @@ class WSManager:
                     "tracker_enrich_ms": round((_perf_after_tracker_enrich - _perf_after_market_enrich) * 1000.0, 6),
                     "history_fetch_ms": round(_history_fetch_ms, 6),
                     "ml_analyze_ms": round(_ml_analyze_ms, 6),
+                    "ml_render_ms": round(_ml_render_ms, 6),
                     "filter_ms": round((_perf_after_filter - _perf_after_tracker_enrich) * 1000.0, 6),
                     "lite_refresh_ms": round((_perf_after_lite_refresh - _perf_after_filter) * 1000.0, 6),
                     "opportunities_before_filter": len(self.engine._opportunities),

@@ -147,7 +147,12 @@ def summarize_dashboard_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 range_core_mismatch_count += 1
 
         mismatch = False
-        if range_status == "insufficient_empirical_context":
+        if signal_reason_code == "median_total_spread_below_threshold":
+            mismatch = (
+                action_lane != "blocked"
+                or "abaixo do mínimo operacional" not in operator_message
+            )
+        elif range_status == "insufficient_empirical_context":
             mismatch = (
                 action_lane != "blocked"
                 or signal_reason_code != "insufficient_empirical_context"

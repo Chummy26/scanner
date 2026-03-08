@@ -421,8 +421,9 @@ def run_single_scenario(
         while (time.time() - started) < duration_sec:
             for endpoint_name, path in DEFAULT_ENDPOINTS:
                 sample = _timed_json_get(base_url, endpoint_name, path)
-                _append_ndjson(samples_path, sample)
-                probe_samples.append(sample)
+                sample_record = {key: value for key, value in sample.items() if key != "payload"}
+                _append_ndjson(samples_path, sample_record)
+                probe_samples.append(sample_record)
                 if endpoint_name == "debug_perf" and sample.get("ok") and isinstance(sample.get("payload"), dict):
                     perf_sample = {
                         "timestamp": sample.get("timestamp"),

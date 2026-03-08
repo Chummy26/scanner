@@ -269,6 +269,7 @@ class SpreadConfig:
     tracker_epsilon_pct: float = 0.02
     tracker_max_records_per_pair: int = 0  # 0 = derive from tracking_window_sec / tracker_record_interval_sec
     tracker_gap_threshold_sec: float = 0.0  # 0 = derive from record interval (max(60, 4 * interval))
+    min_total_spread_pct: float = 1.0
     tracker_db_path: str = ""
     symbols: List[str] = field(default_factory=lambda: [
         "BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "AVAX", "DOT",

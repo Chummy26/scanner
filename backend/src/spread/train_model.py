@@ -82,6 +82,10 @@ class FocalLoss(nn.Module):
         return (focal_weight * bce).mean()
 
 
+def _derive_focal_alpha(positive_rate_train: float) -> float:
+    return float(min(0.95, max(0.25, 1.0 - float(positive_rate_train))))
+
+
 def _apply_platt_scaling(logits: np.ndarray, scale: float, bias: float) -> np.ndarray:
     calibrated = 1.0 / (1.0 + np.exp(-(logits * scale + bias)))
     return np.clip(calibrated, 1e-6, 1.0 - 1e-6)
@@ -685,6 +689,7 @@ def write_audit_report(report: dict[str, Any], audit_path: Path) -> Path:
     temporal_summary = report["temporal_walk_forward"]["test"]["summary"]
     validation_partition = report["validation_partition"]
     feature_monitoring = report["feature_monitoring"]
+    label_audit = report.get("label_audit", {})
     checks = {
         "dataset_non_degenerate": bool(dataset_summary["num_samples"] > 0 and dataset_summary["feature_abs_sum"] > 0.0),
         "windows_respect_blocks": int(dataset_summary.get("num_cross_block_windows", 0)) == 0,
@@ -818,6 +823,20 @@ def write_audit_report(report: dict[str, Any], audit_path: Path) -> Path:
         f"- Max train variance: {feature_monitoring['max_variance']:.4f}",
         f"- Min train variance: {feature_monitoring['min_variance']:.4f}",
         "",
+        "## Label Audit",
+        f"- Labeling method: {dataset_summary.get('labeling_method', 'legacy')}",
+        f"- Timeout only: {dataset_summary.get('labeling_timeout_only', False)}",
+        f"- Timeout windows without future episode: {label_audit.get('timeouts_without_future_episode', 0)}",
+        f"- Timeout windows with only sub-threshold episodes: {label_audit.get('timeouts_with_only_sub_threshold_episode', 0)}",
+        f"- Positive entry bucket lt_0_30: {label_audit.get('positive_entry_spread_buckets', {}).get('lt_0_30', 0)}",
+        f"- Positive entry bucket 0_30_to_0_50: {label_audit.get('positive_entry_spread_buckets', {}).get('0_30_to_0_50', 0)}",
+        f"- Positive entry bucket 0_50_to_1_00: {label_audit.get('positive_entry_spread_buckets', {}).get('0_50_to_1_00', 0)}",
+        f"- Positive entry bucket 1_00_to_2_00: {label_audit.get('positive_entry_spread_buckets', {}).get('1_00_to_2_00', 0)}",
+        f"- Positive entry bucket ge_2_00: {label_audit.get('positive_entry_spread_buckets', {}).get('ge_2_00', 0)}",
+        f"- Timeout peak bucket 0_80_to_1_00: {label_audit.get('timeout_peak_future_total_spread_buckets', {}).get('0_80_to_1_00', 0)}",
+        f"- Future total spread p50: {label_audit.get('future_episode_total_spread_quantiles', {}).get('p50', 0.0):.4f}",
+        f"- Future total spread p90: {label_audit.get('future_episode_total_spread_quantiles', {}).get('p90', 0.0):.4f}",
+        "",
         "## Subgroups",
         f"- Entry buckets analysed: {len(report['subgroup_metrics']['test']['entry_spread_buckets'])}",
         f"- Volatility buckets analysed: {len(report['subgroup_metrics']['test']['volatility_buckets'])}",
@@ -844,6 +863,7 @@ def run_training_loop(
     artifact_dir: Path | None = None,
     sequence_length: int = 15,
     prediction_horizon_sec: int = 14_400,
+    min_total_spread_pct: float = 1.0,
     selected_session_ids: list[int] | None = None,
     selected_block_ids: list[int] | None = None,
     hidden_size: int = 64,
@@ -854,8 +874,11 @@ def run_training_loop(
     patience: int = 5,
     learning_rate: float = 0.001,
     weight_decay: float = 1e-4,
-    focal_alpha: float = 0.25,
+    focal_alpha: float | None = None,
     focal_gamma: float = 2.0,
+    min_train_positive_samples: int = 500,
+    min_val_positive_samples: int = 50,
+    min_test_positive_samples: int = 50,
     seed: int = 42,
     audit_output: Path | None = None,
 ) -> dict[str, Any]:
@@ -883,6 +906,7 @@ def run_training_loop(
         state_path=state_path,
         sequence_length=sequence_length,
         prediction_horizon_sec=prediction_horizon_sec,
+        min_total_spread_pct=min_total_spread_pct,
         selected_session_ids=selected_session_ids,
         selected_block_ids=selected_block_ids,
     )
@@ -898,9 +922,33 @@ def run_training_loop(
     if min(splits["train"].summary["num_samples"], splits["val"].summary["num_samples"], splits["test"].summary["num_samples"]) == 0:
         raise ValueError("At least one split is empty; need more disjoint pairs.")
 
+    split_positive_counts = {
+        "train": int(splits["train"].summary["num_positive_samples"]),
+        "val": int(splits["val"].summary["num_positive_samples"]),
+        "test": int(splits["test"].summary["num_positive_samples"]),
+    }
+    if split_positive_counts["train"] < int(min_train_positive_samples):
+        raise ValueError(
+            f"Train split has only {split_positive_counts['train']} positive samples; minimum required is {int(min_train_positive_samples)}. "
+            "Revise min_total_spread_pct or prediction_horizon_sec before retraining."
+        )
+    if split_positive_counts["val"] < int(min_val_positive_samples):
+        raise ValueError(
+            f"Validation split has only {split_positive_counts['val']} positive samples; minimum required is {int(min_val_positive_samples)}. "
+            "Revise min_total_spread_pct or prediction_horizon_sec before retraining."
+        )
+    if split_positive_counts["test"] < int(min_test_positive_samples):
+        raise ValueError(
+            f"Test split has only {split_positive_counts['test']} positive samples; minimum required is {int(min_test_positive_samples)}. "
+            "Revise min_total_spread_pct or prediction_horizon_sec before retraining."
+        )
+
     feature_mean, feature_std = compute_feature_stats(splits["train"].X)
     for split_bundle in splits.values():
         split_bundle.X = normalize_features(split_bundle.X, feature_mean, feature_std)
+
+    positive_rate_train = float(splits["train"].y_class.mean().item()) if splits["train"].summary["num_samples"] else 0.0
+    focal_alpha_effective = float(focal_alpha) if focal_alpha is not None else _derive_focal_alpha(positive_rate_train)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = SpreadSequenceLSTM(
@@ -915,7 +963,7 @@ def run_training_loop(
         optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-6,
     )
 
-    criterion_prob = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+    criterion_prob = FocalLoss(alpha=focal_alpha_effective, gamma=focal_gamma)
     criterion_eta = nn.SmoothL1Loss()
 
     train_loader = _make_loader(splits["train"], batch_size=batch_size, shuffle=True)
@@ -1020,6 +1068,9 @@ def run_training_loop(
 
     dataset_summary = dict(bundle.summary)
     dataset_summary["feature_abs_sum"] = float(bundle.X.abs().sum().item())
+    dataset_summary["positive_rate_train"] = positive_rate_train
+    dataset_summary["focal_alpha_effective"] = focal_alpha_effective
+    label_audit = dict(dataset_summary.get("label_audit", {}))
     test_x = splits["test"].X.detach().cpu().numpy() if splits["test"].summary["num_samples"] else np.empty((0, 0, 0), dtype=float)
     feature_std_np = feature_std.detach().cpu().numpy()
     mean_abs_zscore_test = 0.0
@@ -1075,6 +1126,7 @@ def run_training_loop(
         "temporal_walk_forward": temporal_walk_forward,
         "validation_partition": validation_partition,
         "feature_monitoring": feature_monitoring,
+        "label_audit": label_audit,
         "training": {
             "best_epoch": best_epoch,
             "best_val_loss": best_val_loss,
@@ -1082,7 +1134,10 @@ def run_training_loop(
             "patience": patience,
             "learning_rate": learning_rate,
             "weight_decay": weight_decay,
-            "focal_alpha": focal_alpha,
+            "focal_alpha": focal_alpha_effective,
+            "positive_rate_train": positive_rate_train,
+            "focal_alpha_requested": float(focal_alpha) if focal_alpha is not None else None,
+            "focal_alpha_effective": focal_alpha_effective,
             "focal_gamma": focal_gamma,
             "platt_scale": platt_scale,
             "platt_bias": platt_bias,
@@ -1121,13 +1176,22 @@ def run_training_loop(
         split_summary=split_summary,
         training_config={
             "prediction_horizon_sec": prediction_horizon_sec,
+            "min_total_spread_pct": float(min_total_spread_pct),
+            "labeling_method": str(dataset_summary.get("labeling_method", "legacy")),
+            "labeling_timeout_only": bool(dataset_summary.get("labeling_timeout_only", False)),
             "batch_size": batch_size,
             "max_epochs": max_epochs,
             "patience": patience,
             "learning_rate": learning_rate,
             "weight_decay": weight_decay,
-            "focal_alpha": focal_alpha,
+            "focal_alpha": focal_alpha_effective,
+            "positive_rate_train": positive_rate_train,
+            "focal_alpha_requested": float(focal_alpha) if focal_alpha is not None else None,
+            "focal_alpha_effective": focal_alpha_effective,
             "focal_gamma": focal_gamma,
+            "min_train_positive_samples": int(min_train_positive_samples),
+            "min_val_positive_samples": int(min_val_positive_samples),
+            "min_test_positive_samples": int(min_test_positive_samples),
             "threshold_selection": threshold_selection["execute"]["objective"],
             "validation_partition_mode": validation_partition["mode"],
             "selected_session_ids": list(selected_session_ids or []),
@@ -1140,6 +1204,7 @@ def run_training_loop(
                 f"{state_path.resolve()}:{state_path.stat().st_mtime_ns}:"
                 f"{dataset_summary['num_samples']}:{dataset_summary['num_positive_samples']}:"
                 f"{dataset_summary['num_pairs']}:{dataset_summary.get('blocks_used', 0)}:{dataset_summary.get('sessions_used', 0)}:"
+                f"{float(min_total_spread_pct)}:"
                 f"{','.join(str(session_id) for session_id in dataset_summary.get('session_ids_used', []))}:"
                 f"{','.join(str(block_id) for block_id in dataset_summary.get('block_ids_used', []))}"
             ).encode()

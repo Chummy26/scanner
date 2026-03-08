@@ -757,6 +757,7 @@ async def handle_debug_status(request):
             "tracking_window_sec": ws_mgr.config.tracking_window_sec,
             "tracker_record_interval_sec": ws_mgr.config.tracker_record_interval_sec,
             "tracker_gap_threshold_sec": getattr(ws_mgr.config, "tracker_gap_threshold_sec", 0.0),
+            "min_total_spread_pct": getattr(ws_mgr.config, "min_total_spread_pct", 1.0),
             "tracker_db_path": getattr(ws_mgr.config, "tracker_db_path", ""),
             "total_configured_symbols": len(ws_mgr.config.symbols),
             "total_configured_exchanges": len(ws_mgr.config.exchanges),
@@ -1499,14 +1500,24 @@ async def handle_ml_training_config_patch(request):
         payload = await request.json()
     except Exception:
         return web.json_response({"error": "invalid json"}, status=400)
-    if "gap_threshold_sec" not in payload:
-        return web.json_response({"error": "gap_threshold_sec is required"}, status=400)
+    if "gap_threshold_sec" not in payload and "min_total_spread_pct" not in payload:
+        return web.json_response({"error": "gap_threshold_sec or min_total_spread_pct is required"}, status=400)
     try:
-        gap_threshold_sec = ws_mgr.tracker.update_gap_threshold_sec(float(payload["gap_threshold_sec"]))
+        if "gap_threshold_sec" in payload:
+            ws_mgr.config.tracker_gap_threshold_sec = ws_mgr.tracker.update_gap_threshold_sec(float(payload["gap_threshold_sec"]))
+        if "min_total_spread_pct" in payload:
+            min_total_spread_pct = ws_mgr.tracker.update_min_total_spread_pct(float(payload["min_total_spread_pct"]))
+            ws_mgr.config.min_total_spread_pct = min_total_spread_pct
+            if getattr(ws_mgr, "ml_analyzer", None) is not None:
+                ws_mgr.ml_analyzer.min_total_spread_pct = float(min_total_spread_pct)
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=400)
-    ws_mgr.config.tracker_gap_threshold_sec = gap_threshold_sec
-    return web.json_response({"gap_threshold_sec": gap_threshold_sec})
+    return web.json_response(
+        {
+            "gap_threshold_sec": float(ws_mgr.tracker.gap_threshold_sec),
+            "min_total_spread_pct": float(ws_mgr.tracker.min_total_spread_pct),
+        }
+    )
 
 
 async def handle_ml_training_resegment(request):
@@ -1556,6 +1567,7 @@ async def _execute_training_run(app: web.Application, run_id: int):
             artifact_dir=artifact_dir,
             sequence_length=int(run_payload["sequence_length"]),
             prediction_horizon_sec=int(run_payload["prediction_horizon_sec"]),
+            min_total_spread_pct=float(getattr(ws_mgr.tracker, "min_total_spread_pct", 1.0) or 1.0),
             selected_session_ids=session_ids,
             selected_block_ids=block_ids,
         )
@@ -2595,6 +2607,8 @@ async def on_startup(app):
                 config.tracker_max_records_per_pair = int(os.environ["TEAM_OP_TRACKER_MAX_RECORDS_PER_PAIR"])
             if os.environ.get("TEAM_OP_TRACKER_GAP_THRESHOLD_SEC"):
                 config.tracker_gap_threshold_sec = float(os.environ["TEAM_OP_TRACKER_GAP_THRESHOLD_SEC"])
+            if os.environ.get("TEAM_OP_MIN_TOTAL_SPREAD_PCT"):
+                config.min_total_spread_pct = float(os.environ["TEAM_OP_MIN_TOTAL_SPREAD_PCT"])
             if os.environ.get("TEAM_OP_TRACKER_DB_PATH"):
                 config.tracker_db_path = os.environ["TEAM_OP_TRACKER_DB_PATH"].strip()
         except Exception as e:
