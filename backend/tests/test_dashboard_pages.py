@@ -11,6 +11,7 @@ def test_signal_dashboard_page_uses_action_queue_copy_and_no_tailwind_cdn():
     assert "Fila de ação do LSTM" in html
     assert "Curadoria de treino" in html
     assert "cdn.tailwindcss.com" not in html
+    assert "Ajustando..." not in html
     assert "/api/v1/ml/dashboard" in html
 
 

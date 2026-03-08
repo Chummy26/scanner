@@ -11,7 +11,7 @@ def test_runtime_audit_runner_resolves_paths_absolutely():
 
     assert output_dir.is_absolute()
     assert db_path.is_absolute()
-    assert str(output_dir).endswith(str(Path("backend") / "out" / "runtime_audit" / "demo"))
+    assert str(output_dir).endswith(str(Path("out") / "runtime_audit" / "demo"))
     assert str(db_path).endswith(str(Path("backend") / "out" / "config" / "demo.sqlite"))
 
 

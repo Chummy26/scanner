@@ -266,3 +266,47 @@ def test_tracker_rebuilds_episodes_when_block_is_split_and_merged(tmp_path: Path
     tracker.merge_next_block(int(merged_block_id))
     after_merge = tracker.get_pair_episodes(*pair, limit=10)
     assert len(after_merge) == len(before)
+
+
+def test_tracker_excludes_open_episode_from_recurring_context(tmp_path: Path):
+    db_path = tmp_path / "tracker_history.sqlite"
+    tracker = SpreadTracker(
+        window_sec=24 * 60 * 60,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=db_path,
+        gap_threshold_sec=120.0,
+    )
+
+    pair = ("SOL", "mexc", "spot", "gate", "futures")
+    entries = [
+        0.20, 0.21, 0.19, 0.20, 0.22,
+        0.46, 0.63, 0.34, 0.23,
+        0.21, 0.20, 0.22, 0.24,
+        0.59, 0.68, 0.36, 0.24,
+        0.23, 0.22, 0.24, 0.27,
+        0.61, 0.72, 0.74, 0.75, 0.73,
+    ]
+    exits = [
+        -0.08, -0.07, -0.08, -0.07, -0.06,
+        -0.03, -0.01, 0.04, 0.08,
+        -0.08, -0.08, -0.07, -0.06,
+        -0.02, -0.01, 0.05, 0.09,
+        -0.08, -0.07, -0.06, -0.05,
+        -0.02, 0.00, 0.01, 0.01, 0.02,
+    ]
+    for index, (entry_spread, exit_spread) in enumerate(zip(entries, exits)):
+        tracker.record_spread(*pair, entry_spread, exit_spread, now_ts=float(index * 15))
+    assert tracker.flush_to_storage(now_ts=float((len(entries) - 1) * 15), force=True)
+    tracker.close_active_session(ended_at=float(len(entries) * 15))
+
+    episodes = tracker.get_pair_episodes(*pair, limit=10)
+    context = tracker.get_pair_recurring_context(*pair, current_entry=0.74, now_ts=float(len(entries) * 15))
+
+    assert len(episodes) == 2
+    assert all(episode["is_closed"] is True for episode in episodes)
+    assert context["empirical_support_short"] == 2
+    assert context["range_status"] == "ready_short"

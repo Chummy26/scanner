@@ -12,7 +12,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.spread.runtime_audit import default_runtime_audit_dir, finalize_runtime_audit_package
+from src.spread.runtime_audit import default_runtime_audit_dir, finalize_runtime_audit_package, summarize_dashboard_payload
 
 
 def _wait_for_api(base_url: str, timeout_sec: int = 30) -> bool:
@@ -44,12 +44,15 @@ def _probe_dashboard(base_url: str, output_path: Path) -> None:
             status_code = int(response.status)
             body = json.loads(response.read().decode("utf-8"))
             payload_count = len(body.get("data", [])) if isinstance(body, dict) else 0
+            payload_summary = summarize_dashboard_payload(body if isinstance(body, dict) else {})
             ok = status_code == 200
     except urllib.error.HTTPError as exc:
         status_code = int(exc.code)
         error = str(exc)
+        payload_summary = summarize_dashboard_payload({})
     except Exception as exc:  # pragma: no cover - runtime utility
         error = str(exc)
+        payload_summary = summarize_dashboard_payload({})
     latency_ms = (time.perf_counter() - started) * 1000.0
     _append_ndjson(
         output_path,
@@ -61,15 +64,19 @@ def _probe_dashboard(base_url: str, output_path: Path) -> None:
             "payload_count": payload_count,
             "ok": ok,
             "error": error,
+            **payload_summary,
         },
     )
 
 
 def resolve_runtime_paths(output_dir_arg: str, db_path_arg: str) -> tuple[Path, Path]:
-    output_dir = Path(output_dir_arg) if output_dir_arg else default_runtime_audit_dir()
+    if output_dir_arg:
+        output_dir = Path(output_dir_arg)
+        if not output_dir.is_absolute():
+            output_dir = (Path.cwd() / output_dir).resolve()
+    else:
+        output_dir = default_runtime_audit_dir()
     db_path = Path(db_path_arg)
-    if not output_dir.is_absolute():
-        output_dir = (ROOT_DIR / output_dir).resolve()
     if not db_path.is_absolute():
         db_path = (ROOT_DIR / db_path).resolve()
     return output_dir, db_path
@@ -83,6 +90,7 @@ def main():
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--output-dir", default="")
     parser.add_argument("--db-path", default="out/config/tracker_history.sqlite")
+    parser.add_argument("--legacy-package-dir", default="")
     parser.add_argument("--spawn-server", action="store_true")
     parser.add_argument("--max-symbols", type=int, default=3)
     parser.add_argument("--symbol-discovery-enabled", default="0")
@@ -130,6 +138,7 @@ def main():
         state_path=db_path,
         duration_sec=int(args.duration_sec),
         run_status=run_status,
+        legacy_package_dir=Path(args.legacy_package_dir).resolve() if args.legacy_package_dir else None,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 

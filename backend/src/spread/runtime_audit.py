@@ -18,6 +18,7 @@ except Exception:  # pragma: no cover
     psutil = None
 
 from .ml_dataset import build_dataset_bundle
+from .spread_tracker import SpreadRecord, build_recurring_context_from_episodes, compute_closed_episodes
 from .train_model import run_training_loop
 
 
@@ -93,6 +94,88 @@ def _numeric_summary(values: list[float]) -> dict[str, Any]:
         "mean": sum(cleaned) / len(cleaned),
         "p95": _percentile(cleaned, 95.0),
         "p99": _percentile(cleaned, 99.0),
+    }
+
+
+def _format_range(min_value: Any, max_value: Any) -> str:
+    try:
+        return f"{float(min_value):.2f}% à {float(max_value):.2f}%"
+    except (TypeError, ValueError):
+        return "--"
+
+
+def summarize_dashboard_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    rows = payload.get("data", []) if isinstance(payload, dict) else []
+    if not isinstance(rows, list):
+        rows = []
+    adjusting_count = 0
+    actionable_without_range_count = 0
+    strong_eta_divergent_count = 0
+    above_band_mismatch_count = 0
+    range_core_mismatch_count = 0
+    reason_lane_message_mismatch_count = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        ml = row.get("mlContext") if isinstance(row.get("mlContext"), dict) else {}
+        signal_action = str(ml.get("signal_action") or "WAIT")
+        range_status = str(ml.get("range_status") or "unknown")
+        entry_position = str(ml.get("entry_position_label") or "unknown")
+        eta_alignment_status = str(ml.get("eta_alignment_status") or "unknown")
+        action_lane = str(row.get("action_lane") or "blocked")
+        signal_reason_code = str(row.get("signal_reason_code") or "")
+        operator_message = str(row.get("operator_message") or "")
+
+        adjusting_count += 1 if str(ml.get("recommended_entry_range") or "") == "Ajustando..." else 0
+        adjusting_count += 1 if str(ml.get("recommended_exit_range") or "") == "Ajustando..." else 0
+
+        if signal_action in {"EXECUTE", "STRONG_EXECUTE"} and range_status == "insufficient_empirical_context":
+            actionable_without_range_count += 1
+        if signal_action == "STRONG_EXECUTE" and eta_alignment_status == "divergent":
+            strong_eta_divergent_count += 1
+        if entry_position == "above_band" and (
+            signal_reason_code != "entry_above_recurring_band" or action_lane != "blocked"
+        ):
+            above_band_mismatch_count += 1
+
+        expected_entry_range = _format_range(ml.get("entry_core_range_min"), ml.get("entry_core_range_max"))
+        expected_exit_range = _format_range(ml.get("exit_core_range_min"), ml.get("exit_core_range_max"))
+        if range_status != "insufficient_empirical_context":
+            if expected_entry_range != str(ml.get("recommended_entry_range") or "--"):
+                range_core_mismatch_count += 1
+            if expected_exit_range != str(ml.get("recommended_exit_range") or "--"):
+                range_core_mismatch_count += 1
+
+        mismatch = False
+        if range_status == "insufficient_empirical_context":
+            mismatch = (
+                action_lane != "blocked"
+                or signal_reason_code != "insufficient_empirical_context"
+                or "Faixa recorrente indisponível" not in operator_message
+            )
+        elif entry_position == "above_band":
+            mismatch = (
+                action_lane != "blocked"
+                or signal_reason_code != "entry_above_recurring_band"
+                or "acima da banda recorrente" not in operator_message
+            )
+        elif signal_reason_code == "execute_ready":
+            mismatch = action_lane != "execute_now"
+        elif signal_reason_code == "strong_execute_ready":
+            mismatch = action_lane != "execute_now"
+        elif signal_reason_code == "eta_divergent":
+            mismatch = action_lane != "execute_now" or "diverge" not in operator_message
+        if mismatch:
+            reason_lane_message_mismatch_count += 1
+
+    return {
+        "payload_count": len(rows),
+        "adjusting_count": adjusting_count,
+        "actionable_without_range_count": actionable_without_range_count,
+        "strong_eta_divergent_count": strong_eta_divergent_count,
+        "above_band_mismatch_count": above_band_mismatch_count,
+        "range_core_mismatch_count": range_core_mismatch_count,
+        "reason_lane_message_mismatch_count": reason_lane_message_mismatch_count,
     }
 
 
@@ -376,10 +459,20 @@ class RuntimeAuditCollector:
             self.event(
                 "signal",
                 pair_key=pair_key,
+                current_entry=round(float(current_entry), 6),
                 inversion_probability=round(probability, 6),
                 eta_seconds=int(result.get("eta_seconds") or 0),
+                display_eta_seconds=int(result.get("display_eta_seconds") or result.get("eta_seconds") or 0),
+                model_eta_seconds=int(result.get("model_eta_seconds") or 0),
                 signal_action=str(result.get("signal_action") or "WAIT"),
+                range_status=str(result.get("range_status") or "unknown"),
+                range_window=str(result.get("range_window") or "none"),
+                recommended_entry_range=str(result.get("recommended_entry_range") or "--"),
+                recommended_exit_range=str(result.get("recommended_exit_range") or "--"),
+                eta_alignment_status=str(result.get("eta_alignment_status") or "unknown"),
                 context_strength=str(result.get("context_strength") or ""),
+                entry_position_label=str(result.get("entry_position_label") or "unknown"),
+                signal_reason=str(result.get("signal_reason") or ""),
                 inference_latency_ms=round(latency_ms, 6),
                 e2e_latency_ms=round(e2e_latency_ms, 6),
                 drift_status=str(result.get("drift_status") or "unknown"),
@@ -492,7 +585,277 @@ class RuntimeAuditCollector:
 RuntimeAuditSession = RuntimeAuditCollector
 
 
-def build_runtime_summary(output_dir: Path) -> dict[str, Any]:
+def _pair_key_from_row(row: sqlite3.Row) -> str:
+    return f"{row['symbol']}|{row['buy_ex']}|{row['buy_mt']}|{row['sell_ex']}|{row['sell_mt']}"
+
+
+def _latest_events_by_pair(events: list[dict[str, Any]], *, kind: str, model_status: str | None = None) -> dict[str, dict[str, Any]]:
+    latest: dict[str, dict[str, Any]] = {}
+    for event in events:
+        if str(event.get("kind") or "") != kind:
+            continue
+        if model_status is not None and str(event.get("model_status") or "") != model_status:
+            continue
+        pair_key = str(event.get("pair_key") or "")
+        if not pair_key:
+            continue
+        wall_ts = float(event.get("wall_ts") or 0.0)
+        previous = latest.get(pair_key)
+        if previous is None or wall_ts >= float(previous.get("wall_ts") or 0.0):
+            latest[pair_key] = event
+    return latest
+
+
+def _load_snapshot_pair_maps(snapshot_path: Path) -> tuple[dict[str, int], dict[str, float], set[str]]:
+    pair_to_id: dict[str, int] = {}
+    pair_max_ts: dict[str, float] = {}
+    eligible_pairs: set[str] = set()
+    try:
+        with sqlite3.connect(snapshot_path, timeout=30.0) as conn:
+            conn.row_factory = sqlite3.Row
+            pair_rows = list(
+                conn.execute(
+                    """
+                    SELECT id, symbol, buy_ex, buy_mt, sell_ex, sell_mt
+                    FROM tracker_pairs
+                    """
+                )
+            )
+            for row in pair_rows:
+                pair_to_id[_pair_key_from_row(row)] = int(row["id"])
+            for row in conn.execute(
+                """
+                SELECT p.symbol, p.buy_ex, p.buy_mt, p.sell_ex, p.sell_mt, MAX(r.ts) AS max_ts
+                FROM tracker_records r
+                JOIN tracker_pairs p ON p.id = r.pair_id
+                GROUP BY r.pair_id
+                """
+            ):
+                pair_max_ts[_pair_key_from_row(row)] = float(row["max_ts"] or 0.0)
+            for row in conn.execute(
+                """
+                SELECT p.symbol, p.buy_ex, p.buy_mt, p.sell_ex, p.sell_mt
+                FROM tracker_pair_blocks b
+                JOIN tracker_pairs p ON p.id = b.pair_id
+                WHERE b.is_open = 0 AND b.record_count >= 32
+                GROUP BY b.pair_id
+                """
+            ):
+                eligible_pairs.add(_pair_key_from_row(row))
+    except sqlite3.Error:
+        return {}, {}, set()
+    return pair_to_id, pair_max_ts, eligible_pairs
+
+
+def _build_context_coverage(events: list[dict[str, Any]], snapshot_path: Path | None) -> dict[str, Any]:
+    latest_ready = _latest_events_by_pair(events, kind="inference", model_status="ready")
+    if snapshot_path is None or not snapshot_path.is_file() or snapshot_path.suffix.lower() != ".sqlite":
+        return {
+            "eligible_ready_pairs": 0,
+            "ready_short_pairs": 0,
+            "ready_long_fallback_pairs": 0,
+            "insufficient_empirical_context_pairs": 0,
+            "insufficient_empirical_context_rate": 0.0,
+            "support_short": _numeric_summary([]),
+            "support_long": _numeric_summary([]),
+            "near_miss_reasons": {},
+        }
+    _, _, eligible_pairs = _load_snapshot_pair_maps(snapshot_path)
+    eligible_ready = {
+        pair_key: payload
+        for pair_key, payload in latest_ready.items()
+        if pair_key in eligible_pairs
+    }
+    ready_short = 0
+    ready_long = 0
+    insufficient = 0
+    short_support: list[float] = []
+    long_support: list[float] = []
+    near_miss_reasons: Counter[str] = Counter()
+    for payload in eligible_ready.values():
+        range_status = str(payload.get("range_status") or "unknown")
+        if range_status == "ready_short":
+            ready_short += 1
+        elif range_status == "ready_long_fallback":
+            ready_long += 1
+        elif range_status == "insufficient_empirical_context":
+            insufficient += 1
+        short_support.append(float(payload.get("empirical_support_short") or 0.0))
+        long_support.append(float(payload.get("empirical_support_long") or 0.0))
+        if str(payload.get("signal_action") or "WAIT") != "STRONG_EXECUTE":
+            if not bool(payload.get("strong_short_ready")):
+                near_miss_reasons["short_ready_strong"] += 1
+            elif not bool(payload.get("strong_long_ready")):
+                near_miss_reasons["long_ready_strong"] += 1
+            elif str(payload.get("entry_position_label") or "") != "inside_core":
+                near_miss_reasons["inside_core"] += 1
+            elif not bool(payload.get("entry_coherent_short_long")) or not bool(payload.get("exit_coherent_short_long")):
+                near_miss_reasons["short_long_coherence"] += 1
+            elif float(payload.get("inversion_probability") or 0.0) < float(payload.get("strong_threshold_used") or 0.0):
+                near_miss_reasons["strong_threshold"] += 1
+            elif str(payload.get("eta_alignment_status") or "") == "divergent":
+                near_miss_reasons["eta_alignment"] += 1
+    eligible_count = len(eligible_ready)
+    return {
+        "eligible_ready_pairs": eligible_count,
+        "ready_short_pairs": ready_short,
+        "ready_long_fallback_pairs": ready_long,
+        "insufficient_empirical_context_pairs": insufficient,
+        "insufficient_empirical_context_rate": round((insufficient / eligible_count), 4) if eligible_count else 0.0,
+        "support_short": _numeric_summary(short_support),
+        "support_long": _numeric_summary(long_support),
+        "near_miss_reasons": dict(sorted(near_miss_reasons.items())),
+    }
+
+
+def _build_signal_confirmations(events: list[dict[str, Any]], snapshot_path: Path | None) -> dict[str, Any]:
+    signal_events = [event for event in events if str(event.get("kind") or "") == "signal"]
+    if snapshot_path is None or not snapshot_path.is_file() or snapshot_path.suffix.lower() != ".sqlite":
+        return {"summary": {"total": len(signal_events), "confirmable_now": 0, "confirmed": 0, "awaiting_confirmation": len(signal_events)}, "by_action": {}, "by_eta_alignment": {}, "signals": []}
+
+    pair_to_id, pair_max_ts, _ = _load_snapshot_pair_maps(snapshot_path)
+    by_action: dict[str, Counter[str]] = {}
+    by_eta_alignment: dict[str, Counter[str]] = {}
+    signals: list[dict[str, Any]] = []
+    confirmed = 0
+    confirmable = 0
+    awaiting = 0
+    try:
+        with sqlite3.connect(snapshot_path, timeout=30.0) as conn:
+            conn.row_factory = sqlite3.Row
+            for event in signal_events:
+                pair_key = str(event.get("pair_key") or "")
+                signal_action = str(event.get("signal_action") or "WAIT")
+                eta_alignment = str(event.get("eta_alignment_status") or "unknown")
+                signal_ts = float(event.get("wall_ts") or 0.0)
+                display_eta = int(event.get("display_eta_seconds") or event.get("eta_seconds") or 0)
+                available_until_ts = float(pair_max_ts.get(pair_key, 0.0))
+                pair_id = pair_to_id.get(pair_key)
+                status = "awaiting_confirmation"
+                actual_duration_sec = None
+                confirmed_within_eta = False
+                if pair_id is not None and display_eta > 0 and available_until_ts >= signal_ts + display_eta:
+                    confirmable += 1
+                    row = conn.execute(
+                        """
+                        SELECT MIN(ts) AS first_inverted_ts
+                        FROM tracker_events
+                        WHERE pair_id = ? AND event_type = 'inverted' AND ts > ?
+                        """,
+                        (int(pair_id), float(signal_ts)),
+                    ).fetchone()
+                    first_inverted_ts = float(row["first_inverted_ts"] or 0.0) if row is not None else 0.0
+                    if first_inverted_ts > 0.0 and first_inverted_ts <= signal_ts + display_eta:
+                        status = "confirmed"
+                        confirmed += 1
+                        confirmed_within_eta = True
+                        actual_duration_sec = round(first_inverted_ts - signal_ts, 6)
+                    else:
+                        status = "not_confirmed"
+                else:
+                    awaiting += 1
+                by_action.setdefault(signal_action, Counter())[status] += 1
+                by_eta_alignment.setdefault(eta_alignment, Counter())[status] += 1
+                signals.append(
+                    {
+                        "pair_key": pair_key,
+                        "signal_action": signal_action,
+                        "signal_ts": signal_ts,
+                        "display_eta_seconds": display_eta,
+                        "model_eta_seconds": int(event.get("model_eta_seconds") or 0),
+                        "eta_alignment_status": eta_alignment,
+                        "status": status,
+                        "confirmed_within_eta": confirmed_within_eta,
+                        "actual_duration_sec": actual_duration_sec,
+                        "available_until_ts": available_until_ts,
+                        "range_status": str(event.get("range_status") or "unknown"),
+                        "range_window": str(event.get("range_window") or "none"),
+                        "recommended_entry_range": str(event.get("recommended_entry_range") or "--"),
+                        "recommended_exit_range": str(event.get("recommended_exit_range") or "--"),
+                        "current_entry": float(event.get("current_entry") or 0.0),
+                        "inversion_probability": float(event.get("inversion_probability") or 0.0),
+                        "context_strength": str(event.get("context_strength") or ""),
+                    }
+                )
+    except sqlite3.Error:
+        return {"summary": {"total": len(signal_events), "confirmable_now": 0, "confirmed": 0, "awaiting_confirmation": len(signal_events)}, "by_action": {}, "by_eta_alignment": {}, "signals": []}
+    return {
+        "summary": {
+            "total": len(signal_events),
+            "confirmable_now": confirmable,
+            "confirmed": confirmed,
+            "not_confirmed": max(confirmable - confirmed, 0),
+            "awaiting_confirmation": awaiting,
+        },
+        "by_action": {key: dict(value) for key, value in sorted(by_action.items())},
+        "by_eta_alignment": {key: dict(value) for key, value in sorted(by_eta_alignment.items())},
+        "signals": signals,
+    }
+
+
+def _build_legacy_comparison(legacy_package_dir: Path | None) -> dict[str, Any]:
+    if legacy_package_dir is None:
+        return {"status": "not_requested"}
+    legacy_dir = Path(legacy_package_dir)
+    if not legacy_dir.is_dir():
+        return {"status": "unavailable", "reason": "legacy package directory not found"}
+    legacy_events = list(_iter_ndjson(legacy_dir / "events.ndjson"))
+    legacy_signals = [event for event in legacy_events if str(event.get("kind") or "") == "signal"]
+    if not legacy_signals:
+        return {"status": "unavailable", "reason": "legacy package has no actionable signal events"}
+    snapshot_path = legacy_dir / "sqlite_snapshot.sqlite"
+    if not snapshot_path.is_file():
+        return {"status": "unavailable", "reason": "legacy package has no sqlite snapshot"}
+    context_ready = 0
+    blocked_by_context = 0
+    unresolved = 0
+    compared = 0
+    with sqlite3.connect(snapshot_path, timeout=30.0) as conn:
+        conn.row_factory = sqlite3.Row
+        pair_to_id, _, _ = _load_snapshot_pair_maps(snapshot_path)
+        for event in legacy_signals:
+            pair_key = str(event.get("pair_key") or "")
+            signal_ts = float(event.get("wall_ts") or 0.0)
+            current_entry = float(event.get("current_entry") or 0.0)
+            pair_id = pair_to_id.get(pair_key)
+            if pair_id is None or signal_ts <= 0.0:
+                unresolved += 1
+                continue
+            pair_row = conn.execute("SELECT session_id, block_id, ts, entry_spread_pct, exit_spread_pct FROM tracker_records WHERE pair_id = ? AND ts <= ? ORDER BY ts ASC", (int(pair_id), signal_ts)).fetchall()
+            if not pair_row:
+                unresolved += 1
+                continue
+            records = [
+                SpreadRecord(
+                    timestamp=float(row["ts"]),
+                    entry_spread_pct=float(row["entry_spread_pct"]),
+                    exit_spread_pct=float(row["exit_spread_pct"]),
+                    session_id=int(row["session_id"] or 0),
+                    block_id=int(row["block_id"] or 0),
+                )
+                for row in pair_row
+            ]
+            context = build_recurring_context_from_episodes(
+                compute_closed_episodes(records),
+                current_entry=current_entry,
+                now_ts=signal_ts,
+            )
+            compared += 1
+            if str(context.get("range_status") or "") == "insufficient_empirical_context" or str(context.get("entry_position_label") or "") in {"below_band", "above_band"}:
+                blocked_by_context += 1
+            else:
+                context_ready += 1
+    return {
+        "status": "ok",
+        "legacy_actionable_signals": len(legacy_signals),
+        "compared_signals": compared,
+        "blocked_by_new_context": blocked_by_context,
+        "still_context_ready": context_ready,
+        "unresolved_signals": unresolved,
+    }
+
+
+def build_runtime_summary(output_dir: Path, *, snapshot_path: Path | None = None, legacy_package_dir: Path | None = None) -> dict[str, Any]:
     output_root = Path(output_dir)
     events = list(_iter_ndjson(output_root / "events.ndjson"))
     alerts = list(_iter_ndjson(output_root / "alerts.ndjson"))
@@ -544,6 +907,19 @@ def build_runtime_summary(output_dir: Path) -> dict[str, Any]:
         if str(sample.get("kind") or "") == "system_sample" and sample.get("rss_bytes") is not None
     ]
 
+    dashboard_validation = {
+        "adjusting_count": sum(int(sample.get("adjusting_count") or 0) for sample in api_probes),
+        "actionable_without_range_count": sum(int(sample.get("actionable_without_range_count") or 0) for sample in api_probes),
+        "strong_eta_divergent_count": sum(int(sample.get("strong_eta_divergent_count") or 0) for sample in api_probes),
+        "above_band_mismatch_count": sum(int(sample.get("above_band_mismatch_count") or 0) for sample in api_probes),
+        "range_core_mismatch_count": sum(int(sample.get("range_core_mismatch_count") or 0) for sample in api_probes),
+        "reason_lane_message_mismatch_count": sum(int(sample.get("reason_lane_message_mismatch_count") or 0) for sample in api_probes),
+        "probe_count": len(api_probes),
+    }
+
+    context_coverage = _build_context_coverage(events, snapshot_path)
+    legacy_comparison = _build_legacy_comparison(legacy_package_dir)
+
     return {
         "counts": {
             "events": len(events),
@@ -565,6 +941,9 @@ def build_runtime_summary(output_dir: Path) -> dict[str, Any]:
             "rss_bytes": _numeric_summary(rss_values),
             "db_size_bytes": _numeric_summary(system_db_sizes),
         },
+        "dashboard_validation": dashboard_validation,
+        "context_coverage": context_coverage,
+        "legacy_comparison": legacy_comparison,
     }
 
 
@@ -695,10 +1074,15 @@ def _build_final_audit_markdown(
     runtime_summary: dict[str, Any],
     dataset_summary: dict[str, Any],
     training_report: dict[str, Any],
+    signal_confirmations: dict[str, Any],
+    auxiliary_short_block_smoke: dict[str, Any],
     output_dir: Path,
 ) -> str:
     inference = runtime_summary.get("inference_latency_ms", {})
     signal_counts = runtime_summary.get("signal_counts", {})
+    context_coverage = runtime_summary.get("context_coverage", {})
+    dashboard_validation = runtime_summary.get("dashboard_validation", {})
+    legacy_comparison = runtime_summary.get("legacy_comparison", {})
     lines = [
         "# Runtime Audit Package",
         "",
@@ -707,6 +1091,21 @@ def _build_final_audit_markdown(
         f"- Alerts: {runtime_summary.get('counts', {}).get('alerts', 0)}",
         f"- Signals: {signal_counts}",
         f"- Inference p99: {inference.get('p99', 0):.3f} ms",
+        "",
+        "## Context Coverage",
+        f"- Eligible ready pairs: {context_coverage.get('eligible_ready_pairs', 0)}",
+        f"- ready_short: {context_coverage.get('ready_short_pairs', 0)}",
+        f"- ready_long_fallback: {context_coverage.get('ready_long_fallback_pairs', 0)}",
+        f"- insufficient_empirical_context_rate: {context_coverage.get('insufficient_empirical_context_rate', 0):.4f}",
+        f"- Near misses for STRONG_EXECUTE: {context_coverage.get('near_miss_reasons', {})}",
+        "",
+        "## Dashboard Validation",
+        f"- Adjustando occurrences: {dashboard_validation.get('adjusting_count', 0)}",
+        f"- Actionable without range: {dashboard_validation.get('actionable_without_range_count', 0)}",
+        f"- Strong with eta divergent: {dashboard_validation.get('strong_eta_divergent_count', 0)}",
+        f"- Above-band mismatches: {dashboard_validation.get('above_band_mismatch_count', 0)}",
+        f"- Range/core mismatches: {dashboard_validation.get('range_core_mismatch_count', 0)}",
+        f"- Reason/lane/message mismatches: {dashboard_validation.get('reason_lane_message_mismatch_count', 0)}",
         "",
         "## Collection & Integrity",
         f"- Dataset samples: {dataset_summary.get('num_samples', 0)}",
@@ -718,6 +1117,20 @@ def _build_final_audit_markdown(
         f"- Metrics: {training_report.get('metrics', {})}",
         f"- Thresholds: {training_report.get('thresholds', {})}",
         "",
+        "## Signal Confirmation",
+        f"- Summary: {signal_confirmations.get('summary', {})}",
+        f"- By action: {signal_confirmations.get('by_action', {})}",
+        f"- By eta alignment: {signal_confirmations.get('by_eta_alignment', {})}",
+        "",
+        "## Auxiliary Short-Block Smoke",
+        f"- Status: {auxiliary_short_block_smoke.get('status', 'unavailable')}",
+        f"- Dataset status: {auxiliary_short_block_smoke.get('dataset_status', 'unavailable')}",
+        f"- All-negative expected: {auxiliary_short_block_smoke.get('all_negative_expected', False)}",
+        "",
+        "## Legacy Comparison",
+        f"- Status: {legacy_comparison.get('status', 'not_requested')}",
+        f"- Details: {legacy_comparison}",
+        "",
         "## Notes",
         "- Esta trilha de auditoria é dedicada e isolada do relatório principal do modelo.",
         f"- Output dir: `{output_dir}`",
@@ -726,9 +1139,86 @@ def _build_final_audit_markdown(
         f"- Runtime summary: `{output_dir / 'summary.json'}`",
         f"- Dataset summary: `{output_dir / 'dataset_summary.json'}`",
         f"- Training report: `{output_dir / 'training_report.json'}`",
+        f"- Signal confirmations: `{output_dir / 'signal_confirmations.json'}`",
         "",
     ]
     return "\n".join(lines)
+
+
+def _build_auxiliary_short_block_smoke(
+    *,
+    snapshot_path: Path,
+    output_root: Path,
+    run_training_fn: Any,
+    sequence_length: int,
+    prediction_horizon_sec: int,
+) -> dict[str, Any]:
+    smoke = {
+        "status": "unavailable",
+        "dataset_status": "unavailable",
+        "all_negative_expected": True,
+        "not_for_model_quality_decision": True,
+        "auxiliary_short_block_smoke": True,
+    }
+    if snapshot_path.suffix.lower() != ".sqlite" or not snapshot_path.is_file():
+        smoke["reason"] = "snapshot is not a sqlite database"
+        return smoke
+    try:
+        with sqlite3.connect(snapshot_path, timeout=30.0) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT id, end_ts, start_ts, record_count
+                FROM tracker_pair_blocks
+                WHERE is_open = 0
+                ORDER BY end_ts DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+    except sqlite3.Error as exc:
+        smoke["reason"] = f"unable to inspect closed blocks: {exc}"
+        return smoke
+    if row is None:
+        smoke["reason"] = "no closed block available for auxiliary smoke"
+        return smoke
+    block_id = int(row["id"])
+    smoke.update(
+        {
+            "status": "selected",
+            "selected_block_id": block_id,
+            "selected_block_duration_sec": max(0.0, float(row["end_ts"] or 0.0) - float(row["start_ts"] or 0.0)),
+            "selected_block_record_count": int(row["record_count"] or 0),
+        }
+    )
+    try:
+        bundle = build_dataset_bundle(
+            state_path=snapshot_path,
+            sequence_length=sequence_length,
+            prediction_horizon_sec=prediction_horizon_sec,
+            selected_block_ids=[block_id],
+        )
+        smoke["dataset_status"] = "built"
+        smoke["dataset_summary"] = _dataset_summary_payload(bundle)
+        smoke["all_negative_expected"] = bool(smoke["dataset_summary"].get("num_positive_samples", 0) == 0)
+    except Exception as exc:
+        smoke["dataset_status"] = "dataset_failed"
+        smoke["dataset_error"] = str(exc)
+        return smoke
+    try:
+        smoke_artifact_dir = output_root / "training_artifacts" / "auxiliary_short_block_smoke"
+        smoke["training_report"] = run_training_fn(
+            state_file=snapshot_path,
+            artifact_dir=smoke_artifact_dir,
+            sequence_length=sequence_length,
+            prediction_horizon_sec=prediction_horizon_sec,
+            selected_block_ids=[block_id],
+            audit_output=smoke_artifact_dir / "best_lstm_model.audit.md",
+        )
+        smoke["status"] = "completed"
+    except Exception as exc:
+        smoke["status"] = "training_failed"
+        smoke["training_error"] = str(exc)
+    return smoke
 
 
 def finalize_runtime_audit_package(
@@ -740,6 +1230,7 @@ def finalize_runtime_audit_package(
     sequence_length: int = 15,
     prediction_horizon_sec: int = 14_400,
     run_status: str = "completed",
+    legacy_package_dir: Path | None = None,
 ) -> dict[str, Any]:
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -795,8 +1286,32 @@ def finalize_runtime_audit_package(
             "thresholds": {},
             "artifacts": {},
         }
+
+    signal_confirmations = _build_signal_confirmations(list(_iter_ndjson(output_root / "events.ndjson")), snapshot_path)
+    _write_json(output_root / "signal_confirmations.json", signal_confirmations)
+    auxiliary_short_block_smoke = _build_auxiliary_short_block_smoke(
+        snapshot_path=snapshot_path,
+        output_root=output_root,
+        run_training_fn=run_training_fn,
+        sequence_length=sequence_length,
+        prediction_horizon_sec=prediction_horizon_sec,
+    )
+    if isinstance(training_report, dict):
+        training_report["auxiliary_short_block_smoke"] = auxiliary_short_block_smoke
     dataset_summary_path = _write_json(output_root / "dataset_summary.json", dataset_summary)
     training_report_path = _write_json(output_root / "training_report.json", training_report)
+
+    runtime_summary = build_runtime_summary(
+        output_root,
+        snapshot_path=snapshot_path,
+        legacy_package_dir=legacy_package_dir,
+    )
+    runtime_summary["finished_at_utc"] = _utc_now_iso()
+    runtime_summary["duration_sec"] = int(duration_sec)
+    runtime_summary["run_status"] = str(run_status)
+    runtime_summary["signal_confirmation_summary"] = dict(signal_confirmations.get("summary", {}))
+    summary_path = _write_json(output_root / "summary.json", runtime_summary)
+    (output_root / "runtime_audit.md").write_text(build_runtime_markdown(runtime_summary), encoding="utf-8")
 
     manual_verification_path = output_root / "manual_data_verification.md"
     manual_verification_path.write_text(
@@ -814,6 +1329,8 @@ def finalize_runtime_audit_package(
             runtime_summary=runtime_summary,
             dataset_summary=dataset_summary,
             training_report=training_report,
+            signal_confirmations=signal_confirmations,
+            auxiliary_short_block_smoke=auxiliary_short_block_smoke,
             output_dir=output_root,
         ),
         encoding="utf-8",
@@ -838,4 +1355,5 @@ __all__ = [
     "create_sqlite_snapshot",
     "default_runtime_audit_dir",
     "finalize_runtime_audit_package",
+    "summarize_dashboard_payload",
 ]

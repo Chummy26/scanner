@@ -228,3 +228,183 @@ def test_finalize_runtime_audit_package_degrades_gracefully_on_invalid_sqlite(tm
     assert training_report["model_status"] in {"dataset_failed", "training_failed"}
     assert dataset_summary["model_status"] == "dataset_failed"
     assert "Collection & Integrity" in final_audit
+
+
+def test_summarize_dashboard_payload_detects_adjusting_and_mismatch_rows():
+    from src.spread.runtime_audit import summarize_dashboard_payload
+
+    payload = {
+        "data": [
+            {
+                "symbol": "AAA",
+                "action_lane": "execute_now",
+                "signal_reason_code": "execute_ready",
+                "operator_message": "Acionável agora: faixa recorrente e probabilidade passaram o corte de execução.",
+                "mlContext": {
+                    "signal_action": "EXECUTE",
+                    "range_status": "ready_short",
+                    "entry_position_label": "inside_outer",
+                    "eta_alignment_status": "aligned",
+                    "recommended_entry_range": "0.50% à 0.70%",
+                    "recommended_exit_range": "0.10% à 0.20%",
+                    "entry_core_range_min": 0.5,
+                    "entry_core_range_max": 0.7,
+                    "exit_core_range_min": 0.1,
+                    "exit_core_range_max": 0.2,
+                },
+            },
+            {
+                "symbol": "BBB",
+                "action_lane": "execute_now",
+                "signal_reason_code": "execute_ready",
+                "operator_message": "qualquer coisa",
+                "mlContext": {
+                    "signal_action": "EXECUTE",
+                    "range_status": "insufficient_empirical_context",
+                    "entry_position_label": "unknown",
+                    "eta_alignment_status": "aligned",
+                    "recommended_entry_range": "Ajustando...",
+                    "recommended_exit_range": "Ajustando...",
+                },
+            },
+            {
+                "symbol": "CCC",
+                "action_lane": "observe",
+                "signal_reason_code": "execute_ready",
+                "operator_message": "mensagem errada",
+                "mlContext": {
+                    "signal_action": "STRONG_EXECUTE",
+                    "range_status": "ready_short",
+                    "entry_position_label": "above_band",
+                    "eta_alignment_status": "divergent",
+                    "recommended_entry_range": "0.40% à 0.60%",
+                    "recommended_exit_range": "0.10% à 0.30%",
+                    "entry_core_range_min": 0.4,
+                    "entry_core_range_max": 0.6,
+                    "exit_core_range_min": 0.1,
+                    "exit_core_range_max": 0.3,
+                },
+            },
+        ]
+    }
+
+    summary = summarize_dashboard_payload(payload)
+
+    assert summary["payload_count"] == 3
+    assert summary["adjusting_count"] == 2
+    assert summary["actionable_without_range_count"] == 1
+    assert summary["strong_eta_divergent_count"] == 1
+    assert summary["above_band_mismatch_count"] == 1
+    assert summary["reason_lane_message_mismatch_count"] >= 2
+    assert summary["range_core_mismatch_count"] == 0
+
+
+def test_finalize_runtime_audit_package_reports_context_coverage_and_signal_confirmations(tmp_path: Path):
+    from src.spread.runtime_audit import RuntimeAuditCollector, finalize_runtime_audit_package
+
+    db_path = tmp_path / "tracker.sqlite"
+    tracker = SpreadTracker(
+        window_sec=24 * 60 * 60,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=db_path,
+        gap_threshold_sec=120.0,
+    )
+    pair = ("BTC", "mexc", "spot", "gate", "futures")
+    base_ts = 1_700_000_000.0
+    entries = ([0.10, 0.11, 0.09, 0.10, 0.11, 0.26, 0.41, 0.18] * 4) + [0.08, 0.05, -0.04, -0.06, -0.05, -0.03]
+    exits = ([-0.08, -0.07, -0.08, -0.07, -0.06, -0.03, -0.01, 0.08] * 4) + [-0.04, -0.02, 0.06, 0.08, 0.09, 0.11]
+    for index, (entry_spread, exit_spread) in enumerate(zip(entries, exits)):
+        tracker.record_spread(*pair, entry_spread, exit_spread, now_ts=base_ts + (index * 15.0))
+    tracker.flush_to_storage(now_ts=base_ts + (len(entries) * 15.0), force=True)
+    tracker.close_active_session(ended_at=base_ts + (len(entries) * 15.0))
+
+    audit_dir = tmp_path / "audit"
+    collector = RuntimeAuditCollector(output_dir=audit_dir, duration_sec=120, record_interval_sec=15.0, gap_threshold_sec=120.0)
+    collector.event(
+        "inference",
+        pair_key="BTC|mexc|spot|gate|futures",
+        model_status="ready",
+        signal_action="EXECUTE",
+        range_status="ready_short",
+        range_window="2h",
+        empirical_support_short=3,
+        empirical_support_long=3,
+        entry_position_label="inside_core",
+        context_strength="strong",
+        eta_alignment_status="aligned",
+        inference_latency_ms=12.5,
+        e2e_latency_ms=18.0,
+        current_entry=0.41,
+        recommended_entry_range="0.34% à 0.41%",
+        recommended_exit_range="-0.01% à 0.08%",
+        entry_core_range_min=0.34,
+        entry_core_range_max=0.41,
+        exit_core_range_min=-0.01,
+        exit_core_range_max=0.08,
+        inversion_probability=0.82,
+        display_eta_seconds=60,
+        model_eta_seconds=60,
+        wall_ts=base_ts + 450.0,
+    )
+    collector.event(
+        "signal",
+        pair_key="BTC|mexc|spot|gate|futures",
+        signal_action="EXECUTE",
+        range_status="ready_short",
+        range_window="2h",
+        recommended_entry_range="0.34% à 0.41%",
+        recommended_exit_range="-0.01% à 0.08%",
+        current_entry=0.41,
+        inversion_probability=0.82,
+        eta_seconds=60,
+        display_eta_seconds=60,
+        model_eta_seconds=60,
+        eta_alignment_status="aligned",
+        context_strength="strong",
+        entry_position_label="inside_core",
+            wall_ts=base_ts + 450.0,
+        )
+    collector.finalize()
+    (audit_dir / "api_probe.ndjson").write_text(
+        json.dumps(
+            {
+                "kind": "api_probe",
+                "timestamp": base_ts + 75.0,
+                "latency_ms": 12.0,
+                "status_code": 200,
+                "payload_count": 1,
+                "ok": True,
+                "error": "",
+                "adjusting_count": 0,
+                "actionable_without_range_count": 0,
+                "strong_eta_divergent_count": 0,
+                "above_band_mismatch_count": 0,
+                "range_core_mismatch_count": 0,
+                "reason_lane_message_mismatch_count": 0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = finalize_runtime_audit_package(
+        output_dir=audit_dir,
+        state_path=db_path,
+        run_training_fn=lambda **kwargs: {"model_status": "skipped", "metrics": {}, "thresholds": {}, "artifacts": {}},
+        duration_sec=120,
+    )
+
+    summary = json.loads(Path(result["summary_path"]).read_text(encoding="utf-8"))
+    confirmations = json.loads((audit_dir / "signal_confirmations.json").read_text(encoding="utf-8"))
+
+    assert summary["context_coverage"]["eligible_ready_pairs"] == 1
+    assert summary["context_coverage"]["ready_short_pairs"] == 1
+    assert summary["context_coverage"]["insufficient_empirical_context_rate"] == 0.0
+    assert summary["dashboard_validation"]["adjusting_count"] == 0
+    assert confirmations["summary"]["confirmable_now"] == 1
+    assert confirmations["summary"]["confirmed"] == 1
+    assert confirmations["by_action"]["EXECUTE"]["confirmed"] == 1
