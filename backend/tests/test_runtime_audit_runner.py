@@ -190,6 +190,7 @@ def test_finalize_runtime_audit_package_creates_snapshot_and_reports(tmp_path: P
         state_path=db_path,
         run_training_fn=_fake_training_loop,
         duration_sec=120,
+        prediction_horizon_sec=60,
     )
 
     assert Path(result["sqlite_snapshot"]).is_file()

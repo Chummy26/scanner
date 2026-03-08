@@ -1700,15 +1700,14 @@ async def _execute_training_run(app: web.Application, run_id: int):
         artifact_dir=str(artifact_dir),
     )
     try:
-        from spread.train_model import run_training_loop
+        from spread.train_model import run_clean_training_cycle
 
         result = await asyncio.to_thread(
-            run_training_loop,
+            run_clean_training_cycle,
             state_file=Path(ws_mgr.config.tracker_db_path),
             artifact_dir=artifact_dir,
             sequence_length=int(run_payload["sequence_length"]),
             prediction_horizon_sec=int(run_payload["prediction_horizon_sec"]),
-            min_total_spread_pct=float(getattr(ws_mgr.tracker, "min_total_spread_pct", 1.0) or 1.0),
             selected_session_ids=session_ids,
             selected_block_ids=block_ids,
         )

@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from src.server import (
+    _execute_training_run,
     handle_ml_training_block_patch,
     handle_ml_training_block_split,
     handle_ml_training_blocks_api,
@@ -153,3 +154,38 @@ def test_training_run_handlers_snapshot_selected_blocks(tmp_path: Path, monkeypa
     assert latest_response.status == 200
     assert latest_payload["id"] == create_payload["id"]
     assert latest_payload["status"] == "completed"
+
+
+def test_execute_training_run_uses_clean_training_cycle(tmp_path: Path, monkeypatch):
+    tracker, db_path = _build_tracker(tmp_path)
+    app = {"ws_manager": _FakeWSManager(tracker, db_path), "ml_training_tasks": {}}
+    session_id = tracker.list_training_sessions(include_open=False)["sessions"][0]["id"]
+    tracker.update_training_session(session_id, approved_for_training=True, notes="reviewed for training")
+    run_payload = tracker.create_training_run(
+        session_ids=[session_id],
+        sequence_length=2,
+        prediction_horizon_sec=240,
+    )
+    called: dict[str, object] = {}
+
+    def _fake_clean_training_cycle(**kwargs):
+        called.update(kwargs)
+        return {
+            "model_status": "trained",
+            "preflight": {"selected_threshold": 0.8},
+            "training": {"selected_threshold": 0.8},
+            "artifacts": {"audit_path": str(tmp_path / "audit.md")},
+        }
+
+    def _fail_run_training_loop(**_kwargs):
+        raise AssertionError("run_training_loop should not be used by server training runs")
+
+    monkeypatch.setattr("spread.train_model.run_clean_training_cycle", _fake_clean_training_cycle)
+    monkeypatch.setattr("spread.train_model.run_training_loop", _fail_run_training_loop)
+
+    asyncio.run(_execute_training_run(app, int(run_payload["id"])))
+    updated = tracker.get_training_run(int(run_payload["id"]))
+
+    assert updated["status"] == "completed"
+    assert updated["result"]["preflight"]["selected_threshold"] == 0.8
+    assert Path(called["artifact_dir"]).name == f"run_{int(run_payload['id'])}"

@@ -813,6 +813,7 @@ def _preflight_entry(
         "min_to_max_positive_rate_ratio": float(stability["min_to_max_positive_rate_ratio"]),
         "split_summary": split_summary,
         "label_audit": dict(bundle.summary.get("label_audit", {})),
+        "block_diagnostics": dict(bundle.summary.get("block_diagnostics", {})),
         "error": str(error or ""),
     }
 
@@ -838,6 +839,7 @@ def run_threshold_preflight(
         "sequence_length": int(sequence_length),
         "prediction_horizon_sec": int(prediction_horizon_sec),
         "thresholds": {},
+        "block_diagnostics": {},
         "selected_threshold": None,
         "selection_mode": "none",
         "qualifies_for_training": False,
@@ -875,6 +877,8 @@ def run_threshold_preflight(
             )
         key = f"{threshold:.1f}"
         preflight["thresholds"][key] = entry
+        if (not preflight["block_diagnostics"]) and entry.get("block_diagnostics"):
+            preflight["block_diagnostics"] = dict(entry["block_diagnostics"])
         if entry.get("qualifies_for_training"):
             primary_candidates.append(float(threshold))
         if entry.get("qualifies_for_training_relaxed"):
@@ -956,6 +960,7 @@ def write_audit_report(report: dict[str, Any], audit_path: Path) -> Path:
     metrics = report["metrics"]["test"]
     baselines = report["baselines"]
     calibration = report["calibration"]["test"]
+    val_threshold_calibration = report["calibration"].get("val_threshold", {})
     high_confidence_calibration = calibration.get("high_confidence", {})
     temporal_summary = report["temporal_walk_forward"]["test"]["summary"]
     validation_partition = report["validation_partition"]
@@ -1077,7 +1082,7 @@ def write_audit_report(report: dict[str, Any], audit_path: Path) -> Path:
         f"- Test recall @ strong: {report['strong_signal_metrics']['test']['recall']:.4f}",
         "",
         "## Calibration",
-        f"- Validation ECE: {report['calibration']['val']['ece']:.4f}",
+        f"- Validation ECE: {val_threshold_calibration.get('ece', 0.0):.4f}",
         f"- Test ECE: {report['calibration']['test']['ece']:.4f}",
         f"- Test Brier score: {calibration['brier_score']:.4f}",
         f"- Test log loss: {calibration['log_loss']:.4f}",
@@ -1343,9 +1348,11 @@ def run_training_loop(
     threshold_selection = _select_thresholds(val_labels[sel_idx], sel_probs)
     execute_threshold = threshold_selection["execute_threshold"]
     strong_threshold = threshold_selection["strong_threshold"]
+    val_threshold_bundle = splits["val"].subset(sel_idx.astype(int).tolist(), "val_threshold")
     evaluations = {
-        split_name: _evaluate_split(model, split_bundle, device, platt_scale, platt_bias, execute_threshold)
-        for split_name, split_bundle in splits.items()
+        "train": _evaluate_split(model, splits["train"], device, platt_scale, platt_bias, execute_threshold),
+        "val_threshold": _evaluate_split(model, val_threshold_bundle, device, platt_scale, platt_bias, execute_threshold),
+        "test": _evaluate_split(model, splits["test"], device, platt_scale, platt_bias, execute_threshold),
     }
     baselines = _baseline_metrics(splits["train"], splits["test"])
 
@@ -1371,6 +1378,7 @@ def run_training_loop(
     calibration = {
         split_name: _calibration_report(evaluation["y_class"], evaluation["probs"])
         for split_name, evaluation in evaluations.items()
+        if split_name in {"val_threshold", "test"}
     }
     for calibration_payload in calibration.values():
         calibration_payload["high_confidence"] = _high_confidence_calibration(calibration_payload)
@@ -1455,7 +1463,7 @@ def run_training_loop(
         strong_threshold=strong_threshold,
         min_history_points=sequence_length,
         min_empirical_events=2,
-        validation_metrics=report["metrics"]["val"],
+        validation_metrics=report["metrics"]["val_threshold"],
         test_metrics=report["metrics"]["test"],
         baselines=baselines,
         dataset_summary=dataset_summary,

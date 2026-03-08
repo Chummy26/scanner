@@ -252,7 +252,7 @@ def _write_multi_session_sqlite(path: Path, *, num_sessions: int = 4) -> Path:
         base_ts = 1_700_900_000 + session_index * 100_000
         for pair_offset, symbol in enumerate((f"BTC{session_index}", f"ETH{session_index}")):
             start = base_ts + pair_offset * 1_000
-            for index in range(12):
+            for index in range(40):
                 tracker.record_spread(
                     symbol,
                     "mexc",
@@ -335,6 +335,141 @@ def _write_many_gap_blocks_sqlite(path: Path, *, num_blocks: int = 1_100) -> Pat
     return path
 
 
+def _write_same_session_cross_block_label_sqlite(path: Path) -> Path:
+    tracker = SpreadTracker(
+        window_sec=30 * 24 * 60 * 60,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=path,
+        gap_threshold_sec=60.0,
+    )
+    pair = ("BTC", "mexc", "spot", "gate", "futures")
+    base_ts = 1_704_000_000
+    first_block_entries = [0.10, 0.12, 0.11, 0.10, 0.09]
+    for index, entry in enumerate(first_block_entries):
+        tracker.record_spread(*pair, entry, -0.20, now_ts=float(base_ts + (index * 15)))
+
+    second_block_records = [
+        (0.10, -0.20),
+        (0.12, -0.18),
+        (0.11, -0.17),
+        (0.92, -0.10),
+        (0.84, -0.04),
+        (0.08, 0.22),
+        (0.06, 0.20),
+    ]
+    for index, (entry, exit_spread) in enumerate(second_block_records):
+        tracker.record_spread(
+            *pair,
+            entry,
+            exit_spread,
+            now_ts=float(base_ts + 180 + (index * 15)),
+        )
+
+    assert tracker.flush_to_storage(now_ts=float(base_ts + 360), force=True)
+    tracker.close_active_session(ended_at=float(base_ts + 360))
+    return path
+
+
+def _write_exact_sequence_length_cross_block_label_sqlite(path: Path) -> Path:
+    tracker = SpreadTracker(
+        window_sec=30 * 24 * 60 * 60,
+        record_interval_sec=60.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=path,
+        gap_threshold_sec=120.0,
+    )
+    pair = ("BTC", "mexc", "spot", "gate", "futures")
+    for index in range(15):
+        tracker.record_spread(
+            *pair,
+            0.10 + (index * 0.01),
+            -0.08,
+            now_ts=float(index * 60),
+        )
+
+    second_block_records = [
+        (0.10, -0.08),
+        (0.12, -0.08),
+        (0.15, -0.07),
+        (0.55, -0.04),
+        (0.72, -0.02),
+        (0.30, 0.05),
+        (0.12, 0.08),
+    ]
+    base_ts = float((15 * 60) + 180)
+    for index, (entry, exit_spread) in enumerate(second_block_records):
+        tracker.record_spread(
+            *pair,
+            entry,
+            exit_spread,
+            now_ts=base_ts + (index * 60),
+        )
+
+    assert tracker.flush_to_storage(now_ts=base_ts + ((len(second_block_records) - 1) * 60), force=True)
+    tracker.close_active_session(ended_at=base_ts + (len(second_block_records) * 60))
+    return path
+
+
+def _write_right_censored_session_sqlite(path: Path) -> Path:
+    tracker = SpreadTracker(
+        window_sec=30 * 24 * 60 * 60,
+        record_interval_sec=60.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=path,
+        gap_threshold_sec=120.0,
+    )
+    pair = ("BTC", "mexc", "spot", "gate", "futures")
+    for index in range(20):
+        tracker.record_spread(
+            *pair,
+            0.10 + (index * 0.01),
+            -0.05,
+            now_ts=float(index * 60),
+        )
+    assert tracker.flush_to_storage(now_ts=float(19 * 60), force=True)
+    tracker.close_active_session(ended_at=float(20 * 60))
+    return path
+
+
+def _write_block_length_sqlite(path: Path, *, block_lengths: list[int]) -> Path:
+    tracker = SpreadTracker(
+        window_sec=30 * 24 * 60 * 60,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=path,
+        gap_threshold_sec=60.0,
+    )
+    pair = ("ETH", "mexc", "spot", "gate", "futures")
+    base_ts = 1_705_000_000
+    cursor_ts = base_ts
+    for block_index, block_length in enumerate(block_lengths):
+        for record_index in range(block_length):
+            tracker.record_spread(
+                *pair,
+                0.20 + (record_index * 0.01),
+                -0.10 + (record_index * 0.002),
+                now_ts=float(cursor_ts + (record_index * 15)),
+            )
+        cursor_ts += (block_length * 15) + 120
+
+    assert tracker.flush_to_storage(now_ts=float(cursor_ts), force=True)
+    tracker.close_active_session(ended_at=float(cursor_ts))
+    return path
+
+
 def _write_multi_session_sqlite_with_spacing(
     path: Path,
     *,
@@ -355,7 +490,7 @@ def _write_multi_session_sqlite_with_spacing(
         base_ts = 1_703_000_000 + (session_index * session_spacing_sec)
         for pair_offset, symbol in enumerate((f"BTCG{session_index}", f"ETHG{session_index}")):
             start = base_ts + pair_offset * 10
-            for index in range(12):
+            for index in range(40):
                 tracker.record_spread(
                     symbol,
                     "mexc",
@@ -475,6 +610,62 @@ def test_build_dataset_bundle_filters_low_total_spread_inversions_from_positive_
     assert filtered_bundle.summary["min_total_spread_pct"] == 1.0
     assert filtered_bundle.summary["labeling_method"] == "episode_take_profit_time_barrier"
     assert filtered_bundle.summary["label_audit"]["timeouts_with_only_sub_threshold_episode"] > 0
+
+
+def test_build_dataset_bundle_labels_future_episode_from_later_block_same_session(tmp_path: Path):
+    sqlite_path = _write_same_session_cross_block_label_sqlite(tmp_path / "tracker_history_cross_block.sqlite")
+    blocks, _, _ = _load_blocks_from_sqlite(sqlite_path, selected_only=False, closed_only=True)
+
+    assert len(blocks) == 2
+    assert len({int(block["session_id"]) for block in blocks}) == 1
+    earlier_block_id = int(min(blocks, key=lambda block: float(block["start_ts"]))["block_id"])
+
+    bundle = build_dataset_bundle(
+        state_path=sqlite_path,
+        sequence_length=3,
+        prediction_horizon_sec=240,
+        min_total_spread_pct=1.0,
+    )
+
+    positive_block_ids = {
+        int(bundle.block_ids[index])
+        for index, value in enumerate(bundle.y_class.tolist())
+        if float(value) >= 0.5
+    }
+    assert earlier_block_id in positive_block_ids
+
+
+def test_build_dataset_bundle_allows_exact_sequence_length_block_with_future_label_in_same_session(tmp_path: Path):
+    sqlite_path = _write_exact_sequence_length_cross_block_label_sqlite(
+        tmp_path / "tracker_history_exact_sequence_cross_block.sqlite"
+    )
+
+    bundle = build_dataset_bundle(
+        state_path=sqlite_path,
+        sequence_length=15,
+        prediction_horizon_sec=600,
+        min_total_spread_pct=0.5,
+    )
+
+    assert bundle.summary["num_samples"] == 1
+    assert bundle.summary["num_positive_samples"] == 1
+    assert bundle.summary["block_diagnostics"]["feature_window_feasibility"]["eligible_blocks_for_sequence_length"] == 1
+    assert bundle.summary["block_diagnostics"]["feature_window_feasibility"]["eligible_sessions_with_any_eligible_block"] == 1
+
+
+def test_build_dataset_bundle_discards_right_censored_tail_windows(tmp_path: Path):
+    sqlite_path = _write_right_censored_session_sqlite(tmp_path / "tracker_history_right_censored.sqlite")
+
+    bundle = build_dataset_bundle(
+        state_path=sqlite_path,
+        sequence_length=15,
+        prediction_horizon_sec=14_400,
+        min_total_spread_pct=0.5,
+    )
+
+    assert bundle.summary["num_samples"] == 0
+    assert bundle.summary["skipped_windows_right_censored"] == 6
+    assert bundle.summary["label_audit"]["right_censored_windows"] == 6
 
 
 def test_label_window_requires_qualified_episode_to_close_within_horizon():
@@ -699,6 +890,8 @@ def test_run_training_loop_saves_artifacts_and_beats_negative_baseline(tmp_path:
     assert artifact_dir.joinpath("best_lstm_model.meta.json").is_file()
     assert report["metrics"]["test"]["recall"] > report["baselines"]["always_negative"]["recall"]
     assert report["metrics"]["test"]["average_precision"] >= report["baselines"]["always_negative"]["average_precision"]
+    assert "val_threshold" in report["metrics"]
+    assert "val" not in report["metrics"]
     assert "confusion_matrix" in report["metrics"]["test"]
     assert "false_positive_rate" in report["metrics"]["test"]
     assert "false_negative_rate" in report["metrics"]["test"]
@@ -718,6 +911,8 @@ def test_run_training_loop_saves_artifacts_and_beats_negative_baseline(tmp_path:
     assert report["validation_partition"]["calibration_end_ts"] <= report["validation_partition"]["selection_start_ts"]
     assert report["training"]["positive_rate_train"] > 0.0
     assert 0.25 <= report["training"]["focal_alpha_effective"] <= 0.95
+    assert "val_threshold" in report["calibration"]
+    assert "val" not in report["calibration"]
     assert "high_confidence" in report["calibration"]["test"]
     assert report["split_summary"]["purged_temporal_separation_ok"] is True
     assert report["dataset_summary"]["labeling_method"] == "episode_take_profit_time_barrier"
@@ -733,6 +928,7 @@ def test_run_training_loop_saves_artifacts_and_beats_negative_baseline(tmp_path:
     assert metadata_payload["training_config"]["labeling_timeout_only"] is True
     assert metadata_payload["training_config"]["positive_rate_train"] > 0.0
     assert 0.25 <= metadata_payload["training_config"]["focal_alpha_effective"] <= 0.95
+    assert metadata_payload["validation_metrics"] == report["metrics"]["val_threshold"]
     assert metadata_payload["trained_at_utc"]
     assert metadata_payload["dataset_fingerprint"]
     assert metadata_payload["feature_schema_hash"]
@@ -750,7 +946,7 @@ def test_run_training_loop_saves_artifacts_and_beats_negative_baseline(tmp_path:
 
 
 def test_threshold_preflight_selects_highest_threshold_that_passes_guardrails(tmp_path: Path):
-    state_path = _write_near_threshold_state(tmp_path / "tracker_state_near_threshold.json", count=15)
+    state_path = _write_near_threshold_state(tmp_path / "tracker_state_near_threshold.json", count=18)
 
     preflight = run_threshold_preflight(
         state_file=state_path,
@@ -768,6 +964,33 @@ def test_threshold_preflight_selects_highest_threshold_that_passes_guardrails(tm
     assert preflight["thresholds"]["1.0"]["guardrail_ok"] is False
     assert preflight["thresholds"]["0.8"]["qualifies_for_training"] is True
     assert "split_positive_rates" in preflight["thresholds"]["0.8"]
+
+
+def test_threshold_preflight_reports_block_window_feasibility(tmp_path: Path):
+    sqlite_path = _write_block_length_sqlite(
+        tmp_path / "tracker_history_block_lengths.sqlite",
+        block_lengths=[8, 12, 20],
+    )
+
+    preflight = run_threshold_preflight(
+        state_file=sqlite_path,
+        sequence_length=15,
+        prediction_horizon_sec=240,
+        thresholds=[1.0],
+        min_train_positive_samples=0,
+        min_val_positive_samples=0,
+        min_test_positive_samples=0,
+    )
+
+    block_diagnostics = preflight["block_diagnostics"]
+    assert block_diagnostics["record_count_threshold_counts"]["ge_8"] == 3
+    assert block_diagnostics["record_count_threshold_counts"]["ge_10"] == 2
+    assert block_diagnostics["record_count_threshold_counts"]["ge_12"] == 2
+    assert block_diagnostics["record_count_threshold_counts"]["ge_15"] == 1
+    assert block_diagnostics["record_count_threshold_counts"]["ge_20"] == 1
+    assert block_diagnostics["feature_window_feasibility"]["sequence_length"] == 15
+    assert block_diagnostics["feature_window_feasibility"]["eligible_blocks_for_sequence_length"] == 1
+    assert block_diagnostics["feature_window_feasibility"]["eligible_sessions_with_any_eligible_block"] == 1
 
 
 def test_clean_training_cycle_archives_existing_artifacts_and_writes_preflight(tmp_path: Path):
@@ -882,7 +1105,8 @@ def test_build_dataset_bundle_never_crosses_temporal_gap_blocks(tmp_path: Path):
     )
 
     assert bundle.summary["num_blocks"] == 2
-    assert bundle.summary["blocks_used"] == 2
+    assert bundle.summary["blocks_used"] == 1
     assert bundle.summary["num_cross_block_windows"] == 0
+    assert bundle.summary["skipped_windows_right_censored"] > 0
     assert sorted(set(bundle.block_ids)) == bundle.summary["block_ids_used"]
     assert all(block_id > 0 for block_id in bundle.block_ids)

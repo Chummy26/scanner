@@ -55,6 +55,7 @@ def _save_ready_artifact(
     strong_threshold: float = 0.70,
     platt_scale: float = 1.0,
     platt_bias: float = 0.0,
+    selected_threshold: float | None = None,
 ) -> None:
     model = SpreadSequenceLSTM(input_sz=len(FEATURE_NAMES), hidden_sz=8, num_layers=1, dropout=0.0)
     with torch.no_grad():
@@ -82,7 +83,11 @@ def _save_ready_artifact(
         baselines={"always_negative": {"recall": 0.0}},
         dataset_summary={"num_samples": 10},
         split_summary={"pair_overlap": 0},
-        training_config={"prediction_horizon_sec": 14_400},
+        training_config={
+            "prediction_horizon_sec": 14_400,
+            "selected_threshold": float(selected_threshold) if selected_threshold is not None else execute_threshold,
+            "min_total_spread_pct": float(selected_threshold) if selected_threshold is not None else execute_threshold,
+        },
         use_attention=True,
         trained_at_utc="2026-03-07T00:00:00+00:00",
         dataset_fingerprint="test-dataset-fingerprint",
@@ -169,6 +174,19 @@ def test_analyzer_loads_artifact_and_preserves_ml_context_contract(tmp_path: Pat
     assert "drifted_features" in result
     assert "inference_latency_ms" in result
     assert "artifact_feature_count" in result
+
+
+def test_analyzer_fails_closed_on_threshold_mismatch(tmp_path: Path):
+    _save_ready_artifact(tmp_path, sequence_length=12, execute_threshold=0.45, selected_threshold=0.80)
+
+    analyzer = SpreadMLAnalyzer(sequence_length=12, artifact_dir=tmp_path, min_total_spread_pct=1.0)
+    result = analyzer.analyze_pair(0.62, _structured_history())
+
+    assert analyzer.model_status == "threshold_mismatch"
+    assert result is not None
+    assert result["model_status"] == "threshold_mismatch"
+    assert result["signal_action"] == "WAIT"
+    assert result["signal_reason_code"] == "threshold_mismatch"
 
 
 def test_analyzer_backward_compat_loads_legacy_4_feature_artifact(tmp_path: Path):
@@ -261,7 +279,13 @@ def test_analyzer_executes_only_when_recurring_context_is_ready(tmp_path: Path):
     tracker.flush_to_storage(now_ts=float((len(entries) - 1) * 15), force=True)
     tracker.close_active_session(ended_at=float(len(entries) * 15))
 
-    _save_ready_artifact(tmp_path, sequence_length=12, execute_threshold=0.45, strong_threshold=0.85)
+    _save_ready_artifact(
+        tmp_path,
+        sequence_length=12,
+        execute_threshold=0.45,
+        strong_threshold=0.85,
+        selected_threshold=1.0,
+    )
     analyzer = SpreadMLAnalyzer(sequence_length=12, artifact_dir=tmp_path)
     analyzer.attach_tracker(tracker)
 
@@ -277,7 +301,7 @@ def test_analyzer_executes_only_when_recurring_context_is_ready(tmp_path: Path):
     assert result["recommended_entry_range"] != "--"
 
 
-def test_analyzer_blocks_strong_execute_when_eta_is_divergent(tmp_path: Path):
+def test_analyzer_allows_strong_execute_when_eta_gate_is_disabled(tmp_path: Path):
     from src.spread.spread_tracker import SpreadTracker
 
     db_path = tmp_path / "tracker.sqlite"
@@ -332,8 +356,8 @@ def test_analyzer_blocks_strong_execute_when_eta_is_divergent(tmp_path: Path):
 
     assert result is not None
     assert result["range_status"] == "ready_short"
-    assert result["eta_alignment_status"] == "divergent"
-    assert result["signal_action"] == "EXECUTE"
+    assert result["eta_alignment_status"] == "disabled_contract_mismatch"
+    assert result["signal_action"] == "STRONG_EXECUTE"
 
 
 def test_analyzer_waits_when_median_total_spread_is_below_operational_floor(tmp_path: Path):
@@ -368,7 +392,13 @@ def test_analyzer_waits_when_median_total_spread_is_below_operational_floor(tmp_
     tracker.flush_to_storage(now_ts=ts, force=True)
     tracker.close_active_session(ended_at=ts)
 
-    _save_ready_artifact(tmp_path, sequence_length=12, execute_threshold=0.45, strong_threshold=0.85)
+    _save_ready_artifact(
+        tmp_path,
+        sequence_length=12,
+        execute_threshold=0.45,
+        strong_threshold=0.85,
+        selected_threshold=1.0,
+    )
     analyzer = SpreadMLAnalyzer(sequence_length=12, artifact_dir=tmp_path, min_total_spread_pct=1.0)
     analyzer.attach_tracker(tracker)
 

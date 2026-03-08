@@ -90,6 +90,22 @@ class SpreadMLAnalyzer:
         self.model = model.to(self.device)
         self.model.eval()
         self.metadata = metadata
+        artifact_threshold = self._artifact_min_total_spread_pct(metadata)
+        if (
+            artifact_threshold is not None
+            and self.min_total_spread_pct > 0.0
+            and abs(float(artifact_threshold) - float(self.min_total_spread_pct)) > 1e-9
+        ):
+            self.model = None
+            self.model_status = "threshold_mismatch"
+            self.model_version = metadata.version
+            self.sequence_length = metadata.sequence_length
+            self.signal_reason = (
+                f"artifact min_total_spread_pct={float(artifact_threshold):.4f} "
+                f"differs from runtime config={float(self.min_total_spread_pct):.4f}"
+            )
+            logger.warning("[ML] Rejected artifact bundle due to threshold mismatch: %s", self.signal_reason)
+            return
         self.model_status = "ready"
         self.model_version = metadata.version
         self.sequence_length = metadata.sequence_length
@@ -97,6 +113,20 @@ class SpreadMLAnalyzer:
 
     def attach_tracker(self, tracker: Any | None):
         self.tracker = tracker
+
+    @staticmethod
+    def _artifact_min_total_spread_pct(metadata: ModelArtifactMetadata) -> float | None:
+        training_config = dict(metadata.training_config or {})
+        raw_value = training_config.get("selected_threshold", training_config.get("min_total_spread_pct"))
+        try:
+            if raw_value is None:
+                return None
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value):
+            return None
+        return float(value)
 
     def _coerce_history(self, history: list[Any]) -> list[dict[str, float]]:
         canonical: list[dict[str, float]] = []
@@ -273,32 +303,8 @@ class SpreadMLAnalyzer:
 
     @staticmethod
     def _eta_payload(model_eta_seconds: int, context: dict[str, Any]) -> dict[str, Any]:
-        q10 = int(round(float(context.get("empirical_eta_q10_seconds") or 0.0)))
-        q25 = int(round(float(context.get("empirical_eta_q25_seconds") or 0.0)))
-        q75 = int(round(float(context.get("empirical_eta_q75_seconds") or 0.0)))
-        q90 = int(round(float(context.get("empirical_eta_q90_seconds") or 0.0)))
-        if str(context.get("range_status") or "") == "insufficient_empirical_context":
-            return {
-                "eta_alignment_status": "unknown",
-                "display_eta_seconds": 0,
-                "eta_source": "not_displayed_no_range",
-                "estimated_time_to_close": "--",
-            }
-        if q10 <= 0 or q90 <= 0:
-            return {
-                "eta_alignment_status": "unknown",
-                "display_eta_seconds": int(model_eta_seconds),
-                "eta_source": "model_only",
-                "estimated_time_to_close": SpreadMLAnalyzer._format_eta(int(model_eta_seconds)),
-            }
-        if q25 <= model_eta_seconds <= q75:
-            status = "aligned"
-        elif q10 <= model_eta_seconds <= q90:
-            status = "loose_alignment"
-        else:
-            status = "divergent"
         return {
-            "eta_alignment_status": status,
+            "eta_alignment_status": "disabled_contract_mismatch",
             "display_eta_seconds": int(model_eta_seconds),
             "eta_source": "model_only",
             "estimated_time_to_close": SpreadMLAnalyzer._format_eta(int(model_eta_seconds)),
@@ -369,7 +375,7 @@ class SpreadMLAnalyzer:
             "empirical_eta_q90_seconds": context["empirical_eta_q90_seconds"],
             "execute_threshold_used": float(self.metadata.execute_threshold) if self.metadata is not None else 0.0,
             "strong_threshold_used": float(self.metadata.strong_threshold) if self.metadata is not None else 0.0,
-            "signal_reason_code": model_status,
+            "signal_reason_code": "threshold_mismatch" if model_status == "threshold_mismatch" else model_status,
             "signal_reason": signal_reason,
             "drift_status": self.last_drift_status,
             "drifted_features": list(self.last_drifted_features),

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -456,13 +456,6 @@ def _load_pairs_payload(state_path: Path) -> tuple[dict[str, Any], float, str]:
     return pairs, saved_at, "sqlite"
 
 
-def _synthetic_block_id(raw_block_id: Any, index: int) -> int:
-    block_id = int(raw_block_id or 0)
-    if block_id > 0:
-        return block_id
-    return int(index + 1)
-
-
 def _build_closed_episodes(
     records: list[dict[str, float]],
     *,
@@ -484,6 +477,48 @@ def _build_closed_episodes(
                 for record in records
             ]
         ),
+        key=lambda episode: (float(episode.end_ts), float(episode.start_ts)),
+    )
+
+
+def _build_closed_episodes_for_blocks(blocks: list[dict[str, Any]]) -> list[Any]:
+    if not blocks:
+        return []
+    ordered_blocks = sorted(
+        blocks,
+        key=lambda block: (
+            float(block.get("start_ts") or 0.0),
+            float(block.get("end_ts") or 0.0),
+            int(block.get("block_id") or 0),
+        ),
+    )
+    records: list[SpreadRecord] = []
+    synthetic_to_storage_block_id: dict[int, int] = {}
+    for synthetic_block_id, block in enumerate(ordered_blocks, start=1):
+        storage_block_id = int(block.get("block_id") or 0)
+        synthetic_to_storage_block_id[synthetic_block_id] = storage_block_id
+        session_id = int(block.get("session_id") or 0)
+        normalized_records = [
+            canonicalize_record(record, fallback_ts=float(index))
+            for index, record in enumerate(block.get("records", []))
+            if isinstance(record, dict)
+        ]
+        normalized_records.sort(key=lambda record: record["timestamp"])
+        records.extend(
+            SpreadRecord(
+                timestamp=float(record["timestamp"]),
+                entry_spread_pct=float(record["entry_spread"]),
+                exit_spread_pct=float(record["exit_spread"]),
+                session_id=session_id,
+                block_id=synthetic_block_id,
+            )
+            for record in normalized_records
+        )
+    episodes = compute_closed_episodes(records)
+    for episode in episodes:
+        episode.block_id = int(synthetic_to_storage_block_id.get(int(episode.block_id or 0), int(episode.block_id or 0)))
+    return sorted(
+        episodes,
         key=lambda episode: (float(episode.end_ts), float(episode.start_ts)),
     )
 
@@ -554,6 +589,7 @@ def _empty_label_audit() -> dict[str, Any]:
         },
         "timeouts_without_future_episode": 0,
         "timeouts_with_only_sub_threshold_episode": 0,
+        "right_censored_windows": 0,
     }
 
 
@@ -564,6 +600,7 @@ def _finalize_label_audit(
     *,
     timeouts_without_future_episode: int,
     timeouts_with_only_sub_threshold_episode: int,
+    right_censored_windows: int,
 ) -> dict[str, Any]:
     return {
         "positive_entry_spread_buckets": {
@@ -583,6 +620,101 @@ def _finalize_label_audit(
         },
         "timeouts_without_future_episode": int(timeouts_without_future_episode),
         "timeouts_with_only_sub_threshold_episode": int(timeouts_with_only_sub_threshold_episode),
+        "right_censored_windows": int(right_censored_windows),
+    }
+
+
+def _empty_block_diagnostics(sequence_length: int) -> dict[str, Any]:
+    return {
+        "record_count_quantiles": _quantile_summary([]),
+        "duration_sec_quantiles": _quantile_summary([]),
+        "record_count_threshold_counts": {
+            "ge_8": 0,
+            "ge_10": 0,
+            "ge_12": 0,
+            "ge_15": 0,
+            "ge_20": 0,
+        },
+        "feature_window_feasibility": {
+            "sequence_length": int(sequence_length),
+            "eligible_blocks_for_sequence_length": 0,
+            "eligible_sessions_with_any_eligible_block": 0,
+        },
+        "session_summaries": {},
+    }
+
+
+def _block_threshold_counts(record_counts: list[int]) -> dict[str, int]:
+    thresholds = {
+        "ge_8": 8,
+        "ge_10": 10,
+        "ge_12": 12,
+        "ge_15": 15,
+        "ge_20": 20,
+    }
+    return {
+        label: int(sum(1 for record_count in record_counts if int(record_count) >= minimum))
+        for label, minimum in thresholds.items()
+    }
+
+
+def _build_block_diagnostics(blocks: list[dict[str, Any]], *, sequence_length: int) -> dict[str, Any]:
+    if not blocks:
+        return _empty_block_diagnostics(sequence_length)
+
+    record_counts: list[int] = []
+    durations: list[float] = []
+    session_blocks: dict[int, list[dict[str, Any]]] = defaultdict(list)
+
+    for block in blocks:
+        records = [record for record in block.get("records", []) if isinstance(record, dict)]
+        record_count = int(block.get("record_count") or len(records))
+        start_ts = float(block.get("start_ts") or 0.0)
+        end_ts = float(block.get("end_ts") or 0.0)
+        if (start_ts <= 0.0 or end_ts <= 0.0) and records:
+            normalized_records = [
+                canonicalize_record(record, fallback_ts=float(index))
+                for index, record in enumerate(records)
+            ]
+            normalized_records.sort(key=lambda record: record["timestamp"])
+            start_ts = float(normalized_records[0]["timestamp"])
+            end_ts = float(normalized_records[-1]["timestamp"])
+        record_counts.append(record_count)
+        durations.append(max(0.0, end_ts - start_ts))
+        session_blocks[int(block.get("session_id") or 0)].append(
+            {
+                "record_count": record_count,
+                "duration_sec": max(0.0, end_ts - start_ts),
+            }
+        )
+
+    eligible_sessions = 0
+    session_summaries: dict[str, Any] = {}
+    for session_id, items in sorted(session_blocks.items()):
+        session_record_counts = [int(item["record_count"]) for item in items]
+        session_threshold_counts = _block_threshold_counts(session_record_counts)
+        eligible_block_count = int(sum(1 for record_count in session_record_counts if record_count >= int(sequence_length)))
+        if eligible_block_count > 0:
+            eligible_sessions += 1
+        session_summaries[str(session_id)] = {
+            "num_blocks": len(items),
+            "record_count_quantiles": _quantile_summary(session_record_counts),
+            "duration_sec_quantiles": _quantile_summary([float(item["duration_sec"]) for item in items]),
+            "max_record_count": max(session_record_counts) if session_record_counts else 0,
+            "record_count_threshold_counts": session_threshold_counts,
+            "eligible_blocks_for_sequence_length": eligible_block_count,
+        }
+
+    return {
+        "record_count_quantiles": _quantile_summary(record_counts),
+        "duration_sec_quantiles": _quantile_summary(durations),
+        "record_count_threshold_counts": _block_threshold_counts(record_counts),
+        "feature_window_feasibility": {
+            "sequence_length": int(sequence_length),
+            "eligible_blocks_for_sequence_length": int(sum(1 for record_count in record_counts if record_count >= int(sequence_length))),
+            "eligible_sessions_with_any_eligible_block": int(eligible_sessions),
+        },
+        "session_summaries": session_summaries,
     }
 
 
@@ -615,6 +747,7 @@ def build_dataset_bundle(
     future_episode_total_spreads: list[float] = []
     timeouts_without_future_episode = 0
     timeouts_with_only_sub_threshold_episode = 0
+    skipped_windows_right_censored = 0
 
     if state_path.suffix.lower() == ".json":
         pairs, saved_at = _load_pairs_from_json(state_path)
@@ -642,28 +775,50 @@ def build_dataset_bundle(
         storage_kind = str(block_summary.get("state_storage_kind", "sqlite"))
 
     min_total_spread_pct = max(0.0, float(min_total_spread_pct or 0.0))
+    block_diagnostics = _build_block_diagnostics(blocks, sequence_length=sequence_length)
+    episodes_by_pair_session: dict[tuple[str, int], list[Any]] = {}
+    blocks_by_pair_session: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+    observable_end_by_pair_session: dict[tuple[str, int], float] = {}
+    for block in blocks:
+        pair_id = str(block.get("pair_id") or "")
+        session_id = int(block.get("session_id") or 0)
+        blocks_by_pair_session[(pair_id, session_id)].append(block)
+    for key, pair_session_blocks in blocks_by_pair_session.items():
+        episodes_by_pair_session[key] = _build_closed_episodes_for_blocks(pair_session_blocks)
+        observable_end_ts = 0.0
+        for block in pair_session_blocks:
+            records = [
+                canonicalize_record(record, fallback_ts=float(index))
+                for index, record in enumerate(block.get("records", []))
+                if isinstance(record, dict)
+            ]
+            records.sort(key=lambda record: record["timestamp"])
+            if records:
+                observable_end_ts = max(observable_end_ts, float(records[-1]["timestamp"]))
+        observable_end_by_pair_session[key] = float(observable_end_ts)
+
     skipped_blocks_too_short = 0
-    for block_index, block in enumerate(blocks):
-        normalized_block_id = _synthetic_block_id(block.get("block_id"), block_index)
+    for block in blocks:
         normalized_session_id = int(block.get("session_id") or 0)
+        normalized_pair_id = str(block.get("pair_id") or "")
         records = [
             canonicalize_record(record, fallback_ts=float(index))
             for index, record in enumerate(block.get("records", []))
             if isinstance(record, dict)
         ]
-        if len(records) < sequence_length + 1:
+        if len(records) < sequence_length:
             skipped_blocks_too_short += 1
             continue
         records.sort(key=lambda record: record["timestamp"])
-        episodes = _build_closed_episodes(
-            records,
-            block_id=normalized_block_id,
-            session_id=normalized_session_id,
-        )
+        episodes = episodes_by_pair_session.get((normalized_pair_id, normalized_session_id), [])
+        observable_end_ts = float(observable_end_by_pair_session.get((normalized_pair_id, normalized_session_id), 0.0))
 
-        for start in range(len(records) - sequence_length):
+        for start in range(len(records) - sequence_length + 1):
             window = records[start : start + sequence_length]
             current_ts = window[-1]["timestamp"]
+            if observable_end_ts > 0.0 and (float(current_ts) + float(prediction_horizon_sec)) > observable_end_ts:
+                skipped_windows_right_censored += 1
+                continue
             label = _label_window_from_episodes(
                 current_ts,
                 episodes,
@@ -734,6 +889,7 @@ def build_dataset_bundle(
         "selected_block_ids": sorted({int(block_id) for block_id in (selected_block_ids or []) if int(block_id) > 0}),
         "selected_session_ids": sorted({int(session_id) for session_id in (selected_session_ids or []) if int(session_id) > 0}),
         "skipped_blocks_too_short": int(skipped_blocks_too_short),
+        "skipped_windows_right_censored": int(skipped_windows_right_censored),
         "num_cross_block_windows": 0,
         "prediction_horizon_sec": int(prediction_horizon_sec),
         "sequence_length": int(sequence_length),
@@ -746,7 +902,9 @@ def build_dataset_bundle(
             timeout_peak_future_total_spread_buckets,
             timeouts_without_future_episode=timeouts_without_future_episode,
             timeouts_with_only_sub_threshold_episode=timeouts_with_only_sub_threshold_episode,
-        ) if X_samples else _empty_label_audit(),
+            right_censored_windows=skipped_windows_right_censored,
+        ),
+        "block_diagnostics": block_diagnostics,
         "state_saved_at": float(saved_at),
         "state_storage_kind": storage_kind,
     }
