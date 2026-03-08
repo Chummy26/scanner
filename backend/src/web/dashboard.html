@@ -132,6 +132,9 @@
   <script>
     let dashboardPayload = {data: [], summary: {}};
     let currentMode = "board";
+    let fetchPromise = null;
+    let fetchQueued = false;
+    let fetchGeneration = 0;
     const laneMeta = {
       execute_now: {title: "Agir agora", description: "Poucas oportunidades com sinal operacional claro.", badge: "good"},
       observe: {title: "Observar", description: "Contexto interessante, mas ainda sem prioridade de execução.", badge: "warn"},
@@ -142,23 +145,59 @@
     const spreadClass = (value) => Number(value || 0) >= 0.8 ? "good" : Number(value || 0) >= 0.3 ? "warn" : "danger";
     const prettyCode = (value) => String(value || "").replaceAll("_", " ");
 
-    async function fetchDashboard() {
-      const response = await fetch("/api/v1/ml/dashboard");
-      const payload = await response.json();
-      dashboardPayload = {data: payload.data || [], summary: payload.summary || {}};
-      renderAll();
+    function activeLaneFilter() {
+      const lane = document.getElementById("lane-filter").value || "all";
+      return lane === "all" ? "" : lane;
+    }
+
+    function activeSearchFilter() {
+      return (document.getElementById("search-input").value || "").trim();
+    }
+
+    function buildDashboardListUrl() {
+      const params = new URLSearchParams();
+      const lane = activeLaneFilter();
+      const search = activeSearchFilter();
+      if (lane) params.set("lane", lane);
+      if (search) params.set("search", search);
+      params.set("limit", currentMode === "board" ? "180" : "250");
+      params.set("offset", "0");
+      return `/api/v1/ml/dashboard/list?${params.toString()}`;
+    }
+
+    async function fetchDashboard({force = false} = {}) {
+      if (document.hidden && !force) return;
+      if (fetchPromise) {
+        fetchQueued = true;
+        return fetchPromise;
+      }
+      const requestId = ++fetchGeneration;
+      fetchPromise = Promise.all([
+        fetch("/api/v1/ml/dashboard/summary"),
+        fetch(buildDashboardListUrl()),
+      ]).then(async ([summaryResponse, listResponse]) => {
+        const [summaryPayload, listPayload] = await Promise.all([
+          summaryResponse.json(),
+          listResponse.json(),
+        ]);
+        if (requestId !== fetchGeneration) return;
+        dashboardPayload = {
+          data: listPayload.data || [],
+          summary: summaryPayload.summary || listPayload.summary || {},
+        };
+        renderAll();
+      }).finally(async () => {
+        fetchPromise = null;
+        if (fetchQueued) {
+          fetchQueued = false;
+          await fetchDashboard();
+        }
+      });
+      return fetchPromise;
     }
 
     function filteredData() {
-      const search = (document.getElementById("search-input").value || "").trim().toLowerCase();
-      const lane = document.getElementById("lane-filter").value || "all";
-      return (dashboardPayload.data || []).filter((opp) => {
-        const symbol = String(opp.symbol || "").toLowerCase();
-        const actionLane = String(opp.action_lane || "blocked");
-        if (search && !symbol.includes(search)) return false;
-        if (lane !== "all" && actionLane !== lane) return false;
-        return true;
-      });
+      return dashboardPayload.data || [];
     }
 
     function setModelBadge(summary) {
@@ -184,7 +223,7 @@
       badge.textContent = `Bundle degradado • ${bundleVersion}`;
     }
 
-    function renderSummary(summary, data) {
+    function renderSummary(summary) {
       const laneCounts = summary.lane_counts || {};
       document.getElementById("sum-total").textContent = summary.total || 0;
       document.getElementById("sum-execute").textContent = laneCounts.execute_now || 0;
@@ -223,26 +262,21 @@
     }
 
     function signalCard(opp) {
-      const ml = opp.mlContext || {};
-      const lane = opp.action_lane || "blocked";
-      const rangeStatus = String(ml.range_status || "unknown");
-      const entryPosition = String(ml.entry_position_label || "unknown");
-      const hideProbEta = lane === "blocked" && rangeStatus === "insufficient_empirical_context";
-      const supportText = `${Number(ml.empirical_support_short || 0)} curta / ${Number(ml.empirical_support_long || 0)} longa`;
-      const etaDiag = ml.estimated_time_to_close || "--";
-      const empiricalEtaDiag = Number(ml.empirical_eta_q25_seconds || 0) > 0
-        ? `${Math.round(Number(ml.empirical_eta_q25_seconds || 0) / 60)}-${Math.round(Number(ml.empirical_eta_q75_seconds || 0) / 60)}m`
-        : "--";
+      const modelStatus = String(opp.model_status || "missing_ml_context");
+      const signalAction = String(opp.signal_action || "WAIT");
+      const rangeStatus = String(opp.range_status || "unknown");
+      const entryPosition = String(opp.entry_position_label || "unknown");
+      const hideProbEta = (opp.action_lane || "blocked") === "blocked" && rangeStatus === "insufficient_empirical_context";
       const metricsHtml = hideProbEta ? `
             <div class="mini"><div class="k">Faixa</div><div class="v">${esc("Contexto insuficiente")}</div></div>
-            <div class="mini"><div class="k">Suporte</div><div class="v mono">${esc(supportText)}</div></div>
-            <div class="mini"><div class="k">Status ML</div><div class="v">${esc(prettyCode(ml.model_status || "missing_ml_context"))}</div></div>
+            <div class="mini"><div class="k">Status ML</div><div class="v">${esc(prettyCode(modelStatus))}</div></div>
             <div class="mini"><div class="k">Motivo</div><div class="v">${esc(prettyCode(opp.signal_reason_code || ""))}</div></div>
+            <div class="mini"><div class="k">Faixa ativa</div><div class="v mono">${esc(opp.recommended_entry_range || "--")}</div></div>
       ` : `
-            <div class="mini"><div class="k">Entrada</div><div class="v mono">${esc(ml.recommended_entry_range || "--")}</div></div>
-            <div class="mini"><div class="k">Saída</div><div class="v mono">${esc(ml.recommended_exit_range || "--")}</div></div>
-            <div class="mini"><div class="k">ETA</div><div class="v">${esc(etaDiag)}</div></div>
-            <div class="mini"><div class="k">Prob./Score</div><div class="v mono">${fmtPct(ml.success_probability || 0)} / ${Number(ml.ml_score || opp.mlScore || 0).toFixed(0)}</div></div>
+            <div class="mini"><div class="k">Entrada</div><div class="v mono">${esc(opp.recommended_entry_range || "--")}</div></div>
+            <div class="mini"><div class="k">Saída</div><div class="v mono">${esc(opp.recommended_exit_range || "--")}</div></div>
+            <div class="mini"><div class="k">ETA</div><div class="v">${Number(opp.display_eta_seconds || 0) > 0 ? `${Math.round(Number(opp.display_eta_seconds || 0) / 60)}m` : "--"}</div></div>
+            <div class="mini"><div class="k">Prob./Score</div><div class="v mono">${fmtPct(opp.success_probability || 0)} / ${Number(opp.ml_score || 0).toFixed(0)}</div></div>
       `;
       return `
         <article class="signal-card">
@@ -253,35 +287,23 @@
             </div>
             <div style="text-align:right">
               <div class="spread ${spreadClass(opp.entrySpread)}">${Number(opp.entrySpread || 0).toFixed(2)}%</div>
-              <div class="muted mono" style="margin-top:6px">${esc(lane.replaceAll("_", " "))}</div>
+              <div class="muted mono" style="margin-top:6px">${esc((opp.action_lane || "blocked").replaceAll("_", " "))}</div>
             </div>
           </div>
           <div class="card-metrics">
             ${metricsHtml}
           </div>
           <div class="chip-row">
-            ${signalBadge(ml.signal_action || "WAIT")}
-            ${statusBadge(ml.model_status || "missing_ml_context")}
-            <span class="chip info">${esc(prettyCode(ml.context_strength || "sem_contexto"))}</span>
+            ${signalBadge(signalAction)}
+            ${statusBadge(modelStatus)}
+            <span class="chip info">${esc(prettyCode(opp.context_strength || "sem_contexto"))}</span>
             <span class="chip info">${esc(prettyCode(rangeStatus))}</span>
             <span class="chip ${entryPosition === "inside_core" ? "good" : (entryPosition === "inside_outer" ? "warn" : "danger")}">${esc(prettyCode(entryPosition))}</span>
-            <span class="chip ${ml.eta_alignment_status === "divergent" ? "danger" : (ml.eta_alignment_status === "aligned" ? "good" : "info")}">${esc(prettyCode(ml.eta_alignment_status || "unknown"))}</span>
-            ${ml.drift_status === "drifted" ? '<span class="chip danger">drift</span>' : '<span class="chip good">sem drift</span>'}
+            <span class="chip ${opp.eta_alignment_status === "divergent" ? "danger" : (opp.eta_alignment_status === "aligned" ? "good" : "info")}">${esc(prettyCode(opp.eta_alignment_status || "unknown"))}</span>
             ${riskChips(opp.risk_flags)}
           </div>
           <div class="operator"><strong>Próxima ação:</strong> ${esc(opp.operator_message || "Sem orientação operacional.")}</div>
-          <div class="muted" style="margin-top:8px;line-height:1.6">Motivo: ${esc(ml.signal_reason || prettyCode(opp.signal_reason_code || ""))}</div>
-          <details style="margin-top:12px">
-            <summary class="muted" style="cursor:pointer">Detalhes do bundle e contexto</summary>
-            <div class="muted" style="margin-top:8px;line-height:1.6">
-              Bundle: ${esc(ml.model_version || "unavailable")} • Latência: ${Number(ml.inference_latency_ms || 0).toFixed(2)}ms<br>
-              Contexto: ${esc(ml.nlp_context || "--")}<br>
-              Faixa recorrente: ${esc(ml.recommended_entry_range || "--")} / ${esc(ml.recommended_exit_range || "--")}<br>
-              Suporte: ${esc(supportText)} • Percentil nas excursões: ${Number(ml.context_percentile_excursions || ml.context_percentile || 0).toFixed(2)}<br>
-              ETA modelo: ${esc(etaDiag)} • ETA empírico Q25-Q75: ${esc(empiricalEtaDiag)}<br>
-              Código: ${esc(opp.signal_reason_code || "--")}
-            </div>
-          </details>
+          <div class="muted" style="margin-top:8px;line-height:1.6">Motivo: ${esc(prettyCode(opp.signal_reason_code || ""))}</div>
         </article>
       `;
     }
@@ -326,19 +348,18 @@
             </tr>
           </thead>
           <tbody>
-            ${data.map((opp) => {
-              const ml = opp.mlContext || {};
-              return `<tr>
+            ${data.map((opp) => `
+              <tr>
                 <td><span class="badge ${opp.action_lane === "execute_now" ? "good" : (opp.action_lane === "observe" ? "warn" : "danger")}">${esc(prettyCode(opp.action_lane || "blocked"))}</span></td>
                 <td><strong>${esc(opp.symbol || "--")}</strong></td>
                 <td>${esc(opp.buyFrom || "--")} -> ${esc(opp.sellTo || "--")}</td>
                 <td class="mono">${Number(opp.entrySpread || 0).toFixed(2)}%</td>
-                <td class="mono">${fmtPct(ml.success_probability || 0)} / ${Number(ml.ml_score || opp.mlScore || 0).toFixed(0)}</td>
-                <td>${esc(ml.signal_action || "WAIT")}</td>
-                <td>${esc(ml.model_status || "missing_ml_context")}</td>
-                <td>${esc(opp.operator_message || ml.signal_reason || "--")}</td>
-              </tr>`;
-            }).join("")}
+                <td class="mono">${fmtPct(opp.success_probability || 0)} / ${Number(opp.ml_score || 0).toFixed(0)}</td>
+                <td>${esc(opp.signal_action || "WAIT")}</td>
+                <td>${esc(opp.model_status || "missing_ml_context")}</td>
+                <td>${esc(opp.operator_message || prettyCode(opp.signal_reason_code || ""))}</td>
+              </tr>
+            `).join("")}
           </tbody>
         </table>
       `;
@@ -354,25 +375,37 @@
     }
 
     function renderAll() {
+      const search = (document.getElementById("search-input").value || "").trim().toLowerCase();
+      void search;
       const data = filteredData();
-      renderSummary(dashboardPayload.summary || {}, data);
-      renderBoard(data);
-      renderTable(data);
+      renderSummary(dashboardPayload.summary || {});
+      if (currentMode === "board") {
+        renderBoard(data);
+      } else {
+        renderTable(data);
+      }
       renderMode();
     }
 
-    document.getElementById("refresh-btn").addEventListener("click", fetchDashboard);
-    document.getElementById("search-input").addEventListener("input", renderAll);
-    document.getElementById("lane-filter").addEventListener("change", renderAll);
-    document.getElementById("board-mode-btn").addEventListener("click", () => { currentMode = "board"; renderMode(); });
-    document.getElementById("table-mode-btn").addEventListener("click", () => { currentMode = "table"; renderMode(); });
+    document.getElementById("refresh-btn").addEventListener("click", () => fetchDashboard({force: true}));
+    document.getElementById("search-input").addEventListener("input", () => fetchDashboard({force: true}));
+    document.getElementById("lane-filter").addEventListener("change", () => fetchDashboard({force: true}));
+    document.getElementById("board-mode-btn").addEventListener("click", () => { currentMode = "board"; fetchDashboard({force: true}); });
+    document.getElementById("table-mode-btn").addEventListener("click", () => { currentMode = "table"; fetchDashboard({force: true}); });
 
     fetchDashboard().catch((error) => {
       console.error("Failed to load ML API", error);
       document.getElementById("lane-grid").innerHTML = '<div class="empty">Falha ao carregar o dashboard de sinais.</div>';
       document.getElementById("table-shell").innerHTML = '<div class="empty">Falha ao carregar o dashboard de sinais.</div>';
     });
-    window.setInterval(() => fetchDashboard().catch((error) => console.error("Failed to refresh ML API", error)), 2000);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) {
+        fetchDashboard({force: true}).catch((error) => console.error("Failed to refresh ML API", error));
+      }
+    });
+    window.setInterval(() => {
+      fetchDashboard().catch((error) => console.error("Failed to refresh ML API", error));
+    }, 5000);
   </script>
 </body>
 </html>

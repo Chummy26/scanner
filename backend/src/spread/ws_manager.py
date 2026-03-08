@@ -58,17 +58,77 @@ class WSManager:
         self._ML_CACHE_MAX = 2000
         self._exchange_instances: Dict[str, BaseExchangeWS] = {}
         self._scanner_clients: Set[Any] = set()
+        self._scanner_lite_clients: Set[Any] = set()
         self._lock = threading.Lock()
         self._running = False
         self._tasks: List[asyncio.Task] = []
         self._threads: List[threading.Thread] = []
         self._last_filtered_opps: List[SpreadOpportunity] = []  # Last broadcast batch (filtered)
+        self._last_scanner_lite_rows: List[Dict[str, Any]] = []
+        self._last_scanner_lite_rows_by_key: Dict[str, Dict[str, Any]] = {}
+        self._last_scanner_lite_snapshot: Dict[str, Any] = {"type": "arbitrage_data_lite_snapshot", "data": [], "count": 0, "total_count": 0}
+        self._last_scanner_lite_delta: Dict[str, Any] = {"type": "arbitrage_data_lite_delta", "upserts": [], "removes": [], "count": 0, "remove_count": 0, "total_count": 0}
+        self._last_scanner_lite_summary: Dict[str, Any] = {"total": 0, "spot_future": 0, "future_future": 0, "updated_at": None}
 
         self._tracker_db_path = tracker_db_path
         self._tracker_db_path.parent.mkdir(parents=True, exist_ok=True)
         restored = self.tracker.load_from_storage()
         if restored:
             logger.info("[WSManager] Restored tracker SQLite state (%s pairs)", restored)
+
+    def _build_scanner_lite_summary(self, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        spot_future = 0
+        future_future = 0
+        for row in rows:
+            buy_type = str(row.get("buyType") or "").upper()
+            sell_type = str(row.get("sellType") or "").upper()
+            if buy_type == "SPOT" and sell_type == "FUTURES":
+                spot_future += 1
+            elif buy_type == "FUTURES" and sell_type == "FUTURES":
+                future_future += 1
+        return {
+            "total": len(rows),
+            "spot_future": spot_future,
+            "future_future": future_future,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def _refresh_scanner_lite_state(self, opportunities: List[SpreadOpportunity]) -> None:
+        rows = [opp.to_scanner_lite_dict() for opp in opportunities[:500]]
+        rows_by_key = {
+            str(row.get("pairKey") or row.get("code") or f"row:{index}"): row
+            for index, row in enumerate(rows)
+        }
+        previous_by_key = self._last_scanner_lite_rows_by_key
+        removes = [key for key in previous_by_key if key not in rows_by_key]
+        upserts = [
+            row for key, row in rows_by_key.items()
+            if previous_by_key.get(key) != row
+        ]
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self._last_scanner_lite_rows = rows
+        self._last_scanner_lite_rows_by_key = rows_by_key
+        self._last_scanner_lite_summary = self._build_scanner_lite_summary(rows)
+        self._last_scanner_lite_snapshot = {
+            "timestamp": now_iso,
+            "type": "arbitrage_data_lite_snapshot",
+            "source": "spread_engine",
+            "count": len(rows),
+            "total_count": len(opportunities),
+            "summary": self._last_scanner_lite_summary,
+            "data": rows,
+        }
+        self._last_scanner_lite_delta = {
+            "timestamp": now_iso,
+            "type": "arbitrage_data_lite_delta",
+            "source": "spread_engine",
+            "count": len(upserts),
+            "remove_count": len(removes),
+            "total_count": len(opportunities),
+            "summary": self._last_scanner_lite_summary,
+            "upserts": upserts,
+            "removes": removes,
+        }
 
     def _on_book_update(self, symbol: str, exchange: str, market_type: str,
                          book: OrderBook):
@@ -544,6 +604,8 @@ class WSManager:
                 and _vol_ok(getattr(opp, "_raw_sell_vol", -1.0))
             ]
 
+        self._refresh_scanner_lite_state(opportunities)
+
         _t_end = time.time()
         # All timing measured inside thread (no event-loop scheduling noise).
         self._last_timing = (
@@ -588,6 +650,8 @@ class WSManager:
                 # Broadcast to scanner clients (skip if previous broadcast still in progress)
                 if not getattr(self, '_broadcasting', False):
                     asyncio.create_task(self._broadcast_scanner(opportunities))
+                if not getattr(self, '_broadcasting_lite', False):
+                    asyncio.create_task(self._broadcast_scanner_lite())
 
                 t2 = time.time()
 
@@ -721,6 +785,59 @@ class WSManager:
                 for ws in disconnected:
                     self._scanner_clients.discard(ws)
 
+    async def _broadcast_scanner_lite(self):
+        """Send compact scanner deltas to migrated scanner clients."""
+        self._broadcasting_lite = True
+        try:
+            await self._broadcast_scanner_lite_inner()
+        finally:
+            self._broadcasting_lite = False
+
+    async def _broadcast_scanner_lite_inner(self):
+        with self._lock:
+            clients = list(self._scanner_lite_clients)
+
+        if not clients:
+            return
+
+        delta = self._last_scanner_lite_delta
+        snapshot = self._last_scanner_lite_snapshot
+        if not snapshot.get("data"):
+            ping_payload = '{"type":"ping"}'
+
+            async def _ping(ws):
+                try:
+                    await asyncio.wait_for(ws.send_str(ping_payload), timeout=3.0)
+                    return None
+                except Exception:
+                    return ws
+
+            results = await asyncio.gather(*[_ping(ws) for ws in clients])
+            disconnected = [ws for ws in results if ws is not None]
+            if disconnected:
+                with self._lock:
+                    for ws in disconnected:
+                        self._scanner_lite_clients.discard(ws)
+            return
+
+        payload_obj = delta if delta.get("upserts") or delta.get("removes") else {"type": "ping"}
+        payload = json.dumps(payload_obj)
+
+        async def _send(ws):
+            try:
+                await asyncio.wait_for(ws.send_str(payload), timeout=5.0)
+                return None
+            except Exception as exc:
+                logger.warning(f"[WSManager] Scanner-lite WS send failed ({type(exc).__name__}): {exc}")
+                return ws
+
+        results = await asyncio.gather(*[_send(ws) for ws in clients])
+        disconnected = [ws for ws in results if ws is not None]
+        if disconnected:
+            with self._lock:
+                for ws in disconnected:
+                    self._scanner_lite_clients.discard(ws)
+
     async def _prune_loop(self):
         """Periodically prune stale tracker data."""
         while self._running:
@@ -804,6 +921,18 @@ class WSManager:
             self._scanner_clients.discard(ws)
         logger.info(f"[WSManager] Scanner client disconnected (total: {len(self._scanner_clients)})")
 
+    def add_scanner_lite_client(self, ws):
+        """Register a compact scanner WebSocket connection."""
+        with self._lock:
+            self._scanner_lite_clients.add(ws)
+        logger.info(f"[WSManager] Scanner-lite client connected (total: {len(self._scanner_lite_clients)})")
+
+    def remove_scanner_lite_client(self, ws):
+        """Unregister a compact scanner WebSocket connection."""
+        with self._lock:
+            self._scanner_lite_clients.discard(ws)
+        logger.info(f"[WSManager] Scanner-lite client disconnected (total: {len(self._scanner_lite_clients)})")
+
     def get_current_opportunities(self) -> List[Dict]:
         """Get current opportunities as dicts (for REST API).
 
@@ -811,6 +940,25 @@ class WSManager:
         so low-volume tokens are excluded from both channels.
         """
         return [opp.to_scanner_dict() for opp in self._last_filtered_opps]
+
+    def get_current_opportunities_lite(self) -> List[Dict]:
+        """Get cached compact opportunity rows for the scanner list."""
+        return list(self._last_scanner_lite_rows)
+
+    def get_current_opportunities_lite_summary(self) -> Dict[str, Any]:
+        return dict(self._last_scanner_lite_summary)
+
+    def get_current_scanner_lite_snapshot(self) -> Dict[str, Any]:
+        return dict(self._last_scanner_lite_snapshot)
+
+    def get_scanner_opportunity_detail(self, pair_key: str) -> Optional[Dict]:
+        target = str(pair_key or "").strip()
+        if not target:
+            return None
+        for opp in self._last_filtered_opps:
+            if opp.pair_key() == target:
+                return opp.to_scanner_dict()
+        return None
 
     def get_status(self) -> Dict:
         """Get manager status for monitoring."""

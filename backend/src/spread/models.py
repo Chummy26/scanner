@@ -92,18 +92,24 @@ class SpreadOpportunity:
     ml_score: int = 0
     ml_context: Optional[Dict[str, Any]] = None
 
-    def to_scanner_dict(self) -> Dict[str, Any]:
-        """Convert to the JSON format expected by the frontend scanner WebSocket.
+    def pair_key(self) -> str:
+        """Stable key for caching, delta updates, and detail lookups."""
+        return "|".join(
+            [
+                str(self.asset or "").strip().upper(),
+                str(self.buy_exchange or "").strip().lower(),
+                str(self.buy_market_type or "").strip().lower(),
+                str(self.sell_exchange or "").strip().lower(),
+                str(self.sell_market_type or "").strip().lower(),
+            ]
+        )
 
-        Matches legacy scanner format: UPPERCASE market types, code field, funding rates.
-        """
-        from datetime import datetime, timezone
-        ts = datetime.fromtimestamp(self.timestamp, tz=timezone.utc).isoformat()
+    def _scanner_base_dict(self) -> Dict[str, Any]:
         buy_type_upper = self.buy_market_type.upper()
         sell_type_upper = self.sell_market_type.upper()
         code = f"{buy_type_upper}_{self.buy_exchange}_{self.asset}-USDT_{self.sell_exchange}_{sell_type_upper}"
-
-        d: Dict[str, Any] = {
+        return {
+            "pairKey": self.pair_key(),
             "symbol": self.asset,
             "current": "USDT",
             "code": code,
@@ -118,16 +124,56 @@ class SpreadOpportunity:
             "sellVol24": round(self.sell_volume_24h, 2),
             "entrySpread": round(self.entry_spread_pct, 4),
             "exitSpread": round(self.exit_spread_pct, 4),
-            "timestamp": ts,
             "histCruzamento": {
                 "inverted_count": self.inverted_count,
                 "inverted_counts": self.inverted_counts or None,
                 "totalEntries": self.total_entries,
                 "totalExits": self.total_exits,
             },
-            "mlScore": self.ml_score,
-            "mlContext": self.ml_context,
         }
+
+    def to_scanner_lite_dict(self) -> Dict[str, Any]:
+        """Compact payload for the main scanner board and incremental WS updates."""
+        d = self._scanner_base_dict()
+        if d["histCruzamento"].get("inverted_counts") is None:
+            d["histCruzamento"].pop("inverted_counts", None)
+        if self.funding_rate_buy is not None:
+            d["buyFundingRate"] = self.funding_rate_buy
+        if self.funding_rate_sell is not None:
+            d["sellFundingRate"] = self.funding_rate_sell
+        if self.buy_book_age >= 0:
+            d["buyBookAge"] = self.buy_book_age
+        if self.sell_book_age >= 0:
+            d["sellBookAge"] = self.sell_book_age
+        if self.buy_withdraw_status is not None:
+            d["buyWithdrawOk"] = self.buy_withdraw_status
+        if self.sell_withdraw_status is not None:
+            d["sellWithdrawOk"] = self.sell_withdraw_status
+        if self.buy_deposit_status is not None:
+            d["buyDepositOk"] = self.buy_deposit_status
+        if self.sell_deposit_status is not None:
+            d["sellDepositOk"] = self.sell_deposit_status
+        if self.funding_interval_buy is not None:
+            d["buyFundingInterval"] = self.funding_interval_buy
+        if self.funding_interval_sell is not None:
+            d["sellFundingInterval"] = self.funding_interval_sell
+        if self.ml_context:
+            d["signalAction"] = str(self.ml_context.get("signal_action") or "WAIT")
+            d["signalReasonCode"] = str(self.ml_context.get("signal_reason_code") or "")
+            d["rangeStatus"] = str(self.ml_context.get("range_status") or "unknown")
+        return d
+
+    def to_scanner_dict(self) -> Dict[str, Any]:
+        """Convert to the JSON format expected by the frontend scanner WebSocket.
+
+        Matches legacy scanner format: UPPERCASE market types, code field, funding rates.
+        """
+        from datetime import datetime, timezone
+        ts = datetime.fromtimestamp(self.timestamp, tz=timezone.utc).isoformat()
+        d: Dict[str, Any] = self._scanner_base_dict()
+        d["timestamp"] = ts
+        d["mlScore"] = self.ml_score
+        d["mlContext"] = self.ml_context
         # Don't send null (cleaner payload for clients that might not expect it).
         if d["histCruzamento"].get("inverted_counts") is None:
             d["histCruzamento"].pop("inverted_counts", None)

@@ -1,6 +1,6 @@
 """Unified server for Team OP Scanner.
 
-Serves the bundled legacy frontend in `novo frontend/frontend` and provides
+Serves the new frontend source in `novo frontend/frontend 2` and provides
 REST + WebSocket APIs.
 
 Integrates the spread engine (real-time exchange WS) and the existing
@@ -91,7 +91,7 @@ ADMIN_USER = os.environ.get("TEAM_OP_ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("TEAM_OP_ADMIN_PASS", "admin123")
 
 # Paths
-FRONTEND_DIR = PROJECT_DIR / "novo frontend" / "frontend"
+FRONTEND_DIR = PROJECT_DIR / "novo frontend" / "frontend 2"
 ASSETS_DIR = FRONTEND_DIR / "assets"
 OUT_DIR = BACKEND_DIR / "out" / "prod"
 CONFIG_DIR = BACKEND_DIR / "out" / "config"
@@ -483,6 +483,35 @@ async def handle_spread_opportunities(request):
         "data": ws_mgr.get_current_opportunities(),
         "status": ws_mgr.get_status(),
     })
+
+
+async def handle_spread_opportunities_lite(request):
+    ws_mgr = request.app.get("ws_manager")
+    if not ws_mgr:
+        return web.json_response({"data": [], "summary": {"total": 0}, "status": "no_engine"})
+    return web.json_response({
+        "data": ws_mgr.get_current_opportunities_lite(),
+        "summary": ws_mgr.get_current_opportunities_lite_summary(),
+        "status": ws_mgr.get_status(),
+    })
+
+
+async def handle_spread_opportunities_lite_summary(request):
+    ws_mgr = request.app.get("ws_manager")
+    if not ws_mgr:
+        return web.json_response({"summary": {"total": 0}})
+    return web.json_response({"summary": ws_mgr.get_current_opportunities_lite_summary()})
+
+
+async def handle_spread_opportunity_detail(request):
+    ws_mgr = request.app.get("ws_manager")
+    if not ws_mgr:
+        return web.json_response({"error": "no_engine"}, status=503)
+    pair_key = str(request.match_info.get("pair_key") or "").strip()
+    detail = ws_mgr.get_scanner_opportunity_detail(pair_key)
+    if not detail:
+        return web.json_response({"error": "not_found"}, status=404)
+    return web.json_response({"data": detail})
 
 
 async def handle_spread_status(request):
@@ -963,6 +992,45 @@ def _dashboard_enrich_opportunity(opp: dict) -> dict:
     return enriched
 
 
+def _dashboard_pair_key(opp: dict) -> str:
+    symbol = str(opp.get("symbol") or opp.get("current") or opp.get("code") or "").upper()
+    buy_from = _norm_exchange(str(opp.get("buyFrom") or opp.get("buy_exchange") or ""))
+    buy_type = _norm_market(str(opp.get("buyType") or opp.get("buy_market_type") or ""))
+    sell_to = _norm_exchange(str(opp.get("sellTo") or opp.get("sell_exchange") or ""))
+    sell_type = _norm_market(str(opp.get("sellType") or opp.get("sell_market_type") or ""))
+    return "|".join((symbol, buy_from, buy_type, sell_to, sell_type))
+
+
+def _dashboard_list_item(opp: dict) -> dict:
+    ml_context = opp.get("mlContext") if isinstance(opp.get("mlContext"), dict) else {}
+    return {
+        "pair_key": _dashboard_pair_key(opp),
+        "symbol": str(opp.get("symbol") or opp.get("current") or opp.get("code") or ""),
+        "buyFrom": opp.get("buyFrom") or opp.get("buy_exchange"),
+        "sellTo": opp.get("sellTo") or opp.get("sell_exchange"),
+        "buyType": opp.get("buyType") or opp.get("buy_market_type"),
+        "sellType": opp.get("sellType") or opp.get("sell_market_type"),
+        "entrySpread": opp.get("entrySpread") or opp.get("entry_spread_pct"),
+        "exitSpread": opp.get("exitSpread") or opp.get("exit_spread_pct"),
+        "action_lane": str(opp.get("action_lane") or _dashboard_action_lane(opp)),
+        "signal_action": _dashboard_signal_action(opp),
+        "signal_reason_code": str(opp.get("signal_reason_code") or _dashboard_signal_reason_code(opp)),
+        "operator_message": str(opp.get("operator_message") or _dashboard_operator_message(opp)),
+        "risk_flags": list(opp.get("risk_flags") or _dashboard_risk_flags(opp)),
+        "model_status": _dashboard_model_status(opp),
+        "success_probability": _dashboard_success_probability(opp),
+        "ml_score": _dashboard_ml_score(opp),
+        "model_version": _dashboard_model_version_value(opp),
+        "range_status": _dashboard_range_status(opp),
+        "context_strength": _dashboard_context_strength(opp),
+        "entry_position_label": _dashboard_entry_position_label(opp),
+        "eta_alignment_status": _dashboard_eta_alignment_status(opp),
+        "display_eta_seconds": ml_context.get("display_eta_seconds"),
+        "recommended_entry_range": ml_context.get("recommended_entry_range") or "--",
+        "recommended_exit_range": ml_context.get("recommended_exit_range") or "--",
+    }
+
+
 def _dashboard_summary(opps_sorted: list[dict]) -> dict:
     signals: dict[str, int] = {}
     statuses: dict[str, int] = {}
@@ -1033,14 +1101,10 @@ def _dashboard_summary(opps_sorted: list[dict]) -> dict:
     }
 
 
-async def handle_ml_dashboard_api(request):
-    ws_mgr = request.app.get("ws_manager")
-    if not ws_mgr:
-        return web.json_response({"data": [], "summary": _dashboard_summary([])})
-    
+def _dashboard_all_enriched_opportunities(ws_mgr) -> list[dict]:
     opps = ws_mgr.get_current_opportunities()
     enriched_opps = [_dashboard_enrich_opportunity(opp) for opp in opps]
-    opps_sorted = sorted(
+    return sorted(
         enriched_opps,
         key=lambda opp: (
             _dashboard_lane_rank(str(opp.get("action_lane") or "blocked")),
@@ -1050,7 +1114,72 @@ async def handle_ml_dashboard_api(request):
             str(opp.get("symbol") or ""),
         ),
     )
+
+
+async def handle_ml_dashboard_api(request):
+    ws_mgr = request.app.get("ws_manager")
+    if not ws_mgr:
+        return web.json_response({"data": [], "summary": _dashboard_summary([])})
+
+    opps_sorted = _dashboard_all_enriched_opportunities(ws_mgr)
     return web.json_response({"data": opps_sorted, "summary": _dashboard_summary(opps_sorted)})
+
+
+async def handle_ml_dashboard_summary_api(request):
+    ws_mgr = request.app.get("ws_manager")
+    if not ws_mgr:
+        return web.json_response({"summary": _dashboard_summary([])})
+    opps_sorted = _dashboard_all_enriched_opportunities(ws_mgr)
+    return web.json_response({"summary": _dashboard_summary(opps_sorted)})
+
+
+async def handle_ml_dashboard_list_api(request):
+    ws_mgr = request.app.get("ws_manager")
+    if not ws_mgr:
+        return web.json_response({
+            "data": [],
+            "summary": _dashboard_summary([]),
+            "pagination": {"limit": 0, "offset": 0, "returned": 0},
+        })
+
+    lane = str(request.query.get("lane") or "").strip().lower()
+    search = str(request.query.get("search") or "").strip().lower()
+    try:
+        limit = max(1, min(int(request.query.get("limit", "100")), 500))
+    except (TypeError, ValueError):
+        limit = 100
+    try:
+        offset = max(0, int(request.query.get("offset", "0")))
+    except (TypeError, ValueError):
+        offset = 0
+
+    opps_sorted = _dashboard_all_enriched_opportunities(ws_mgr)
+    filtered = []
+    for opp in opps_sorted:
+        if lane and str(opp.get("action_lane") or "").lower() != lane:
+            continue
+        symbol = str(opp.get("symbol") or opp.get("current") or opp.get("code") or "").lower()
+        pair_key = _dashboard_pair_key(opp).lower()
+        if search and search not in symbol and search not in pair_key:
+            continue
+        filtered.append(opp)
+    sliced = filtered[offset: offset + limit]
+    return web.json_response({
+        "data": [_dashboard_list_item(opp) for opp in sliced],
+        "summary": _dashboard_summary(opps_sorted),
+        "pagination": {"limit": limit, "offset": offset, "returned": len(sliced)},
+    })
+
+
+async def handle_ml_dashboard_detail_api(request):
+    ws_mgr = request.app.get("ws_manager")
+    if not ws_mgr:
+        return web.json_response({"error": "no_engine"}, status=503)
+    pair_key = str(request.match_info.get("pair_key") or "").strip()
+    for opp in _dashboard_all_enriched_opportunities(ws_mgr):
+        if _dashboard_pair_key(opp) == pair_key:
+            return web.json_response({"data": opp})
+    return web.json_response({"error": "not_found"}, status=404)
 
 async def handle_ml_dashboard_page(request):
     path = SRC_DIR / "web" / "dashboard.html"
@@ -2011,6 +2140,39 @@ async def handle_scanner_ws(request):
     return ws
 
 
+async def handle_scanner_lite_ws(request):
+    if request.headers.get("Upgrade", "").lower() != "websocket":
+        return await handle_spa(request)
+    ws = web.WebSocketResponse(heartbeat=45.0)
+    await ws.prepare(request)
+
+    ws_mgr = request.app.get("ws_manager")
+    if ws_mgr:
+        ws_mgr.add_scanner_lite_client(ws)
+
+    await ws.send_json({"mensagem": "Conectado ao servidor de spreads (lite)", "tipo": "status"})
+    if ws_mgr:
+        snapshot = ws_mgr.get_current_scanner_lite_snapshot()
+        if snapshot:
+            await ws.send_json(snapshot)
+
+    logger.info("Scanner lite WebSocket connected")
+
+    try:
+        async for msg in ws:
+            if msg.type == WSMsgType.TEXT:
+                if msg.data == "ping":
+                    await ws.send_str("pong")
+            elif msg.type == WSMsgType.ERROR:
+                logger.error(f"Scanner lite WS error: {ws.exception()}")
+    finally:
+        if ws_mgr:
+            ws_mgr.remove_scanner_lite_client(ws)
+        logger.info("Scanner lite WebSocket disconnected")
+
+    return ws
+
+
 def _norm_exchange(ex: str) -> str:
     e = (ex or "").strip().lower()
     if not e:
@@ -2205,7 +2367,7 @@ async def handle_spa(request):
     if path and file_path.is_file():
         return web.FileResponse(file_path)
 
-    index_path = FRONTEND_DIR / "index.html"
+    index_path = FRONTEND_DIR / "src-preview.html"
     if index_path.is_file():
         html = index_path.read_text(encoding="utf-8")
         return web.Response(
@@ -2214,7 +2376,7 @@ async def handle_spa(request):
             headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
         )
 
-    return web.Response(text="Frontend not found. Check 'novo frontend/frontend/' directory.", status=404)
+    return web.Response(text="Frontend not found. Check 'novo frontend/frontend 2/' directory.", status=404)
 
 
 # ---------------------------------------------------------------------------
@@ -2388,6 +2550,9 @@ def create_app() -> web.Application:
 
     # ---- Spread API ----
     app.router.add_get("/api/spread/opportunities", handle_spread_opportunities)
+    app.router.add_get("/api/spread/opportunities-lite", handle_spread_opportunities_lite)
+    app.router.add_get("/api/spread/opportunities-lite/summary", handle_spread_opportunities_lite_summary)
+    app.router.add_get("/api/spread/opportunities/{pair_key}", handle_spread_opportunity_detail)
     app.router.add_get("/api/spread/status", handle_spread_status)
     app.router.add_get("/api/spread/debug/books", handle_debug_books)
     app.router.add_get("/api/spread/debug/status", handle_debug_status)
@@ -2417,6 +2582,7 @@ def create_app() -> web.Application:
 
     # ---- WebSockets ----
     app.router.add_get("/ws/scanner", handle_scanner_ws)
+    app.router.add_get("/ws/scanner-lite", handle_scanner_lite_ws)
     app.router.add_get("/ws/monitor", handle_monitor_ws)
     app.router.add_get("/ws", handle_scanner_ws)
     app.router.add_get("/crypto/compare-ws", handle_compare_ws)
@@ -2431,6 +2597,9 @@ def create_app() -> web.Application:
     app.router.add_get("/dashboard", handle_ml_dashboard_page)
     app.router.add_get("/dashboard/training", handle_ml_training_page)
     app.router.add_get("/api/v1/ml/dashboard", handle_ml_dashboard_api)
+    app.router.add_get("/api/v1/ml/dashboard/summary", handle_ml_dashboard_summary_api)
+    app.router.add_get("/api/v1/ml/dashboard/list", handle_ml_dashboard_list_api)
+    app.router.add_get("/api/v1/ml/dashboard/{pair_key}", handle_ml_dashboard_detail_api)
     app.router.add_get("/api/v1/ml/training/sessions", handle_ml_training_sessions_api)
     app.router.add_patch("/api/v1/ml/training/sessions/{session_id}", handle_ml_training_session_patch)
     app.router.add_get("/api/v1/ml/training/sessions/{session_id}/exceptions", handle_ml_training_session_exceptions)
@@ -2454,6 +2623,11 @@ def create_app() -> web.Application:
   API_BASE: "{scheme}://{host}",
   WS_BASE: "{ws_scheme}://{host}",
   WS_SCANNER: "{ws_scheme}://{host}/ws/scanner",
+  WS_SCANNER_LITE: "{ws_scheme}://{host}/ws/scanner-lite",
+  API_SCANNER_LITE: "{scheme}://{host}/api/spread/opportunities-lite",
+  API_SCANNER_LITE_SUMMARY: "{scheme}://{host}/api/spread/opportunities-lite/summary",
+  API_ML_DASHBOARD_SUMMARY: "{scheme}://{host}/api/v1/ml/dashboard/summary",
+  API_ML_DASHBOARD_LIST: "{scheme}://{host}/api/v1/ml/dashboard/list",
   WATCHDOG_TIMEOUT_MS: 45000,
 }};"""
         return web.Response(

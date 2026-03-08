@@ -2,12 +2,19 @@ import asyncio
 import json
 from types import SimpleNamespace
 
-from src.server import handle_ml_dashboard_api
+from src.server import (
+    handle_ml_dashboard_api,
+    handle_ml_dashboard_detail_api,
+    handle_ml_dashboard_list_api,
+    handle_ml_dashboard_summary_api,
+)
 
 
 class _FakeRequest:
-    def __init__(self, app: dict):
+    def __init__(self, app: dict, *, query=None, match_info=None):
         self.app = app
+        self.query = query or {}
+        self.match_info = match_info or {}
 
 
 class _FakeWSManager:
@@ -196,3 +203,160 @@ def test_ml_dashboard_api_sorts_ready_rows_by_probability_and_returns_summary():
     assert payload["summary"]["blocked_by_empirical_context"] == 1
     assert payload["summary"]["entry_above_recurring_band_count"] == 1
     assert payload["summary"]["eta_divergent_ready"] == 1
+
+
+def test_ml_dashboard_summary_endpoint_returns_only_summary_payload():
+    opportunities = [
+        {
+            "symbol": "AAA",
+            "mlScore": 20,
+            "mlContext": {
+                "signal_action": "EXECUTE",
+                "model_status": "ready",
+                "model_version": "bundle-v1",
+                "success_probability": 70.0,
+                "ml_score": 20,
+                "drift_status": "stable",
+                "inference_latency_ms": 10.0,
+                "range_status": "ready_short",
+                "entry_position_label": "inside_outer",
+                "eta_alignment_status": "aligned",
+            },
+        },
+        {
+            "symbol": "BBB",
+            "mlScore": 10,
+            "mlContext": {
+                "signal_action": "WAIT",
+                "model_status": "insufficient_history",
+                "success_probability": 0.0,
+                "ml_score": 10,
+            },
+        },
+    ]
+    request = _FakeRequest({"ws_manager": _FakeWSManager(opportunities)})
+
+    response = asyncio.run(handle_ml_dashboard_summary_api(request))
+    payload = json.loads(response.text)
+
+    assert set(payload.keys()) == {"summary"}
+    assert payload["summary"]["total"] == 2
+    assert payload["summary"]["lane_counts"]["execute_now"] == 1
+    assert payload["summary"]["lane_counts"]["blocked"] == 1
+
+
+def test_ml_dashboard_list_endpoint_filters_by_lane_search_and_limit():
+    opportunities = [
+            {
+                "symbol": "AAA",
+                "buyFrom": "mexc",
+                "buyType": "spot",
+                "sellTo": "gate",
+                "sellType": "futures",
+                "entrySpread": 1.5,
+                "exitSpread": 0.6,
+                "mlScore": 66,
+            "mlContext": {
+                "signal_action": "EXECUTE",
+                "model_status": "ready",
+                "model_version": "bundle-v1",
+                "success_probability": 70.0,
+                "ml_score": 66,
+                "drift_status": "stable",
+                "inference_latency_ms": 12.0,
+                "range_status": "ready_short",
+                "entry_position_label": "inside_outer",
+                "eta_alignment_status": "aligned",
+                "display_eta_seconds": 1800,
+                "recommended_entry_range": "1.20% à 1.80%",
+                "recommended_exit_range": "0.40% à 0.70%",
+            },
+        },
+            {
+                "symbol": "BBB",
+                "buyFrom": "kucoin",
+                "buyType": "spot",
+                "sellTo": "bingx",
+                "sellType": "futures",
+                "entrySpread": 0.7,
+                "exitSpread": 0.2,
+                "mlScore": 32,
+            "mlContext": {
+                "signal_action": "WAIT",
+                "model_status": "ready",
+                "model_version": "bundle-v1",
+                "success_probability": 55.0,
+                "ml_score": 32,
+                "drift_status": "stable",
+                "inference_latency_ms": 9.0,
+                "range_status": "insufficient_empirical_context",
+                "entry_position_label": "unknown",
+                "eta_alignment_status": "unknown",
+            },
+        },
+    ]
+    request = _FakeRequest(
+        {"ws_manager": _FakeWSManager(opportunities)},
+        query={"lane": "execute_now", "search": "AA", "limit": "5", "offset": "0"},
+    )
+
+    response = asyncio.run(handle_ml_dashboard_list_api(request))
+    payload = json.loads(response.text)
+
+    assert payload["summary"]["total"] == 2
+    assert payload["pagination"] == {"limit": 5, "offset": 0, "returned": 1}
+    assert len(payload["data"]) == 1
+    item = payload["data"][0]
+    assert item["symbol"] == "AAA"
+    assert item["pair_key"] == "AAA|mexc|spot|gate|futures"
+    assert item["action_lane"] == "execute_now"
+    assert item["signal_reason_code"] == "execute_ready"
+    assert item["recommended_entry_range"] == "1.20% à 1.80%"
+    assert "mlContext" not in item
+
+
+def test_ml_dashboard_detail_endpoint_returns_full_enriched_row():
+    opportunities = [
+        {
+            "symbol": "AAA",
+            "buyFrom": "mexc",
+            "buyType": "spot",
+            "sellTo": "gate",
+            "sellType": "futures",
+            "mlScore": 66,
+            "mlContext": {
+                "signal_action": "EXECUTE",
+                "model_status": "ready",
+                "model_version": "bundle-v1",
+                "success_probability": 70.0,
+                "ml_score": 66,
+                "drift_status": "stable",
+                "inference_latency_ms": 12.0,
+                "range_status": "ready_short",
+                "entry_position_label": "inside_outer",
+                "eta_alignment_status": "aligned",
+            },
+        },
+    ]
+    request = _FakeRequest(
+        {"ws_manager": _FakeWSManager(opportunities)},
+        match_info={"pair_key": "AAA|mexc|spot|gate|futures"},
+    )
+
+    response = asyncio.run(handle_ml_dashboard_detail_api(request))
+    payload = json.loads(response.text)
+
+    assert payload["data"]["symbol"] == "AAA"
+    assert payload["data"]["action_lane"] == "execute_now"
+    assert payload["data"]["signal_reason_code"] == "execute_ready"
+
+
+def test_ml_dashboard_detail_endpoint_returns_404_for_unknown_pair():
+    request = _FakeRequest(
+        {"ws_manager": _FakeWSManager([])},
+        match_info={"pair_key": "missing|pair"},
+    )
+
+    response = asyncio.run(handle_ml_dashboard_detail_api(request))
+
+    assert response.status == 404
