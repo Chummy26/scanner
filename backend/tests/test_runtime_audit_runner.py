@@ -299,6 +299,36 @@ def test_summarize_dashboard_payload_detects_adjusting_and_mismatch_rows():
     assert summary["range_core_mismatch_count"] == 0
 
 
+def test_summarize_dashboard_payload_accepts_low_total_spread_runtime_block():
+    from src.spread.runtime_audit import summarize_dashboard_payload
+
+    payload = {
+        "data": [
+            {
+                "symbol": "LOW",
+                "action_lane": "blocked",
+                "signal_reason_code": "median_total_spread_below_threshold",
+                "operator_message": "Deslocamento total mediano abaixo do mínimo operacional.",
+                "mlContext": {
+                    "signal_action": "WAIT",
+                    "range_status": "insufficient_empirical_context",
+                    "entry_position_label": "unknown",
+                    "eta_alignment_status": "unknown",
+                    "recommended_entry_range": "--",
+                    "recommended_exit_range": "--",
+                    "median_total_spread": 0.06,
+                    "min_total_spread_threshold": 1.0,
+                },
+            }
+        ]
+    }
+
+    summary = summarize_dashboard_payload(payload)
+
+    assert summary["payload_count"] == 1
+    assert summary["reason_lane_message_mismatch_count"] == 0
+
+
 def test_finalize_runtime_audit_package_reports_context_coverage_and_signal_confirmations(tmp_path: Path):
     from src.spread.runtime_audit import RuntimeAuditCollector, finalize_runtime_audit_package
 

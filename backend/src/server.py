@@ -52,6 +52,7 @@ PROJECT_DIR = BACKEND_DIR.parent
 sys.path.insert(0, str(SRC_DIR))
 
 from system.auth import AuthManager
+from spread.perf_monitor import RuntimePerfMonitor
 
 # ---------------------------------------------------------------------------
 # ENV
@@ -475,43 +476,100 @@ async def handle_user_preferences(request):
 # REST Handlers: Spread Data
 # ---------------------------------------------------------------------------
 
+def _infer_payload_rows(payload) -> int:
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list):
+            return len(data)
+        summary = payload.get("summary")
+        if isinstance(summary, dict):
+            try:
+                return int(summary.get("total") or 0)
+            except (TypeError, ValueError):
+                return 0
+    if isinstance(payload, list):
+        return len(payload)
+    return 0
+
+
+def _response_payload_bytes(response: web.StreamResponse) -> int:
+    if isinstance(response, web.Response) and response.body is not None:
+        return len(response.body)
+    return 0
+
+
+def _mark_perf_started(request) -> None:
+    setattr(request, "_perf_started", time.perf_counter())
+
+
+def _record_route_perf(request, route_name: str, started_perf: float, response: web.StreamResponse, *, source: str = "", rows: int = 0):
+    perf_monitor: RuntimePerfMonitor | None = request.app.get("perf_monitor")
+    if perf_monitor is None:
+        return
+    perf_monitor.record_route(
+        route_name,
+        latency_ms=(time.perf_counter() - started_perf) * 1000.0,
+        status_code=int(getattr(response, "status", 200) or 200),
+        payload_bytes=_response_payload_bytes(response),
+        rows=int(rows),
+        source=source,
+        path=str(getattr(request, "path", "") or ""),
+    )
+
+
+def _json_response_with_perf(request, route_name: str, payload, *, source: str = "", status: int = 200, rows: int | None = None):
+    response = web.json_response(payload, status=status)
+    _record_route_perf(
+        request,
+        route_name,
+        getattr(request, "_perf_started", time.perf_counter()),
+        response,
+        source=source,
+        rows=_infer_payload_rows(payload) if rows is None else rows,
+    )
+    return response
+
 async def handle_spread_opportunities(request):
+    _mark_perf_started(request)
     ws_mgr = request.app.get("ws_manager")
     if not ws_mgr:
-        return web.json_response({"data": [], "status": "no_engine"})
-    return web.json_response({
+        return _json_response_with_perf(request, "scanner_legacy_list", {"data": [], "status": "no_engine"}, source="no_engine")
+    return _json_response_with_perf(request, "scanner_legacy_list", {
         "data": ws_mgr.get_current_opportunities(),
         "status": ws_mgr.get_status(),
-    })
+    }, source="full_rehydrate")
 
 
 async def handle_spread_opportunities_lite(request):
+    _mark_perf_started(request)
     ws_mgr = request.app.get("ws_manager")
     if not ws_mgr:
-        return web.json_response({"data": [], "summary": {"total": 0}, "status": "no_engine"})
-    return web.json_response({
+        return _json_response_with_perf(request, "scanner_lite_list", {"data": [], "summary": {"total": 0}, "status": "no_engine"}, source="no_engine")
+    return _json_response_with_perf(request, "scanner_lite_list", {
         "data": ws_mgr.get_current_opportunities_lite(),
         "summary": ws_mgr.get_current_opportunities_lite_summary(),
         "status": ws_mgr.get_status(),
-    })
+    }, source="cached_lite")
 
 
 async def handle_spread_opportunities_lite_summary(request):
+    _mark_perf_started(request)
     ws_mgr = request.app.get("ws_manager")
     if not ws_mgr:
-        return web.json_response({"summary": {"total": 0}})
-    return web.json_response({"summary": ws_mgr.get_current_opportunities_lite_summary()})
+        return _json_response_with_perf(request, "scanner_lite_summary", {"summary": {"total": 0}}, source="no_engine")
+    return _json_response_with_perf(request, "scanner_lite_summary", {"summary": ws_mgr.get_current_opportunities_lite_summary()}, source="cached_lite")
 
 
 async def handle_spread_opportunity_detail(request):
+    _mark_perf_started(request)
     ws_mgr = request.app.get("ws_manager")
     if not ws_mgr:
-        return web.json_response({"error": "no_engine"}, status=503)
+        return _json_response_with_perf(request, "scanner_detail", {"error": "no_engine"}, status=503, source="no_engine", rows=0)
     pair_key = str(request.match_info.get("pair_key") or "").strip()
     detail = ws_mgr.get_scanner_opportunity_detail(pair_key)
     if not detail:
-        return web.json_response({"error": "not_found"}, status=404)
-    return web.json_response({"data": detail})
+        return _json_response_with_perf(request, "scanner_detail", {"error": "not_found"}, status=404, source="detail_full", rows=0)
+    return _json_response_with_perf(request, "scanner_detail", {"data": detail}, source="detail_full", rows=1)
 
 
 async def handle_spread_status(request):
@@ -723,6 +781,19 @@ async def handle_debug_logs(request):
     return web.json_response({"logs": logs})
 
 
+async def handle_debug_perf(request):
+    _mark_perf_started(request)
+    perf_monitor: RuntimePerfMonitor | None = request.app.get("perf_monitor")
+    ws_mgr = request.app.get("ws_manager")
+    payload = {
+        "perf": perf_monitor.snapshot() if perf_monitor is not None else {},
+        "runtime": ws_mgr.get_perf_state() if ws_mgr and hasattr(ws_mgr, "get_perf_state") else {},
+        "runtime_audit_enabled": bool(request.app.get("runtime_audit")),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return _json_response_with_perf(request, "debug_perf", payload, source="perf_monitor")
+
+
 async def handle_spread_history(request):
     ws_mgr = request.app.get("ws_manager")
     symbol = (request.match_info.get("symbol", "") or "").upper()
@@ -765,6 +836,9 @@ async def handle_spread_history(request):
 
 
 def _dashboard_model_status(opp: dict) -> str:
+    flat = opp.get("modelStatus")
+    if flat is not None:
+        return str(flat or "missing_ml_context")
     ml_context = opp.get("mlContext")
     if not isinstance(ml_context, dict):
         return "missing_ml_context"
@@ -772,6 +846,9 @@ def _dashboard_model_status(opp: dict) -> str:
 
 
 def _dashboard_signal_action(opp: dict) -> str:
+    flat = opp.get("signalAction")
+    if flat is not None:
+        return str(flat or "NONE")
     ml_context = opp.get("mlContext")
     if not isinstance(ml_context, dict):
         return "NONE"
@@ -779,6 +856,11 @@ def _dashboard_signal_action(opp: dict) -> str:
 
 
 def _dashboard_success_probability(opp: dict) -> float:
+    if opp.get("successProbability") is not None:
+        try:
+            return float(opp.get("successProbability") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
     ml_context = opp.get("mlContext")
     if isinstance(ml_context, dict):
         try:
@@ -789,6 +871,11 @@ def _dashboard_success_probability(opp: dict) -> float:
 
 
 def _dashboard_ml_score(opp: dict) -> float:
+    if opp.get("mlScore") is not None:
+        try:
+            return float(opp.get("mlScore") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
     ml_context = opp.get("mlContext")
     if isinstance(ml_context, dict):
         try:
@@ -802,6 +889,11 @@ def _dashboard_ml_score(opp: dict) -> float:
 
 
 def _dashboard_inference_latency_ms(opp: dict) -> float:
+    if opp.get("inferenceLatencyMs") is not None:
+        try:
+            return float(opp.get("inferenceLatencyMs") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
     ml_context = opp.get("mlContext")
     if not isinstance(ml_context, dict):
         return 0.0
@@ -812,6 +904,9 @@ def _dashboard_inference_latency_ms(opp: dict) -> float:
 
 
 def _dashboard_model_version_value(opp: dict) -> str:
+    flat = opp.get("modelVersion")
+    if flat is not None:
+        return str(flat or "unavailable")
     ml_context = opp.get("mlContext")
     if not isinstance(ml_context, dict):
         return "unavailable"
@@ -819,6 +914,9 @@ def _dashboard_model_version_value(opp: dict) -> str:
 
 
 def _dashboard_drift_status(opp: dict) -> str:
+    flat = opp.get("driftStatus")
+    if flat is not None:
+        return str(flat or "unknown")
     ml_context = opp.get("mlContext")
     if not isinstance(ml_context, dict):
         return "unknown"
@@ -826,6 +924,9 @@ def _dashboard_drift_status(opp: dict) -> str:
 
 
 def _dashboard_context_strength(opp: dict) -> str:
+    flat = opp.get("contextStrength")
+    if flat is not None:
+        return str(flat or "unknown")
     ml_context = opp.get("mlContext")
     if not isinstance(ml_context, dict):
         return "unknown"
@@ -833,6 +934,9 @@ def _dashboard_context_strength(opp: dict) -> str:
 
 
 def _dashboard_range_status(opp: dict) -> str:
+    flat = opp.get("rangeStatus")
+    if flat is not None:
+        return str(flat or "unknown")
     ml_context = opp.get("mlContext")
     if not isinstance(ml_context, dict):
         return "unknown"
@@ -840,6 +944,9 @@ def _dashboard_range_status(opp: dict) -> str:
 
 
 def _dashboard_entry_position_label(opp: dict) -> str:
+    flat = opp.get("entryPositionLabel")
+    if flat is not None:
+        return str(flat or "unknown")
     ml_context = opp.get("mlContext")
     if not isinstance(ml_context, dict):
         return "unknown"
@@ -847,13 +954,42 @@ def _dashboard_entry_position_label(opp: dict) -> str:
 
 
 def _dashboard_eta_alignment_status(opp: dict) -> str:
+    flat = opp.get("etaAlignmentStatus")
+    if flat is not None:
+        return str(flat or "unknown")
     ml_context = opp.get("mlContext")
     if not isinstance(ml_context, dict):
         return "unknown"
     return str(ml_context.get("eta_alignment_status") or "unknown")
 
 
+def _dashboard_runtime_signal_reason_code(opp: dict) -> str:
+    flat = opp.get("signalReasonCode")
+    if flat:
+        return str(flat)
+    ml_context = opp.get("mlContext")
+    if isinstance(ml_context, dict) and ml_context.get("signal_reason_code"):
+        return str(ml_context.get("signal_reason_code"))
+    return ""
+
+
+def _dashboard_runtime_signal_reason_message(opp: dict) -> str:
+    flat = opp.get("operatorMessage") or opp.get("signalReason")
+    if flat:
+        return str(flat)
+    ml_context = opp.get("mlContext")
+    if isinstance(ml_context, dict):
+        for key in ("operator_message", "signal_reason"):
+            value = ml_context.get(key)
+            if value:
+                return str(value)
+    return ""
+
+
 def _dashboard_signal_reason_code(opp: dict) -> str:
+    runtime_reason = _dashboard_runtime_signal_reason_code(opp)
+    if runtime_reason:
+        return runtime_reason
     status = _dashboard_model_status(opp)
     if status != "ready":
         return status
@@ -915,6 +1051,9 @@ def _dashboard_risk_flags(opp: dict) -> list[str]:
 
 
 def _dashboard_operator_message(opp: dict) -> str:
+    runtime_message = _dashboard_runtime_signal_reason_message(opp)
+    if runtime_message:
+        return runtime_message
     status = _dashboard_model_status(opp)
     if status == "insufficient_history":
         return "Aguardar mais histórico estruturado antes de considerar ação."
@@ -1003,6 +1142,15 @@ def _dashboard_pair_key(opp: dict) -> str:
 
 def _dashboard_list_item(opp: dict) -> dict:
     ml_context = opp.get("mlContext") if isinstance(opp.get("mlContext"), dict) else {}
+    display_eta = opp.get("displayEtaSeconds")
+    if display_eta is None:
+        display_eta = ml_context.get("display_eta_seconds")
+    recommended_entry = opp.get("recommendedEntryRange")
+    if recommended_entry is None:
+        recommended_entry = ml_context.get("recommended_entry_range") or "--"
+    recommended_exit = opp.get("recommendedExitRange")
+    if recommended_exit is None:
+        recommended_exit = ml_context.get("recommended_exit_range") or "--"
     return {
         "pair_key": _dashboard_pair_key(opp),
         "symbol": str(opp.get("symbol") or opp.get("current") or opp.get("code") or ""),
@@ -1025,9 +1173,9 @@ def _dashboard_list_item(opp: dict) -> dict:
         "context_strength": _dashboard_context_strength(opp),
         "entry_position_label": _dashboard_entry_position_label(opp),
         "eta_alignment_status": _dashboard_eta_alignment_status(opp),
-        "display_eta_seconds": ml_context.get("display_eta_seconds"),
-        "recommended_entry_range": ml_context.get("recommended_entry_range") or "--",
-        "recommended_exit_range": ml_context.get("recommended_exit_range") or "--",
+        "display_eta_seconds": display_eta,
+        "recommended_entry_range": recommended_entry,
+        "recommended_exit_range": recommended_exit,
     }
 
 
@@ -1101,8 +1249,13 @@ def _dashboard_summary(opps_sorted: list[dict]) -> dict:
     }
 
 
-def _dashboard_all_enriched_opportunities(ws_mgr) -> list[dict]:
-    opps = ws_mgr.get_current_opportunities()
+def _dashboard_all_enriched_opportunities(ws_mgr) -> tuple[list[dict], str]:
+    source = "full_rehydrate"
+    if hasattr(ws_mgr, "get_current_opportunities_lite"):
+        opps = ws_mgr.get_current_opportunities_lite()
+        source = "cached_lite"
+    else:
+        opps = ws_mgr.get_current_opportunities()
     enriched_opps = [_dashboard_enrich_opportunity(opp) for opp in opps]
     return sorted(
         enriched_opps,
@@ -1113,34 +1266,37 @@ def _dashboard_all_enriched_opportunities(ws_mgr) -> list[dict]:
             -_dashboard_ml_score(opp),
             str(opp.get("symbol") or ""),
         ),
-    )
+    ), source
 
 
 async def handle_ml_dashboard_api(request):
+    _mark_perf_started(request)
     ws_mgr = request.app.get("ws_manager")
     if not ws_mgr:
-        return web.json_response({"data": [], "summary": _dashboard_summary([])})
+        return _json_response_with_perf(request, "ml_dashboard_legacy", {"data": [], "summary": _dashboard_summary([])}, source="no_engine")
 
-    opps_sorted = _dashboard_all_enriched_opportunities(ws_mgr)
-    return web.json_response({"data": opps_sorted, "summary": _dashboard_summary(opps_sorted)})
+    opps_sorted, source = _dashboard_all_enriched_opportunities(ws_mgr)
+    return _json_response_with_perf(request, "ml_dashboard_legacy", {"data": opps_sorted, "summary": _dashboard_summary(opps_sorted)}, source=source)
 
 
 async def handle_ml_dashboard_summary_api(request):
+    _mark_perf_started(request)
     ws_mgr = request.app.get("ws_manager")
     if not ws_mgr:
-        return web.json_response({"summary": _dashboard_summary([])})
-    opps_sorted = _dashboard_all_enriched_opportunities(ws_mgr)
-    return web.json_response({"summary": _dashboard_summary(opps_sorted)})
+        return _json_response_with_perf(request, "ml_dashboard_summary", {"summary": _dashboard_summary([])}, source="no_engine")
+    opps_sorted, source = _dashboard_all_enriched_opportunities(ws_mgr)
+    return _json_response_with_perf(request, "ml_dashboard_summary", {"summary": _dashboard_summary(opps_sorted)}, source=source)
 
 
 async def handle_ml_dashboard_list_api(request):
+    _mark_perf_started(request)
     ws_mgr = request.app.get("ws_manager")
     if not ws_mgr:
-        return web.json_response({
+        return _json_response_with_perf(request, "ml_dashboard_list", {
             "data": [],
             "summary": _dashboard_summary([]),
             "pagination": {"limit": 0, "offset": 0, "returned": 0},
-        })
+        }, source="no_engine")
 
     lane = str(request.query.get("lane") or "").strip().lower()
     search = str(request.query.get("search") or "").strip().lower()
@@ -1153,7 +1309,7 @@ async def handle_ml_dashboard_list_api(request):
     except (TypeError, ValueError):
         offset = 0
 
-    opps_sorted = _dashboard_all_enriched_opportunities(ws_mgr)
+    opps_sorted, source = _dashboard_all_enriched_opportunities(ws_mgr)
     filtered = []
     for opp in opps_sorted:
         if lane and str(opp.get("action_lane") or "").lower() != lane:
@@ -1164,22 +1320,30 @@ async def handle_ml_dashboard_list_api(request):
             continue
         filtered.append(opp)
     sliced = filtered[offset: offset + limit]
-    return web.json_response({
+    return _json_response_with_perf(request, "ml_dashboard_list", {
         "data": [_dashboard_list_item(opp) for opp in sliced],
         "summary": _dashboard_summary(opps_sorted),
         "pagination": {"limit": limit, "offset": offset, "returned": len(sliced)},
-    })
+    }, source=source, rows=len(sliced))
 
 
 async def handle_ml_dashboard_detail_api(request):
+    _mark_perf_started(request)
     ws_mgr = request.app.get("ws_manager")
     if not ws_mgr:
-        return web.json_response({"error": "no_engine"}, status=503)
+        return _json_response_with_perf(request, "ml_dashboard_detail", {"error": "no_engine"}, status=503, source="no_engine", rows=0)
     pair_key = str(request.match_info.get("pair_key") or "").strip()
-    for opp in _dashboard_all_enriched_opportunities(ws_mgr):
+    detail = None
+    if hasattr(ws_mgr, "get_scanner_opportunity_detail"):
+        detail = ws_mgr.get_scanner_opportunity_detail(pair_key)
+    if detail:
+        enriched = _dashboard_enrich_opportunity(detail)
+        return _json_response_with_perf(request, "ml_dashboard_detail", {"data": enriched}, source="detail_full", rows=1)
+    opps_sorted, source = _dashboard_all_enriched_opportunities(ws_mgr)
+    for opp in opps_sorted:
         if _dashboard_pair_key(opp) == pair_key:
-            return web.json_response({"data": opp})
-    return web.json_response({"error": "not_found"}, status=404)
+            return _json_response_with_perf(request, "ml_dashboard_detail", {"data": opp}, source=source, rows=1)
+    return _json_response_with_perf(request, "ml_dashboard_detail", {"error": "not_found"}, status=404, source=source, rows=0)
 
 async def handle_ml_dashboard_page(request):
     path = SRC_DIR / "web" / "dashboard.html"
@@ -2379,6 +2543,29 @@ async def handle_spa(request):
     return web.Response(text="Frontend not found. Check 'novo frontend/frontend 2/' directory.", status=404)
 
 
+async def _event_loop_lag_probe(app: web.Application):
+    perf_monitor: RuntimePerfMonitor | None = app.get("perf_monitor")
+    interval_sec = 0.1
+    loop = asyncio.get_running_loop()
+    expected = loop.time() + interval_sec
+    while True:
+        await asyncio.sleep(interval_sec)
+        now = loop.time()
+        lag_ms = max((now - expected) * 1000.0, 0.0)
+        if perf_monitor is not None:
+            perf_monitor.record_event_loop_lag(lag_ms)
+        expected = now + interval_sec
+
+
+async def _perf_snapshot_probe(app: web.Application):
+    perf_monitor: RuntimePerfMonitor | None = app.get("perf_monitor")
+    while True:
+        await asyncio.sleep(30)
+        ws_mgr = app.get("ws_manager")
+        if perf_monitor is not None and ws_mgr and hasattr(ws_mgr, "get_perf_state"):
+            perf_monitor.record_cache_state(ws_mgr.get_perf_state())
+
+
 # ---------------------------------------------------------------------------
 # Startup / Shutdown
 # ---------------------------------------------------------------------------
@@ -2414,6 +2601,8 @@ async def on_startup(app):
             logger.warning(f"Invalid TEAM_OP_* tuning env vars: {e}")
 
         ws_mgr = WSManager(config)
+        perf_monitor: RuntimePerfMonitor = app["perf_monitor"]
+        ws_mgr.set_perf_monitor(perf_monitor)
         runtime_audit_dir = os.environ.get("TEAM_OP_RUNTIME_AUDIT_DIR", "").strip()
         if runtime_audit_dir:
             collector = RuntimeAuditCollector(
@@ -2428,6 +2617,10 @@ async def on_startup(app):
             app["runtime_audit"] = None
         app["ws_manager"] = ws_mgr
         await ws_mgr.start()
+        app["perf_tasks"] = [
+            asyncio.create_task(_event_loop_lag_probe(app), name="event_loop_lag_probe"),
+            asyncio.create_task(_perf_snapshot_probe(app), name="perf_snapshot_probe"),
+        ]
         logger.info(f"Spread engine started: {len(config.symbols)} symbols, "
                      f"{len(config.exchanges)} exchanges")
     except Exception as e:
@@ -2437,6 +2630,12 @@ async def on_startup(app):
 
 
 async def on_shutdown(app):
+    perf_tasks = list(app.get("perf_tasks", []))
+    for task in perf_tasks:
+        task.cancel()
+    if perf_tasks:
+        await asyncio.gather(*perf_tasks, return_exceptions=True)
+
     ws_mgr = app.get("ws_manager")
     if ws_mgr:
         await ws_mgr.stop()
@@ -2511,6 +2710,8 @@ def create_app() -> web.Application:
     app = web.Application(middlewares=[cors_middleware, gzip_middleware, cache_middleware])
     app["scanner_websockets"] = set()
     app["ml_training_tasks"] = {}
+    app["perf_monitor"] = RuntimePerfMonitor()
+    app["perf_tasks"] = []
 
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
@@ -2557,6 +2758,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/spread/debug/books", handle_debug_books)
     app.router.add_get("/api/spread/debug/status", handle_debug_status)
     app.router.add_get("/api/spread/debug/logs", handle_debug_logs)
+    app.router.add_get("/api/debug/perf", handle_debug_perf)
     app.router.add_get("/api/spread/history/{symbol}", handle_spread_history)
 
     # ---- Export API (for ArbML / ML consumers) ----

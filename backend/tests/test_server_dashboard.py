@@ -3,26 +3,48 @@ import json
 from types import SimpleNamespace
 
 from src.server import (
+    handle_debug_perf,
     handle_ml_dashboard_api,
     handle_ml_dashboard_detail_api,
     handle_ml_dashboard_list_api,
     handle_ml_dashboard_summary_api,
 )
+from src.spread.perf_monitor import RuntimePerfMonitor
 
 
 class _FakeRequest:
-    def __init__(self, app: dict, *, query=None, match_info=None):
+    def __init__(self, app: dict, *, query=None, match_info=None, path="/test"):
         self.app = app
         self.query = query or {}
         self.match_info = match_info or {}
+        self.path = path
 
 
 class _FakeWSManager:
-    def __init__(self, opportunities):
+    def __init__(self, opportunities, *, lite_rows=None):
         self._opportunities = opportunities
+        self._lite_rows = lite_rows if lite_rows is not None else opportunities
 
     def get_current_opportunities(self):
         return list(self._opportunities)
+
+    def get_current_opportunities_lite(self):
+        return list(self._lite_rows)
+
+    def get_scanner_opportunity_detail(self, pair_key):
+        for row in self._opportunities:
+            symbol = row.get("symbol")
+            buy_from = row.get("buyFrom")
+            buy_type = row.get("buyType")
+            sell_to = row.get("sellTo")
+            sell_type = row.get("sellType")
+            current_key = f"{symbol}|{buy_from}|{buy_type}|{sell_to}|{sell_type}"
+            if current_key == pair_key:
+                return dict(row)
+        return None
+
+    def get_perf_state(self):
+        return {"ml_cache_size": 3, "scanner_lite_rows": len(self._lite_rows)}
 
 
 def test_ml_dashboard_api_sorts_ready_rows_by_probability_and_returns_summary():
@@ -360,3 +382,99 @@ def test_ml_dashboard_detail_endpoint_returns_404_for_unknown_pair():
     response = asyncio.run(handle_ml_dashboard_detail_api(request))
 
     assert response.status == 404
+
+
+def test_ml_dashboard_summary_prefers_cached_lite_rows_and_records_perf_source():
+    perf_monitor = RuntimePerfMonitor()
+    lite_rows = [
+        {
+            "symbol": "AAA",
+            "buyFrom": "mexc",
+            "buyType": "spot",
+            "sellTo": "gate",
+            "sellType": "futures",
+            "signalAction": "EXECUTE",
+            "modelStatus": "ready",
+            "modelVersion": "bundle-v1",
+            "successProbability": 73.0,
+            "mlScore": 61,
+            "driftStatus": "stable",
+            "inferenceLatencyMs": 11.0,
+            "rangeStatus": "ready_short",
+            "entryPositionLabel": "inside_outer",
+            "etaAlignmentStatus": "aligned",
+        }
+    ]
+    request = _FakeRequest(
+        {"ws_manager": _FakeWSManager([], lite_rows=lite_rows), "perf_monitor": perf_monitor},
+        path="/api/v1/ml/dashboard/summary",
+    )
+
+    response = asyncio.run(handle_ml_dashboard_summary_api(request))
+    payload = json.loads(response.text)
+    perf_snapshot = perf_monitor.snapshot()
+
+    assert payload["summary"]["total"] == 1
+    assert perf_snapshot["routes"]["ml_dashboard_summary"]["source_counts"]["cached_lite"] == 1
+
+
+def test_debug_perf_endpoint_returns_perf_snapshot_and_runtime_state():
+    perf_monitor = RuntimePerfMonitor()
+    perf_monitor.record_route(
+        "scanner_lite_list",
+        latency_ms=12.5,
+        status_code=200,
+        payload_bytes=1234,
+        rows=7,
+        source="cached_lite",
+        path="/api/spread/opportunities-lite",
+    )
+    request = _FakeRequest(
+        {"perf_monitor": perf_monitor, "ws_manager": _FakeWSManager([])},
+        path="/api/debug/perf",
+    )
+
+    response = asyncio.run(handle_debug_perf(request))
+    payload = json.loads(response.text)
+
+    assert "perf" in payload
+    assert "runtime" in payload
+    assert payload["runtime"]["scanner_lite_rows"] == 0
+    assert payload["perf"]["routes"]["scanner_lite_list"]["source_counts"]["cached_lite"] == 1
+
+
+def test_ml_dashboard_prefers_runtime_signal_reason_code_for_low_total_spread_blocks():
+    opportunities = [
+        {
+            "symbol": "AAA",
+            "buyFrom": "mexc",
+            "buyType": "spot",
+            "sellTo": "gate",
+            "sellType": "futures",
+            "mlScore": 81,
+            "mlContext": {
+                "signal_action": "WAIT",
+                "signal_reason_code": "median_total_spread_below_threshold",
+                "signal_reason": "Deslocamento total mediano abaixo do mínimo operacional.",
+                "model_status": "ready",
+                "model_version": "bundle-v1",
+                "success_probability": 81.0,
+                "ml_score": 81,
+                "drift_status": "stable",
+                "inference_latency_ms": 10.0,
+                "range_status": "insufficient_empirical_context",
+                "entry_position_label": "unknown",
+                "eta_alignment_status": "unknown",
+                "median_total_spread": 0.06,
+                "min_total_spread_threshold": 1.0,
+            },
+        }
+    ]
+    request = _FakeRequest({"ws_manager": _FakeWSManager(opportunities)})
+
+    response = asyncio.run(handle_ml_dashboard_api(request))
+    payload = json.loads(response.text)
+
+    assert payload["data"][0]["signal_reason_code"] == "median_total_spread_below_threshold"
+    assert payload["data"][0]["action_lane"] == "blocked"
+    assert "mínimo operacional" in payload["data"][0]["operator_message"]

@@ -54,6 +54,7 @@ class WSManager:
         self.ml_analyzer = SpreadMLAnalyzer(sequence_length=15)
         self.ml_analyzer.attach_tracker(self.tracker)
         self.runtime_audit = None
+        self.perf_monitor = None
         self._ml_cache: OrderedDict = OrderedDict()
         self._ML_CACHE_MAX = 2000
         self._exchange_instances: Dict[str, BaseExchangeWS] = {}
@@ -147,6 +148,12 @@ class WSManager:
         self.runtime_audit = collector
         self.tracker.audit_collector = collector
         return collector
+
+    def set_perf_monitor(self, monitor):
+        self.perf_monitor = monitor
+        if hasattr(self.engine, "set_perf_monitor"):
+            self.engine.set_perf_monitor(monitor)
+        return monitor
 
     async def start(self):
         """Start all exchange connections and the calculation broadcast loop."""
@@ -381,6 +388,36 @@ class WSManager:
             self.runtime_audit.finalize()
         logger.info("[WSManager] Stopped (tracker state flushed)")
 
+    def get_perf_state(self) -> Dict[str, Any]:
+        tracker_stats = {}
+        process_rss_mb = 0.0
+        process_threads = 0
+        try:
+            tracker_stats = self.tracker.get_storage_stats()
+        except Exception:
+            tracker_stats = {}
+        try:
+            import psutil
+
+            proc = psutil.Process(os.getpid())
+            process_rss_mb = round(proc.memory_info().rss / (1024 * 1024), 3)
+            process_threads = int(proc.num_threads())
+        except Exception:
+            pass
+        return {
+            "ml_cache_size": len(self._ml_cache),
+            "scanner_clients": len(self._scanner_clients),
+            "scanner_lite_clients": len(self._scanner_lite_clients),
+            "opportunities_cached": len(self._last_filtered_opps),
+            "scanner_lite_rows": len(self._last_scanner_lite_rows),
+            "tracker_pairs": int(tracker_stats.get("pairs_tracked", 0) or 0),
+            "tracker_records_total": int(tracker_stats.get("records_total", 0) or 0),
+            "tracker_episodes_total": int(tracker_stats.get("episodes_total", 0) or 0),
+            "tracker_db_size_bytes": int(tracker_stats.get("db_size_bytes", 0) or 0),
+            "process_rss_mb": process_rss_mb,
+            "process_threads": process_threads,
+        }
+
     async def _market_data_loop(self):
         """Periodically fetch volume and funding rate data from REST APIs."""
         # Initial delay to let WS connections establish
@@ -460,6 +497,7 @@ class WSManager:
         _t0 = time.time()
 
         # --- 1. Spread calculation ----------------------------------------
+        _perf_started = time.perf_counter()
         _records_batch = []
         if on_spread_cb:
             record_started_at_by_key = {}
@@ -474,10 +512,12 @@ class WSManager:
 
         opportunities = self.engine.calculate_all(on_spread=calc_cb)
         _t_calc = time.time()
+        _perf_after_calc = time.perf_counter()
 
         # Batch-record all tracker data in one lock acquisition.
         if _records_batch:
             self.tracker.batch_record(_records_batch)
+        _perf_after_batch_record = time.perf_counter()
 
         now_ts = time.time()
 
@@ -521,6 +561,7 @@ class WSManager:
                     opp.next_settlement_sell = meta.get("next_settlement")
                     opp.open_interest_sell = meta.get("open_interest")
                     opp.position_limit_sell = meta.get("position_limit")
+        _perf_after_market_enrich = time.perf_counter()
 
         # --- 3. Tracker enrichment (batched + cached) ---------------------
         self._enrich_tracker_cycle = getattr(self, '_enrich_tracker_cycle', 0) + 1
@@ -539,7 +580,10 @@ class WSManager:
             ]
             tracker_cache = self.tracker.batch_enrich(keys, now_ts)
             self._tracker_enrich_cache = tracker_cache
+        _perf_after_tracker_enrich = time.perf_counter()
 
+        _history_fetch_ms = 0.0
+        _ml_analyze_ms = 0.0
         if tracker_cache:
             pair_key = self.tracker._pair_key
             for opp in opportunities:
@@ -557,12 +601,16 @@ class WSManager:
                 # Only perform ML analysis if we need to refresh (every ~4s) or if uncached.
                 if key not in self._ml_cache or refresh_tracker:
                     # Fetch decimation history
+                    _history_started = time.perf_counter()
                     history = self.tracker.get_history(
                         opp.asset, opp.buy_exchange, opp.buy_market_type,
                         opp.sell_exchange, opp.sell_market_type, limit=100
                     )
+                    _history_fetch_ms += (time.perf_counter() - _history_started) * 1000.0
                     if history and len(history) >= 5:
+                        _ml_started = time.perf_counter()
                         ml_ctx = self.ml_analyzer.analyze_pair(opp.entry_spread_pct, history, pair_key=key)
+                        _ml_analyze_ms += (time.perf_counter() - _ml_started) * 1000.0
                         if ml_ctx:
                             self._ml_cache[key] = ml_ctx
                             self._ml_cache.move_to_end(key)
@@ -603,8 +651,10 @@ class WSManager:
                 if _vol_ok(getattr(opp, "_raw_buy_vol", -1.0))
                 and _vol_ok(getattr(opp, "_raw_sell_vol", -1.0))
             ]
+        _perf_after_filter = time.perf_counter()
 
         self._refresh_scanner_lite_state(opportunities)
+        _perf_after_lite_refresh = time.perf_counter()
 
         _t_end = time.time()
         # All timing measured inside thread (no event-loop scheduling noise).
@@ -613,6 +663,25 @@ class WSManager:
             int((_t_end - _t_calc) * 1000),     # enrich_ms
             int((_t_end - _t0) * 1000),         # thread_total_ms
         )
+        if self.perf_monitor is not None:
+            self.perf_monitor.record_scanner_cycle(
+                {
+                    "total_ms": round((_perf_after_lite_refresh - _perf_started) * 1000.0, 6),
+                    "calculate_ms": round((_perf_after_calc - _perf_started) * 1000.0, 6),
+                    "batch_record_ms": round((_perf_after_batch_record - _perf_after_calc) * 1000.0, 6),
+                    "market_enrich_ms": round((_perf_after_market_enrich - _perf_after_batch_record) * 1000.0, 6),
+                    "tracker_enrich_ms": round((_perf_after_tracker_enrich - _perf_after_market_enrich) * 1000.0, 6),
+                    "history_fetch_ms": round(_history_fetch_ms, 6),
+                    "ml_analyze_ms": round(_ml_analyze_ms, 6),
+                    "filter_ms": round((_perf_after_filter - _perf_after_tracker_enrich) * 1000.0, 6),
+                    "lite_refresh_ms": round((_perf_after_lite_refresh - _perf_after_filter) * 1000.0, 6),
+                    "opportunities_before_filter": len(self.engine._opportunities),
+                    "opportunities_after_filter": len(opportunities),
+                    "refresh_tracker": bool(refresh_tracker),
+                    "tracker_cache_size": len(tracker_cache or {}),
+                    "ml_cache_size": len(self._ml_cache),
+                }
+            )
         return opportunities
 
     async def _calc_and_broadcast_loop(self):
@@ -779,6 +848,18 @@ class WSManager:
                 f"payload={len(payload)//1024}KB clients={len(clients)}"
             )
         disconnected = [ws for ws in results if ws is not None]
+        if self.perf_monitor is not None:
+            self.perf_monitor.record_broadcast(
+                "scanner_full",
+                {
+                    "dict_ms": round((_t1 - _t0) * 1000.0, 6),
+                    "json_ms": round((_t2 - _t1) * 1000.0, 6),
+                    "send_ms": round((_t3 - _t2) * 1000.0, 6),
+                    "total_ms": round((_t3 - _t0) * 1000.0, 6),
+                    "payload_bytes": len(payload.encode("utf-8")),
+                    "client_count": len(clients),
+                },
+            )
 
         if disconnected:
             with self._lock:
@@ -821,7 +902,9 @@ class WSManager:
             return
 
         payload_obj = delta if delta.get("upserts") or delta.get("removes") else {"type": "ping"}
+        _t0 = time.perf_counter()
         payload = json.dumps(payload_obj)
+        _t1 = time.perf_counter()
 
         async def _send(ws):
             try:
@@ -832,7 +915,21 @@ class WSManager:
                 return ws
 
         results = await asyncio.gather(*[_send(ws) for ws in clients])
+        _t2 = time.perf_counter()
         disconnected = [ws for ws in results if ws is not None]
+        if self.perf_monitor is not None:
+            self.perf_monitor.record_broadcast(
+                "scanner_lite",
+                {
+                    "json_ms": round((_t1 - _t0) * 1000.0, 6),
+                    "send_ms": round((_t2 - _t1) * 1000.0, 6),
+                    "total_ms": round((_t2 - _t0) * 1000.0, 6),
+                    "payload_bytes": len(payload.encode("utf-8")),
+                    "client_count": len(clients),
+                    "upsert_count": int(delta.get("count") or 0),
+                    "remove_count": int(delta.get("remove_count") or 0),
+                },
+            )
         if disconnected:
             with self._lock:
                 for ws in disconnected:
@@ -855,6 +952,13 @@ class WSManager:
                 started = time.perf_counter()
                 self.tracker.flush_to_storage()
                 logger.debug("[WSManager] Tracker SQLite flushed")
+                if self.perf_monitor is not None:
+                    self.perf_monitor.record_cache_state(
+                        {
+                            **self.get_perf_state(),
+                            "tracker_persist_ms": round((time.perf_counter() - started) * 1000.0, 6),
+                        }
+                    )
                 if self.runtime_audit is not None:
                     tracker_stats = self.tracker.get_storage_stats()
                     self.runtime_audit.event(
@@ -891,6 +995,8 @@ class WSManager:
                 exchange_statuses = self._runtime_audit_exchange_statuses()
                 self.runtime_audit.record_exchange_status(exchange_statuses)
                 if sample_index % 12 == 0:
+                    if self.perf_monitor is not None:
+                        self.perf_monitor.record_cache_state(self.get_perf_state())
                     self.runtime_audit.sample_system(
                         pid=os.getpid(),
                         db_path=self._tracker_db_path,

@@ -334,3 +334,52 @@ def test_analyzer_blocks_strong_execute_when_eta_is_divergent(tmp_path: Path):
     assert result["range_status"] == "ready_short"
     assert result["eta_alignment_status"] == "divergent"
     assert result["signal_action"] == "EXECUTE"
+
+
+def test_analyzer_waits_when_median_total_spread_is_below_operational_floor(tmp_path: Path):
+    from src.spread.spread_tracker import SpreadTracker
+
+    db_path = tmp_path / "tracker.sqlite"
+    tracker = SpreadTracker(
+        window_sec=24 * 60 * 60,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=db_path,
+        gap_threshold_sec=120.0,
+        min_total_spread_pct=1.0,
+    )
+    pair = ("LTC", "mexc", "spot", "gate", "futures")
+    cycle = [
+        (0.10, -0.20),
+        (0.11, -0.19),
+        (0.09, -0.18),
+        (0.23, -0.18),
+        (0.11, -0.17),
+        (-0.10, 0.15),
+    ]
+    ts = 0.0
+    for _ in range(3):
+        for entry_spread, exit_spread in cycle:
+            tracker.record_spread(*pair, entry_spread, exit_spread, now_ts=ts)
+            ts += 15.0
+    tracker.flush_to_storage(now_ts=ts, force=True)
+    tracker.close_active_session(ended_at=ts)
+
+    _save_ready_artifact(tmp_path, sequence_length=12, execute_threshold=0.45, strong_threshold=0.85)
+    analyzer = SpreadMLAnalyzer(sequence_length=12, artifact_dir=tmp_path, min_total_spread_pct=1.0)
+    analyzer.attach_tracker(tracker)
+
+    result = analyzer.analyze_pair(
+        0.23,
+        tracker.get_history(*pair, limit=100),
+        pair_key=pair,
+    )
+
+    assert result is not None
+    assert result["signal_action"] == "WAIT"
+    assert result["signal_reason_code"] == "median_total_spread_below_threshold"
+    assert result["median_total_spread"] < result["min_total_spread_threshold"]
+    assert result["raw_empirical_support_short"] >= 2

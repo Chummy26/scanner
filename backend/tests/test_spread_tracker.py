@@ -233,6 +233,49 @@ def test_tracker_extracts_adaptive_episodes_and_recurring_context_for_positive_r
     assert context["entry_position_label"] in {"inside_outer", "inside_core"}
 
 
+def test_tracker_exposes_total_spread_and_filters_low_value_episodes_from_qualified_context(tmp_path: Path):
+    db_path = tmp_path / "tracker_history.sqlite"
+    tracker = SpreadTracker(
+        window_sec=24 * 60 * 60,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=db_path,
+        gap_threshold_sec=120.0,
+        min_total_spread_pct=1.0,
+    )
+
+    pair = ("LTC", "mexc", "spot", "gate", "futures")
+    cycle = [
+        (0.10, -0.20),
+        (0.11, -0.19),
+        (0.09, -0.18),
+        (0.23, -0.18),
+        (0.11, -0.17),
+        (-0.10, 0.15),
+    ]
+    ts = 0.0
+    for _ in range(3):
+        for entry_spread, exit_spread in cycle:
+            tracker.record_spread(*pair, entry_spread, exit_spread, now_ts=ts)
+            ts += 15.0
+    assert tracker.flush_to_storage(now_ts=ts, force=True)
+    tracker.close_active_session(ended_at=ts)
+
+    episodes = tracker.get_pair_episodes(*pair, limit=10)
+    context = tracker.get_pair_recurring_context(*pair, current_entry=0.23, now_ts=ts)
+
+    assert len(episodes) >= 3
+    assert all("total_spread" in episode for episode in episodes)
+    assert all(float(episode["total_spread"]) < 1.0 for episode in episodes)
+    assert context["raw_empirical_support_short"] >= 2
+    assert context["empirical_support_short"] == 0
+    assert context["median_total_spread"] < 1.0
+    assert context["range_status"] == "insufficient_empirical_context"
+
+
 def test_tracker_rebuilds_episodes_when_block_is_split_and_merged(tmp_path: Path):
     db_path = tmp_path / "tracker_history.sqlite"
     tracker = SpreadTracker(

@@ -129,6 +129,38 @@ def _write_tracker_state(path: Path) -> Path:
     return path
 
 
+def _write_low_total_spread_state(path: Path) -> Path:
+    base_ts = 1_701_000_000
+    records = [
+        {"ts": float(base_ts + 0), "entry": 0.10, "exit": -0.20},
+        {"ts": float(base_ts + 60), "entry": 0.11, "exit": -0.19},
+        {"ts": float(base_ts + 120), "entry": 0.09, "exit": -0.18},
+        {"ts": float(base_ts + 180), "entry": 0.23, "exit": -0.18},
+        {"ts": float(base_ts + 240), "entry": 0.11, "exit": -0.17},
+        {"ts": float(base_ts + 300), "entry": -0.10, "exit": 0.15},
+        {"ts": float(base_ts + 360), "entry": -0.08, "exit": 0.14},
+        {"ts": float(base_ts + 420), "entry": -0.05, "exit": 0.12},
+    ]
+    payload = {
+        "saved_at": float(base_ts + 420),
+        "window_sec": 604800,
+        "pairs": {
+            "LOW00|buy|spot|sell|futures": {
+                "last_state": -1,
+                "last_crossover_ts": float(base_ts + 300),
+                "last_seen_ts": float(base_ts + 420),
+                "history_enabled": True,
+                "inverted_events": [float(base_ts + 300)],
+                "entry_events": [],
+                "exit_events": [],
+                "records": records,
+            }
+        },
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
 def _write_tracker_sqlite(path: Path, pairs: dict[str, dict]) -> Path:
     tracker = SpreadTracker(
         window_sec=604800,
@@ -243,6 +275,29 @@ def test_build_dataset_bundle_still_reads_legacy_tracker_json_schema(tmp_path: P
 
     assert bundle.summary["num_samples"] > 0
     assert bundle.summary["state_storage_kind"] == "json"
+
+
+def test_build_dataset_bundle_filters_low_total_spread_inversions_from_positive_labels(tmp_path: Path):
+    state_path = _write_low_total_spread_state(tmp_path / "tracker_state_low_total.json")
+
+    unfiltered_bundle = build_dataset_bundle(
+        state_path=state_path,
+        sequence_length=3,
+        prediction_horizon_sec=180,
+        min_total_spread_pct=0.0,
+    )
+    filtered_bundle = build_dataset_bundle(
+        state_path=state_path,
+        sequence_length=3,
+        prediction_horizon_sec=180,
+        min_total_spread_pct=1.0,
+    )
+
+    assert unfiltered_bundle.summary["num_positive_samples"] > 0
+    assert filtered_bundle.summary["num_samples"] == unfiltered_bundle.summary["num_samples"]
+    assert filtered_bundle.summary["num_positive_samples"] == 0
+    assert filtered_bundle.summary["num_negative_samples"] == filtered_bundle.summary["num_samples"]
+    assert filtered_bundle.summary["min_total_spread_pct"] == 1.0
 
 
 def test_group_splits_handle_overlapping_pair_histories_with_temporal_embargo(tmp_path: Path):

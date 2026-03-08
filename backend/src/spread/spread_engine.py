@@ -49,6 +49,7 @@ class SpreadEngine:
 
     def __init__(self, config: Optional[SpreadConfig] = None):
         self.config = config or SpreadConfig()
+        self.perf_monitor = None
         self._lock = threading.Lock()
         # symbol -> exchange -> market_type -> OrderBookSnapshot
         self._snapshots: Dict[str, Dict[str, Dict[str, OrderBookSnapshot]]] = {}
@@ -63,6 +64,10 @@ class SpreadEngine:
         self._opps_by_symbol: Dict[str, List[SpreadOpportunity]] = {}
         self._cycle_count: int = 0
         self._last_stale_count: int = 0
+
+    def set_perf_monitor(self, monitor):
+        self.perf_monitor = monitor
+        return monitor
 
     # ------------------------------------------------------------------
     # Public: book updates
@@ -144,6 +149,7 @@ class SpreadEngine:
         Returns a sorted list of SpreadOpportunity objects.
         """
         now = time.time()
+        perf_started = time.perf_counter()
         stale_threshold = 8.0  # Books older than 8s are unreliable for arbitrage
         notional_usd = float(getattr(self.config, "min_volume_usd", 0.0) or 0.0)
         min_spread = self.config.min_spread_pct
@@ -154,6 +160,7 @@ class SpreadEngine:
         force_full = (self._cycle_count % _FULL_RECALC_EVERY == 0)
 
         # ------ snapshot copy under lock (minimal time) ------
+        lock_started = time.perf_counter()
         with self._lock:
             if force_full:
                 self._dirty_symbols.clear()
@@ -183,11 +190,13 @@ class SpreadEngine:
                         snapshot_copy[sym] = {
                             ex: dict(mkts) for ex, mkts in exs.items()
                         }
+        lock_finished = time.perf_counter()
 
         # ------ per-symbol calculation (outside lock) ------
         _stale_count = 0
         spread_records: list = []  # deferred on_spread payloads
 
+        calc_started = time.perf_counter()
         for symbol in symbols_to_calc:
             exchanges = snapshot_copy.get(symbol)
             if not exchanges:
@@ -203,8 +212,10 @@ class SpreadEngine:
             self._opps_by_symbol[symbol] = opps
             if records:
                 spread_records.extend(records)
+        calc_finished = time.perf_counter()
 
         # ------ update cached (non-dirty) opps in incremental mode ------
+        aging_started = time.perf_counter()
         if not force_full and self._last_calc_time > 0:
             elapsed = now - self._last_calc_time
             # Snapshot pending dirty symbols — these have fresh WS data
@@ -237,25 +248,48 @@ class SpreadEngine:
             for sym in list(self._opps_by_symbol):
                 if sym not in live:
                     del self._opps_by_symbol[sym]
+        aging_finished = time.perf_counter()
 
         # ------ batch on_spread callbacks ------
+        callbacks_started = time.perf_counter()
         if on_spread and spread_records:
             for rec in spread_records:
                 try:
                     on_spread(*rec)
                 except Exception:
                     pass
+        callbacks_finished = time.perf_counter()
 
         # ------ assemble final sorted list ------
+        sort_started = time.perf_counter()
         all_opps: List[SpreadOpportunity] = []
         for opps in self._opps_by_symbol.values():
             all_opps.extend(opps)
         all_opps.sort(key=lambda o: o.entry_spread_pct, reverse=True)
+        sort_finished = time.perf_counter()
 
         self._opportunities = all_opps
         self._last_calc_time = now
         self._last_stale_count = _stale_count
         self._last_dirty_count = len(symbols_to_calc)
+        if self.perf_monitor is not None:
+            self.perf_monitor.record_scanner_cycle(
+                {
+                    "kind": "spread_engine",
+                    "total_ms": round((sort_finished - perf_started) * 1000.0, 6),
+                    "snapshot_lock_ms": round((lock_finished - lock_started) * 1000.0, 6),
+                    "symbol_calc_ms": round((calc_finished - calc_started) * 1000.0, 6),
+                    "aging_ms": round((aging_finished - aging_started) * 1000.0, 6),
+                    "callback_ms": round((callbacks_finished - callbacks_started) * 1000.0, 6),
+                    "sort_ms": round((sort_finished - sort_started) * 1000.0, 6),
+                    "symbols_to_calc_count": len(symbols_to_calc),
+                    "dirty_symbols_pending": len(self._dirty_symbols),
+                    "force_full": bool(force_full),
+                    "stale_count": int(_stale_count),
+                    "spread_record_count": len(spread_records),
+                    "opportunity_count": len(all_opps),
+                }
+            )
         return all_opps
 
     # ------------------------------------------------------------------

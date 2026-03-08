@@ -134,7 +134,10 @@ class SpreadOpportunity:
 
     def to_scanner_lite_dict(self) -> Dict[str, Any]:
         """Compact payload for the main scanner board and incremental WS updates."""
+        from datetime import datetime, timezone
         d = self._scanner_base_dict()
+        d["timestamp"] = datetime.fromtimestamp(self.timestamp, tz=timezone.utc).isoformat()
+        d["mlScore"] = self.ml_score
         if d["histCruzamento"].get("inverted_counts") is None:
             d["histCruzamento"].pop("inverted_counts", None)
         if self.funding_rate_buy is not None:
@@ -160,7 +163,18 @@ class SpreadOpportunity:
         if self.ml_context:
             d["signalAction"] = str(self.ml_context.get("signal_action") or "WAIT")
             d["signalReasonCode"] = str(self.ml_context.get("signal_reason_code") or "")
+            d["modelStatus"] = str(self.ml_context.get("model_status") or "missing_ml_context")
+            d["modelVersion"] = str(self.ml_context.get("model_version") or "unavailable")
+            d["successProbability"] = self.ml_context.get("success_probability")
+            d["driftStatus"] = str(self.ml_context.get("drift_status") or "unknown")
+            d["inferenceLatencyMs"] = self.ml_context.get("inference_latency_ms")
+            d["contextStrength"] = str(self.ml_context.get("context_strength") or "unknown")
             d["rangeStatus"] = str(self.ml_context.get("range_status") or "unknown")
+            d["entryPositionLabel"] = str(self.ml_context.get("entry_position_label") or "unknown")
+            d["etaAlignmentStatus"] = str(self.ml_context.get("eta_alignment_status") or "unknown")
+            d["displayEtaSeconds"] = self.ml_context.get("display_eta_seconds")
+            d["recommendedEntryRange"] = self.ml_context.get("recommended_entry_range") or "--"
+            d["recommendedExitRange"] = self.ml_context.get("recommended_exit_range") or "--"
         return d
 
     def to_scanner_dict(self) -> Dict[str, Any]:
