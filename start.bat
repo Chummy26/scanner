@@ -16,24 +16,25 @@ if errorlevel 1 (
 echo   Diretorio: %cd%
 echo.
 
-where python >nul 2>&1
-if errorlevel 1 (
-    echo   ERRO: Python nao encontrado no PATH
+if not exist ".venv\Scripts\python.exe" (
+    echo   ERRO: Virtual environment nao encontrado em .venv
+    echo   Execute: python -m venv .venv
+    echo   Depois:  .venv\Scripts\pip install -r requirements.txt
     pause
     exit /b 1
 )
 
-for /f "tokens=*" %%i in ('python --version 2^>^&1') do set PYVER=%%i
-echo   Python: %PYVER%
+for /f "tokens=*" %%i in ('.venv\Scripts\python.exe --version 2^>^&1') do set PYVER=%%i
+echo   Python: %PYVER% (venv)
 
-set "PYTHONPATH=%cd%\.venv\lib\python3.12\site-packages;%cd%"
+set "PYTHONPATH=%cd%"
 echo   PYTHONPATH configurado
 echo.
 echo   Starting server on http://127.0.0.1:8000
 echo   Press Ctrl+C to stop
 echo.
 
-python -u src\server.py %*
+.venv\Scripts\python.exe -u src\server.py %*
 
 echo.
 echo   Servidor encerrou (codigo: %errorlevel%)

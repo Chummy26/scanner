@@ -111,7 +111,11 @@ def test_training_sessions_api_summarizes_sessions_and_exposes_exceptions(tmp_pa
     assert exceptions_payload["session_id"] == first_session["id"]
     assert any(block["selected_for_training"] is False for block in exceptions_payload["blocks"])
 
-    preview_response = asyncio.run(handle_ml_training_cohort_preview(_FakeRequest(app)))
+    preview_response = asyncio.run(
+        handle_ml_training_cohort_preview(
+            _FakeRequest(app, payload={"sequence_length": 4, "prediction_horizon_sec": 60})
+        )
+    )
     preview_payload = json.loads(preview_response.text)
     preview_ids = [session["id"] for session in preview_payload["sessions"]]
     assert first_session["id"] not in preview_ids
@@ -136,7 +140,11 @@ def test_training_session_patch_and_cohort_preview_follow_approved_sessions(tmp_
     assert patch_payload["approved_for_training"] is False
     assert patch_payload["excluded_reason"] == "bad continuity"
 
-    preview_response = asyncio.run(handle_ml_training_cohort_preview(_FakeRequest(app)))
+    preview_response = asyncio.run(
+        handle_ml_training_cohort_preview(
+            _FakeRequest(app, payload={"sequence_length": 4, "prediction_horizon_sec": 60})
+        )
+    )
     preview_payload = json.loads(preview_response.text)
     approved_session_ids = [session["id"] for session in preview_payload["sessions"]]
     assert excluded_session_id not in approved_session_ids
@@ -166,7 +174,7 @@ def test_training_run_create_uses_session_ids_and_snapshots_sessions(tmp_path: P
         handle_ml_training_run_create(
             _FakeRequest(
                 app,
-                payload={"session_ids": session_ids, "sequence_length": 4, "prediction_horizon_sec": 240},
+                payload={"session_ids": session_ids, "sequence_length": 4, "prediction_horizon_sec": 60},
             )
         )
     )
@@ -198,4 +206,4 @@ def test_training_run_create_rejects_sequence_longer_than_available_blocks(tmp_p
     payload = json.loads(response.text)
 
     assert response.status == 400
-    assert "enough contiguous records" in payload["error"]
+    assert "clean-cycle quality gates" in payload["error"] or "No selected blocks available" in payload["error"]

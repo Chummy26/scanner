@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import shutil
 import sqlite3
 import threading
 import time
@@ -41,6 +42,10 @@ _BLOCK_BOUNDARY_REASONS = {
     "manual_merge",
     "legacy_import",
 }
+_DEFAULT_CLEAN_SEQUENCE_LENGTH = 15
+_DEFAULT_CLEAN_PREDICTION_HORIZON_SEC = 14_400
+_BURN_IN_CHECKPOINT_SEC = 30 * 60
+_BURN_IN_MIN_SEC = 60 * 60
 
 
 @dataclass(slots=True)
@@ -1123,6 +1128,8 @@ class SpreadTracker:
                 """,
                 (status, normalized_finished_at, normalized_finished_at, active_session_id),
             )
+            self._reconcile_storage_conn(conn, session_ids=[active_session_id])
+        self._run_wal_checkpoint()
 
     def _mark_dirty(self, key: PairKey):
         self._dirty_pairs.add(key)
@@ -1825,6 +1832,7 @@ class SpreadTracker:
         snapshot_rebindings: list[tuple[PairKey, int, dict[int, int]]] = []
         try:
             with self._connect() as conn:
+                reconciled_pair_ids: set[int] = set()
                 conn.execute("BEGIN")
                 if deleted_keys:
                     self._delete_pairs_from_storage(conn, deleted_keys)
@@ -1888,6 +1896,8 @@ class SpreadTracker:
                                 storage_pair_id,
                             ),
                             )
+                    if storage_pair_id > 0:
+                        reconciled_pair_ids.add(int(storage_pair_id))
                     conn.execute("DELETE FROM tracker_events WHERE pair_id = ?", (storage_pair_id,))
                     conn.execute("DELETE FROM tracker_records WHERE pair_id = ?", (storage_pair_id,))
                     block_metadata = {
@@ -2041,8 +2051,9 @@ class SpreadTracker:
                         """,
                         (storage_pair_id, storage_pair_id),
                     )
-                    self._rebuild_episodes_for_pair_conn(conn, storage_pair_id)
                     snapshot_rebindings.append((key, storage_pair_id, runtime_to_storage_block_id))
+                if reconciled_pair_ids:
+                    self._reconcile_storage_conn(conn, pair_ids=sorted(reconciled_pair_ids))
                 self._last_flush_at = ts
                 self._write_meta(
                     conn,
@@ -2056,6 +2067,7 @@ class SpreadTracker:
                     },
                 )
                 conn.commit()
+            self._run_wal_checkpoint()
         except Exception as exc:
             logger.error("[Tracker] Failed to flush SQLite storage: %s", exc)
             self._emit_event({"kind": "tracker_error", "error": str(exc)})
@@ -2245,6 +2257,254 @@ class SpreadTracker:
             "active_session_id": self._active_session_id,
         }
 
+    @staticmethod
+    def _float_close(left: float | None, right: float | None, *, tolerance: float = 1e-6) -> bool:
+        if left is None or right is None:
+            return left is None and right is None
+        return abs(float(left) - float(right)) <= float(tolerance)
+
+    def _collect_training_quality_state(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        sequence_length: int = _DEFAULT_CLEAN_SEQUENCE_LENGTH,
+        prediction_horizon_sec: int = _DEFAULT_CLEAN_PREDICTION_HORIZON_SEC,
+    ) -> dict[str, Any]:
+        session_rows = list(
+            conn.execute(
+                """
+                SELECT id, started_at, ended_at, status, record_interval_sec, tracking_window_sec, gap_threshold_sec,
+                       approved_for_training, excluded_reason, manual_override, notes
+                FROM tracker_capture_sessions
+                ORDER BY id ASC
+                """
+            )
+        )
+        session_meta = {int(row["id"]): row for row in session_rows}
+        block_rows = list(
+            conn.execute(
+                """
+                SELECT id, pair_id, session_id, start_ts, end_ts, record_count, max_gap_sec, boundary_reason,
+                       selected_for_training, disabled_reason, manual_override, notes, is_open
+                FROM tracker_pair_blocks
+                ORDER BY session_id ASC, id ASC
+                """
+            )
+        )
+        record_rows = list(
+            conn.execute(
+                """
+                SELECT block_id, session_id, ts
+                FROM tracker_records
+                WHERE block_id IS NOT NULL
+                ORDER BY block_id ASC, ts ASC
+                """
+            )
+        )
+        actual_by_block: dict[int, dict[str, float]] = {}
+        block_timestamps: dict[int, list[float]] = defaultdict(list)
+        for row in record_rows:
+            block_id = int(row["block_id"] or 0)
+            if block_id <= 0:
+                continue
+            block_timestamps[block_id].append(float(row["ts"]))
+        for block_id, timestamps in block_timestamps.items():
+            max_gap = 0.0
+            for previous, current in zip(timestamps, timestamps[1:]):
+                max_gap = max(max_gap, float(current) - float(previous))
+            actual_by_block[block_id] = {
+                "count": float(len(timestamps)),
+                "start_ts": float(timestamps[0]),
+                "end_ts": float(timestamps[-1]),
+                "max_gap_sec": float(max_gap),
+            }
+
+        blocks_by_session: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        block_lookup: dict[int, dict[str, Any]] = {}
+        block_ranges_by_session_pair: dict[tuple[int, int], list[tuple[float, float, int]]] = defaultdict(list)
+        for row in block_rows:
+            session_id = int(row["session_id"] or 0)
+            block_id = int(row["id"])
+            actual = actual_by_block.get(block_id, {})
+            actual_count = int(actual.get("count", 0.0))
+            actual_start_ts = float(actual.get("start_ts", row["start_ts"])) if actual_count else None
+            actual_end_ts = float(actual.get("end_ts", row["end_ts"])) if actual_count else None
+            actual_max_gap_sec = float(actual.get("max_gap_sec", row["max_gap_sec"])) if actual_count else 0.0
+            zero_record_block = actual_count <= 0 or int(row["record_count"]) <= 0
+            count_mismatch = actual_count != int(row["record_count"])
+            range_mismatch = actual_count > 0 and (
+                not self._float_close(actual_start_ts, float(row["start_ts"]))
+                or not self._float_close(actual_end_ts, float(row["end_ts"]))
+            )
+            block_payload = {
+                "id": block_id,
+                "pair_id": int(row["pair_id"]),
+                "session_id": session_id,
+                "start_ts": float(row["start_ts"]),
+                "end_ts": float(row["end_ts"]),
+                "record_count": int(row["record_count"]),
+                "max_gap_sec": float(row["max_gap_sec"]),
+                "boundary_reason": str(row["boundary_reason"]),
+                "selected_for_training": bool(row["selected_for_training"]),
+                "disabled_reason": str(row["disabled_reason"] or ""),
+                "manual_override": bool(row["manual_override"]),
+                "notes": str(row["notes"] or ""),
+                "is_open": bool(row["is_open"]),
+                "actual_record_count": actual_count,
+                "actual_start_ts": actual_start_ts,
+                "actual_end_ts": actual_end_ts,
+                "actual_max_gap_sec": actual_max_gap_sec,
+                "zero_record_block": zero_record_block,
+                "record_count_mismatch": count_mismatch,
+                "range_mismatch": range_mismatch,
+            }
+            block_payload["critical_anomaly_count"] = int(
+                zero_record_block
+                + count_mismatch
+                + range_mismatch
+            )
+            blocks_by_session[session_id].append(block_payload)
+            block_lookup[block_id] = block_payload
+            range_start = actual_start_ts if actual_start_ts is not None else float(row["start_ts"])
+            range_end = actual_end_ts if actual_end_ts is not None else float(row["end_ts"])
+            block_ranges_by_session_pair[(session_id, int(row["pair_id"]))].append((range_start, range_end, block_id))
+
+        for ranges in block_ranges_by_session_pair.values():
+            ranges.sort(key=lambda item: (float(item[0]), float(item[1]), int(item[2])))
+
+        missing_event_blocks_by_session: Counter[int] = Counter()
+        event_rows = list(
+            conn.execute(
+                """
+                SELECT pair_id, session_id, block_id, ts
+                FROM tracker_events
+                ORDER BY session_id ASC, ts ASC
+                """
+            )
+        )
+        for row in event_rows:
+            session_id = int(row["session_id"] or 0)
+            pair_id = int(row["pair_id"] or 0)
+            block_id = int(row["block_id"] or 0) if row["block_id"] is not None else 0
+            ts_value = float(row["ts"])
+            block_row = block_lookup.get(block_id)
+            block_matches = (
+                block_row is not None
+                and int(block_row["pair_id"]) == pair_id
+                and int(block_row["session_id"]) == session_id
+                and float(block_row.get("actual_start_ts") or block_row["start_ts"]) <= ts_value <= float(block_row.get("actual_end_ts") or block_row["end_ts"])
+            )
+            if block_matches:
+                continue
+            matched = False
+            for start_ts, end_ts, candidate_block_id in block_ranges_by_session_pair.get((session_id, pair_id), []):
+                if float(start_ts) <= ts_value <= float(end_ts):
+                    matched = True
+                    break
+            if not matched:
+                missing_event_blocks_by_session[session_id] += 1
+
+        sessions: dict[int, dict[str, Any]] = {}
+        summary = {
+            "critical_sessions": 0,
+            "training_ready_sessions": 0,
+            "burn_in_passed_sessions": 0,
+            "checkpoint_ready_sessions": 0,
+            "zero_record_blocks": 0,
+            "record_count_mismatches": 0,
+            "range_mismatches": 0,
+            "missing_event_blocks": 0,
+        }
+        for session_id, row in session_meta.items():
+            session_blocks = blocks_by_session.get(session_id, [])
+            data_start_ts = min(
+                (
+                    float(block.get("actual_start_ts"))
+                    for block in session_blocks
+                    if block.get("actual_start_ts") is not None
+                ),
+                default=0.0,
+            )
+            data_end_ts = max(
+                (
+                    float(block.get("actual_end_ts"))
+                    for block in session_blocks
+                    if block.get("actual_end_ts") is not None
+                ),
+                default=0.0,
+            )
+            session_span_sec = max(0.0, float(data_end_ts) - float(data_start_ts)) if data_end_ts > 0.0 else 0.0
+            zero_record_blocks = sum(1 for block in session_blocks if bool(block["zero_record_block"]))
+            count_mismatches = sum(1 for block in session_blocks if bool(block["record_count_mismatch"]))
+            range_mismatches = sum(1 for block in session_blocks if bool(block["range_mismatch"]))
+            open_blocks_after_close = sum(1 for block in session_blocks if bool(block["is_open"]) and str(row["status"]) != "open")
+            critical_anomaly_count = (
+                int(zero_record_blocks)
+                + int(count_mismatches)
+                + int(range_mismatches)
+                + int(open_blocks_after_close)
+                + int(missing_event_blocks_by_session.get(session_id, 0))
+            )
+            checkpoint_ready = critical_anomaly_count == 0 and session_span_sec >= float(_BURN_IN_CHECKPOINT_SEC) and str(row["status"]) != "open"
+            burn_in_passed = critical_anomaly_count == 0 and session_span_sec >= float(_BURN_IN_MIN_SEC) and str(row["status"]) != "open"
+            training_ready = burn_in_passed and session_span_sec >= self._required_session_span_sec(
+                sequence_length=int(sequence_length),
+                prediction_horizon_sec=int(prediction_horizon_sec),
+                record_interval_sec=float(row["record_interval_sec"]),
+            )
+            trainable_block_count = sum(
+                1
+                for block in session_blocks
+                if self._block_is_trainable(
+                    block,
+                    record_interval_sec=float(row["record_interval_sec"]),
+                    sequence_length=2,
+                )
+            )
+            selected_block_count = sum(1 for block in session_blocks if bool(block["selected_for_training"]))
+            exception_block_count = sum(1 for block in session_blocks if self._block_is_exception(block))
+            quality_status = self._session_quality_status(
+                status=str(row["status"]),
+                critical_anomaly_count=critical_anomaly_count,
+                session_span_sec=session_span_sec,
+                record_interval_sec=float(row["record_interval_sec"]),
+                sequence_length=int(sequence_length),
+                prediction_horizon_sec=int(prediction_horizon_sec),
+            )
+            session_payload = {
+                "session_id": session_id,
+                "data_start_ts": float(data_start_ts),
+                "data_end_ts": float(data_end_ts),
+                "session_span_sec": float(session_span_sec),
+                "zero_record_blocks": int(zero_record_blocks),
+                "record_count_mismatches": int(count_mismatches),
+                "range_mismatches": int(range_mismatches),
+                "missing_event_blocks": int(missing_event_blocks_by_session.get(session_id, 0)),
+                "open_blocks_after_close": int(open_blocks_after_close),
+                "critical_anomaly_count": int(critical_anomaly_count),
+                "checkpoint_ready": bool(checkpoint_ready),
+                "burn_in_passed": bool(burn_in_passed),
+                "training_ready": bool(training_ready),
+                "quality_status": quality_status,
+                "selected_block_count_strict": int(selected_block_count),
+                "trainable_block_count_strict": int(trainable_block_count),
+                "exception_block_count_strict": int(exception_block_count),
+            }
+            sessions[session_id] = session_payload
+            summary["critical_sessions"] += int(critical_anomaly_count > 0)
+            summary["training_ready_sessions"] += int(training_ready)
+            summary["burn_in_passed_sessions"] += int(burn_in_passed)
+            summary["checkpoint_ready_sessions"] += int(checkpoint_ready)
+            summary["zero_record_blocks"] += int(zero_record_blocks)
+            summary["record_count_mismatches"] += int(count_mismatches)
+            summary["range_mismatches"] += int(range_mismatches)
+            summary["missing_event_blocks"] += int(missing_event_blocks_by_session.get(session_id, 0))
+        return {
+            "sessions": sessions,
+            "blocks": block_lookup,
+            "summary": summary,
+        }
+
     def update_gap_threshold_sec(self, gap_threshold_sec: float) -> float:
         self.gap_threshold_sec = self._resolve_gap_threshold_sec(gap_threshold_sec, self.record_interval_sec)
         if self.db_path is not None:
@@ -2305,6 +2565,75 @@ class SpreadTracker:
         return list(dict.fromkeys(reasons))
 
     @staticmethod
+    def _block_is_trainable(
+        block: dict[str, object],
+        *,
+        record_interval_sec: float,
+        sequence_length: int = 2,
+    ) -> bool:
+        if SpreadTracker._block_is_exception(block):
+            return False
+        if int(block.get("record_count") or 0) < max(int(sequence_length), 2):
+            return False
+        max_gap_sec = float(block.get("actual_max_gap_sec", block.get("max_gap_sec", 0.0)) or 0.0)
+        return max_gap_sec <= (2.0 * max(float(record_interval_sec), 0.0))
+
+    @staticmethod
+    def _required_session_span_sec(*, sequence_length: int, prediction_horizon_sec: int, record_interval_sec: float) -> float:
+        return max(
+            float(prediction_horizon_sec),
+            float(prediction_horizon_sec) + max(int(sequence_length) - 1, 0) * max(float(record_interval_sec), 0.0),
+        )
+
+    @classmethod
+    def _session_quality_status(
+        cls,
+        *,
+        status: str,
+        critical_anomaly_count: int,
+        session_span_sec: float,
+        record_interval_sec: float,
+        sequence_length: int,
+        prediction_horizon_sec: int,
+    ) -> str:
+        if status == "open":
+            return "open"
+        if critical_anomaly_count > 0:
+            return "quarantined"
+        if session_span_sec < float(_BURN_IN_CHECKPOINT_SEC):
+            return "collecting"
+        if session_span_sec < float(_BURN_IN_MIN_SEC):
+            return "checkpoint_ready"
+        if session_span_sec >= cls._required_session_span_sec(
+            sequence_length=sequence_length,
+            prediction_horizon_sec=prediction_horizon_sec,
+            record_interval_sec=record_interval_sec,
+        ):
+            return "training_ready"
+        return "burn_in_passed"
+
+    @classmethod
+    def _session_meets_run_gates(
+        cls,
+        *,
+        status: str,
+        critical_anomaly_count: int,
+        session_span_sec: float,
+        record_interval_sec: float,
+        sequence_length: int,
+        prediction_horizon_sec: int,
+    ) -> bool:
+        if str(status) == "open":
+            return False
+        if int(critical_anomaly_count) > 0:
+            return False
+        return float(session_span_sec) >= cls._required_session_span_sec(
+            sequence_length=int(sequence_length),
+            prediction_horizon_sec=int(prediction_horizon_sec),
+            record_interval_sec=float(record_interval_sec),
+        )
+
+    @staticmethod
     def _session_review_state(*, status: str, approved: bool, exception_count: int, manual_override: bool) -> str:
         if status == "open":
             return "open"
@@ -2329,6 +2658,7 @@ class SpreadTracker:
                 },
             }
         with self._connect() as conn:
+            quality_state = self._collect_training_quality_state(conn)
             session_filter = "" if include_open else "WHERE s.status != 'open'"
             session_rows = list(
                 conn.execute(
@@ -2345,13 +2675,10 @@ class SpreadTracker:
                         s.excluded_reason,
                         s.manual_override,
                         s.notes,
-                        COALESCE(MIN(b.start_ts), 0.0) AS data_start_ts,
-                        COALESCE(MAX(b.end_ts), 0.0) AS data_end_ts,
                         COALESCE(COUNT(b.id), 0) AS block_count,
                         COALESCE(COUNT(DISTINCT b.pair_id), 0) AS pair_count,
                         COALESCE(COUNT(DISTINCT p.symbol), 0) AS symbol_count,
                         COALESCE(SUM(CASE WHEN b.selected_for_training = 1 THEN 1 ELSE 0 END), 0) AS selected_block_count,
-                        COALESCE(SUM(CASE WHEN b.selected_for_training = 1 AND b.is_open = 0 AND b.record_count > 1 THEN 1 ELSE 0 END), 0) AS trainable_block_count,
                         COALESCE(SUM(CASE WHEN {self._training_exception_sql('b')} THEN 1 ELSE 0 END), 0) AS exception_block_count
                     FROM tracker_capture_sessions s
                     LEFT JOIN tracker_pair_blocks b ON b.session_id = s.id
@@ -2395,6 +2722,7 @@ class SpreadTracker:
         exception_reason_counts_by_session: dict[int, Counter[str]] = defaultdict(Counter)
         for row in preview_rows:
             session_id = int(row["session_id"])
+            block_quality = quality_state["blocks"].get(int(row["id"]), {})
             block_payload = {
                 "id": int(row["id"]),
                 "symbol": str(row["symbol"]),
@@ -2409,6 +2737,11 @@ class SpreadTracker:
                 "manual_override": bool(row["manual_override"]),
                 "notes": str(row["notes"] or ""),
                 "is_open": bool(row["is_open"]),
+                "actual_record_count": int(block_quality.get("actual_record_count", 0)),
+                "actual_max_gap_sec": float(block_quality.get("actual_max_gap_sec", row["max_gap_sec"]) or 0.0),
+                "zero_record_block": bool(block_quality.get("zero_record_block", False)),
+                "record_count_mismatch": bool(block_quality.get("record_count_mismatch", False)),
+                "range_mismatch": bool(block_quality.get("range_mismatch", False)),
             }
             for reason in self._block_exception_reasons(block_payload):
                 exception_reason_counts_by_session[session_id][reason] += 1
@@ -2423,8 +2756,9 @@ class SpreadTracker:
         auto_approved_sessions = 0
         review_state_counts: Counter[str] = Counter()
         for row in session_rows:
+            session_quality = quality_state["sessions"].get(int(row["id"]), {})
             approved = bool(row["approved_for_training"])
-            exception_count = int(row["exception_block_count"])
+            exception_count = int(row["exception_block_count"]) + int(session_quality.get("critical_anomaly_count", 0))
             manual_override = bool(row["manual_override"])
             review_state = self._session_review_state(
                 status=str(row["status"]),
@@ -2432,8 +2766,21 @@ class SpreadTracker:
                 exception_count=exception_count,
                 manual_override=manual_override,
             )
-            can_train = review_state in {"auto_approved", "reviewed_ok"} and int(row["trainable_block_count"]) > 0
-            reason_counts = dict(sorted(exception_reason_counts_by_session.get(int(row["id"]), Counter()).items()))
+            can_train = (
+                review_state in {"auto_approved", "reviewed_ok"}
+                and bool(session_quality.get("training_ready", False))
+                and int(session_quality.get("trainable_block_count_strict", 0)) > 0
+            )
+            reason_counter = Counter(exception_reason_counts_by_session.get(int(row["id"]), Counter()))
+            if int(session_quality.get("zero_record_blocks", 0)) > 0:
+                reason_counter["zero_record_block"] += int(session_quality.get("zero_record_blocks", 0))
+            if int(session_quality.get("record_count_mismatches", 0)) > 0:
+                reason_counter["record_count_mismatch"] += int(session_quality.get("record_count_mismatches", 0))
+            if int(session_quality.get("range_mismatches", 0)) > 0:
+                reason_counter["range_mismatch"] += int(session_quality.get("range_mismatches", 0))
+            if int(session_quality.get("missing_event_blocks", 0)) > 0:
+                reason_counter["missing_event_block"] += int(session_quality.get("missing_event_blocks", 0))
+            reason_counts = dict(sorted(reason_counter.items()))
             dominant_reason = ""
             if reason_counts:
                 dominant_reason = max(reason_counts.items(), key=lambda item: (item[1], item[0]))[0]
@@ -2459,26 +2806,34 @@ class SpreadTracker:
                     "excluded_reason": str(row["excluded_reason"] or ""),
                     "manual_override": manual_override,
                     "notes": str(row["notes"] or ""),
-                    "data_start_ts": self._coerce_float(row["data_start_ts"], 0.0),
-                    "data_end_ts": self._coerce_float(row["data_end_ts"], 0.0),
+                    "data_start_ts": float(session_quality.get("data_start_ts", 0.0) or 0.0),
+                    "data_end_ts": float(session_quality.get("data_end_ts", 0.0) or 0.0),
                     "capture_duration_sec": max(
                         0.0,
                         self._coerce_float(row["ended_at"], 0.0) - float(row["started_at"]),
                     ),
-                    "data_duration_sec": max(
-                        0.0,
-                        self._coerce_float(row["data_end_ts"], 0.0) - self._coerce_float(row["data_start_ts"], 0.0),
-                    ),
+                    "data_duration_sec": float(session_quality.get("session_span_sec", 0.0) or 0.0),
                     "block_count": int(row["block_count"]),
                     "pair_count": int(row["pair_count"]),
                     "symbol_count": int(row["symbol_count"]),
                     "selected_block_count": int(row["selected_block_count"]),
-                    "trainable_block_count": int(row["trainable_block_count"]),
+                    "trainable_block_count": int(session_quality.get("trainable_block_count_strict", 0)),
                     "exception_block_count": exception_count,
                     "can_train": can_train,
                     "review_state": review_state,
                     "dominant_exception_reason": dominant_reason,
                     "exception_reason_counts": reason_counts,
+                    "quality_status": str(session_quality.get("quality_status", "collecting")),
+                    "checkpoint_ready": bool(session_quality.get("checkpoint_ready", False)),
+                    "burn_in_passed": bool(session_quality.get("burn_in_passed", False)),
+                    "training_ready": bool(session_quality.get("training_ready", False)),
+                    "session_span_sec": float(session_quality.get("session_span_sec", 0.0) or 0.0),
+                    "critical_anomaly_count": int(session_quality.get("critical_anomaly_count", 0)),
+                    "zero_record_blocks": int(session_quality.get("zero_record_blocks", 0)),
+                    "record_count_mismatches": int(session_quality.get("record_count_mismatches", 0)),
+                    "range_mismatches": int(session_quality.get("range_mismatches", 0)),
+                    "missing_event_blocks": int(session_quality.get("missing_event_blocks", 0)),
+                    "open_blocks_after_close": int(session_quality.get("open_blocks_after_close", 0)),
                     "blocks_preview": preview_by_session.get(int(row["id"]), []),
                 }
             )
@@ -2492,6 +2847,14 @@ class SpreadTracker:
                 "trainable_sessions": trainable_sessions,
                 "exception_sessions": exception_sessions,
                 "auto_approved_sessions": auto_approved_sessions,
+                "training_ready_sessions": int(quality_state["summary"].get("training_ready_sessions", 0)),
+                "burn_in_passed_sessions": int(quality_state["summary"].get("burn_in_passed_sessions", 0)),
+                "checkpoint_ready_sessions": int(quality_state["summary"].get("checkpoint_ready_sessions", 0)),
+                "critical_sessions": int(quality_state["summary"].get("critical_sessions", 0)),
+                "zero_record_blocks": int(quality_state["summary"].get("zero_record_blocks", 0)),
+                "record_count_mismatches": int(quality_state["summary"].get("record_count_mismatches", 0)),
+                "range_mismatches": int(quality_state["summary"].get("range_mismatches", 0)),
+                "missing_event_blocks": int(quality_state["summary"].get("missing_event_blocks", 0)),
                 "review_state_counts": dict(sorted(review_state_counts.items())),
             },
         }
@@ -2554,7 +2917,13 @@ class SpreadTracker:
             },
         }
 
-    def get_approved_training_session_ids(self, *, include_open: bool = False) -> list[int]:
+    def get_approved_training_session_ids(
+        self,
+        *,
+        include_open: bool = False,
+        sequence_length: int = _DEFAULT_CLEAN_SEQUENCE_LENGTH,
+        prediction_horizon_sec: int = _DEFAULT_CLEAN_PREDICTION_HORIZON_SEC,
+    ) -> list[int]:
         if self.db_path is None or not self.db_path.is_file():
             return []
         allowed_status = {"auto_approved", "reviewed_ok"}
@@ -2567,10 +2936,24 @@ class SpreadTracker:
             )
             if session["approved_for_training"]
             and session["review_state"] in allowed_status
+            and self._session_meets_run_gates(
+                status=str(session["status"]),
+                critical_anomaly_count=int(session.get("critical_anomaly_count", 0)),
+                session_span_sec=float(session.get("session_span_sec", 0.0) or 0.0),
+                record_interval_sec=float(session.get("record_interval_sec", self.record_interval_sec) or self.record_interval_sec),
+                sequence_length=int(sequence_length),
+                prediction_horizon_sec=int(prediction_horizon_sec),
+            )
             and int(session["trainable_block_count"]) > 0
         ]
 
-    def preview_training_cohorts(self, *, session_ids: Optional[list[int]] = None) -> dict[str, object]:
+    def preview_training_cohorts(
+        self,
+        *,
+        session_ids: Optional[list[int]] = None,
+        sequence_length: int = _DEFAULT_CLEAN_SEQUENCE_LENGTH,
+        prediction_horizon_sec: int = _DEFAULT_CLEAN_PREDICTION_HORIZON_SEC,
+    ) -> dict[str, object]:
         listing = self.list_training_sessions(include_open=False)
         allowed = {int(session_id) for session_id in session_ids} if session_ids is not None else None
         sessions = [
@@ -2580,6 +2963,14 @@ class SpreadTracker:
             and session["approved_for_training"]
             and session["status"] != "open"
             and session["trainable_block_count"] > 0
+            and self._session_meets_run_gates(
+                status=str(session["status"]),
+                critical_anomaly_count=int(session.get("critical_anomaly_count", 0)),
+                session_span_sec=float(session.get("session_span_sec", 0.0) or 0.0),
+                record_interval_sec=float(session.get("record_interval_sec", self.record_interval_sec) or self.record_interval_sec),
+                sequence_length=int(sequence_length),
+                prediction_horizon_sec=int(prediction_horizon_sec),
+            )
             and (allowed is None or int(session["id"]) in allowed)
         ]
         sessions.sort(key=lambda session: (float(session["data_end_ts"] or 0.0), int(session["id"])))
@@ -2619,6 +3010,7 @@ class SpreadTracker:
         if self.db_path is None or not self.db_path.is_file():
             return {"config": self.get_training_config(), "sessions": [], "summary": {"total_sessions": 0, "total_blocks": 0}}
         with self._connect() as conn:
+            quality_state = self._collect_training_quality_state(conn)
             params: list[Any] = []
             session_filter = ""
             if session_id is not None:
@@ -2691,7 +3083,22 @@ class SpreadTracker:
         for row in block_rows:
             is_open = bool(row["is_open"])
             selected = bool(row["selected_for_training"])
-            trainable = selected and (not is_open) and int(row["record_count"]) > 1
+            block_quality = quality_state["blocks"].get(int(row["id"]), {})
+            trainable = self._block_is_trainable(
+                {
+                    "is_open": is_open,
+                    "selected_for_training": selected,
+                    "manual_override": bool(row["manual_override"]),
+                    "disabled_reason": str(row["disabled_reason"] or ""),
+                    "record_count": int(row["record_count"]),
+                    "actual_max_gap_sec": float(block_quality.get("actual_max_gap_sec", row["max_gap_sec"]) or 0.0),
+                    "boundary_reason": str(row["boundary_reason"]),
+                    "zero_record_block": bool(block_quality.get("zero_record_block", False)),
+                    "record_count_mismatch": bool(block_quality.get("record_count_mismatch", False)),
+                    "range_mismatch": bool(block_quality.get("range_mismatch", False)),
+                },
+                record_interval_sec=self.record_interval_sec,
+            )
             if trainable:
                 total_trainable += 1
             block = {
@@ -2715,12 +3122,21 @@ class SpreadTracker:
                 "notes": str(row["notes"] or ""),
                 "is_open": is_open,
                 "trainable": trainable,
+                "actual_record_count": int(block_quality.get("actual_record_count", 0)),
+                "actual_start_ts": block_quality.get("actual_start_ts"),
+                "actual_end_ts": block_quality.get("actual_end_ts"),
+                "actual_max_gap_sec": float(block_quality.get("actual_max_gap_sec", row["max_gap_sec"]) or 0.0),
+                "zero_record_block": bool(block_quality.get("zero_record_block", False)),
+                "record_count_mismatch": bool(block_quality.get("record_count_mismatch", False)),
+                "range_mismatch": bool(block_quality.get("range_mismatch", False)),
+                "critical_anomaly_count": int(block_quality.get("critical_anomaly_count", 0)),
             }
             blocks_by_session[int(row["session_id"])].append(block)
 
         sessions = []
         for row in session_rows:
             session_blocks = blocks_by_session.get(int(row["id"]), [])
+            session_quality = quality_state["sessions"].get(int(row["id"]), {})
             sessions.append(
                 {
                     "id": int(row["id"]),
@@ -2732,7 +3148,10 @@ class SpreadTracker:
                     "gap_threshold_sec": float(row["gap_threshold_sec"]),
                     "block_count": int(row["block_count"]),
                     "selected_block_count": int(row["selected_block_count"]),
-                    "trainable_block_count": int(row["trainable_block_count"]),
+                    "trainable_block_count": int(sum(1 for block in session_blocks if bool(block["trainable"]))),
+                    "quality_status": str(session_quality.get("quality_status", "collecting")),
+                    "critical_anomaly_count": int(session_quality.get("critical_anomaly_count", 0)),
+                    "session_span_sec": float(session_quality.get("session_span_sec", 0.0) or 0.0),
                     "blocks": session_blocks,
                 }
             )
@@ -2805,6 +3224,135 @@ class SpreadTracker:
             (timestamps[0], timestamps[-1], len(timestamps), max_gap, time.time(), int(block_id)),
         )
 
+    def _run_wal_checkpoint(self, *, mode: str = "TRUNCATE") -> None:
+        if self.db_path is None or not self.db_path.exists():
+            return
+        try:
+            with self._connect() as conn:
+                conn.execute(f"PRAGMA wal_checkpoint({str(mode).upper()})")
+        except Exception as exc:
+            logger.debug("[Tracker] WAL checkpoint skipped: %s", exc)
+
+    def _reconcile_storage_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        pair_ids: Optional[Iterable[int]] = None,
+        session_ids: Optional[Iterable[int]] = None,
+    ) -> dict[str, int]:
+        pair_filter = [int(pair_id) for pair_id in pair_ids or [] if int(pair_id) > 0]
+        session_filter = [int(session_id) for session_id in session_ids or [] if int(session_id) > 0]
+        conditions: list[str] = []
+        params: list[Any] = []
+        if pair_filter:
+            placeholders = ",".join("?" for _ in pair_filter)
+            conditions.append(f"pair_id IN ({placeholders})")
+            params.extend(pair_filter)
+        if session_filter:
+            placeholders = ",".join("?" for _ in session_filter)
+            conditions.append(f"session_id IN ({placeholders})")
+            params.extend(session_filter)
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        block_rows = list(
+            conn.execute(
+                f"""
+                SELECT id, pair_id, session_id
+                FROM tracker_pair_blocks
+                {where_clause}
+                ORDER BY session_id ASC, id ASC
+                """,
+                params,
+            )
+        )
+        deleted_zero_record_blocks = 0
+        updated_block_ranges = 0
+        reassigned_event_blocks = 0
+        affected_pair_ids: set[int] = set()
+        block_ranges_by_session_pair: dict[tuple[int, int], list[tuple[float, float, int]]] = defaultdict(list)
+
+        for block_row in block_rows:
+            block_id = int(block_row["id"])
+            pair_id = int(block_row["pair_id"])
+            affected_pair_ids.add(pair_id)
+            record_rows = list(
+                conn.execute(
+                    """
+                    SELECT ts
+                    FROM tracker_records
+                    WHERE block_id = ?
+                    ORDER BY ts ASC
+                    """,
+                    (block_id,),
+                )
+            )
+            if not record_rows:
+                conn.execute("DELETE FROM tracker_pair_blocks WHERE id = ?", (block_id,))
+                deleted_zero_record_blocks += 1
+                continue
+            timestamps = [float(row["ts"]) for row in record_rows]
+            max_gap = 0.0
+            for previous, current in zip(timestamps, timestamps[1:]):
+                max_gap = max(max_gap, float(current) - float(previous))
+            conn.execute(
+                """
+                UPDATE tracker_pair_blocks
+                SET start_ts = ?, end_ts = ?, record_count = ?, max_gap_sec = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (timestamps[0], timestamps[-1], len(timestamps), max_gap, time.time(), block_id),
+            )
+            updated_block_ranges += 1
+            block_ranges_by_session_pair[(int(block_row["session_id"]), pair_id)].append((timestamps[0], timestamps[-1], block_id))
+
+        event_conditions: list[str] = []
+        event_params: list[Any] = []
+        if pair_filter:
+            placeholders = ",".join("?" for _ in pair_filter)
+            event_conditions.append(f"pair_id IN ({placeholders})")
+            event_params.extend(pair_filter)
+        if session_filter:
+            placeholders = ",".join("?" for _ in session_filter)
+            event_conditions.append(f"session_id IN ({placeholders})")
+            event_params.extend(session_filter)
+        event_where = f"WHERE {' AND '.join(event_conditions)}" if event_conditions else ""
+        event_rows = list(
+            conn.execute(
+                f"""
+                SELECT rowid, pair_id, session_id, block_id, ts
+                FROM tracker_events
+                {event_where}
+                ORDER BY session_id ASC, ts ASC
+                """,
+                event_params,
+            )
+        )
+        for event_row in event_rows:
+            session_id = int(event_row["session_id"] or 0)
+            pair_id = int(event_row["pair_id"] or 0)
+            ts_value = float(event_row["ts"])
+            matched_block_id = None
+            for start_ts, end_ts, block_id in block_ranges_by_session_pair.get((session_id, pair_id), []):
+                if float(start_ts) <= ts_value <= float(end_ts):
+                    matched_block_id = int(block_id)
+                    break
+            current_block_id = int(event_row["block_id"] or 0) if event_row["block_id"] is not None else 0
+            if current_block_id != int(matched_block_id or 0):
+                conn.execute(
+                    "UPDATE tracker_events SET block_id = ? WHERE rowid = ?",
+                    (matched_block_id, int(event_row["rowid"])),
+                )
+                reassigned_event_blocks += 1
+            if pair_id > 0:
+                affected_pair_ids.add(pair_id)
+
+        for pair_id in sorted(affected_pair_ids):
+            self._rebuild_episodes_for_pair_conn(conn, int(pair_id))
+        return {
+            "deleted_zero_record_blocks": int(deleted_zero_record_blocks),
+            "updated_block_ranges": int(updated_block_ranges),
+            "reassigned_event_blocks": int(reassigned_event_blocks),
+        }
+
     def split_block(self, block_id: int, split_ts: float) -> dict[str, object]:
         if self.db_path is None:
             raise RuntimeError("Tracker storage is not configured")
@@ -2855,7 +3403,7 @@ class SpreadTracker:
             )
             self._recompute_block_from_db(conn, int(block_id))
             self._recompute_block_from_db(conn, new_block_id)
-            self._rebuild_episodes_for_pair_conn(conn, pair_id)
+            self._reconcile_storage_conn(conn, session_ids=[int(block_row["session_id"])])
         if pair_id:
             self._refresh_pair_records_from_storage(pair_id)
         return {"block_id": int(block_id), "new_block_id": new_block_id}
@@ -2897,7 +3445,7 @@ class SpreadTracker:
             )
             conn.execute("DELETE FROM tracker_pair_blocks WHERE id = ?", (next_block_id,))
             self._recompute_block_from_db(conn, int(block_id))
-            self._rebuild_episodes_for_pair_conn(conn, pair_id)
+            self._reconcile_storage_conn(conn, session_ids=[int(block_row["session_id"])])
         if pair_id:
             self._refresh_pair_records_from_storage(pair_id)
         return {"block_id": int(block_id), "merged_block_id": next_block_id}
@@ -3038,6 +3586,8 @@ class SpreadTracker:
                         )
             for pair_id in rebuilt_pair_ids:
                 self._rebuild_episodes_for_pair_conn(conn, pair_id)
+            if processed_sessions:
+                self._reconcile_storage_conn(conn, session_ids=processed_sessions)
         self.update_gap_threshold_sec(effective_threshold)
         for pair_id in rebuilt_pair_ids:
             self._refresh_pair_records_from_storage(pair_id)
@@ -3048,25 +3598,27 @@ class SpreadTracker:
         *,
         trainable_only: bool = True,
         session_ids: Optional[list[int]] = None,
+        sequence_length: int = 2,
     ) -> list[int]:
         if self.db_path is None or not self.db_path.is_file():
             return []
-        with self._connect() as conn:
-            filters = ["selected_for_training = 1"]
-            params: list[Any] = []
-            if trainable_only:
-                filters.append("is_open = 0")
-                filters.append("record_count > 1")
-            if session_ids is not None:
-                normalized_ids = [int(session_id) for session_id in session_ids if int(session_id) > 0]
-                if not normalized_ids:
-                    return []
-                placeholders = ",".join("?" for _ in normalized_ids)
-                filters.append(f"session_id IN ({placeholders})")
-                params.extend(normalized_ids)
-            where_clause = " AND ".join(filters)
-            query = f"SELECT id FROM tracker_pair_blocks WHERE {where_clause} ORDER BY session_id ASC, start_ts ASC, id ASC"
-            return [int(row["id"]) for row in conn.execute(query, params)]
+        listing = self.list_training_blocks(session_id=None, include_open=False)
+        normalized_ids = {int(session_id) for session_id in session_ids or [] if int(session_id) > 0}
+        selected_ids: list[int] = []
+        for session in listing["sessions"]:
+            if normalized_ids and int(session["id"]) not in normalized_ids:
+                continue
+            for block in session["blocks"]:
+                if not bool(block.get("selected_for_training", True)):
+                    continue
+                if trainable_only and not self._block_is_trainable(
+                    block,
+                    record_interval_sec=float(session.get("record_interval_sec", self.record_interval_sec) or self.record_interval_sec),
+                    sequence_length=max(int(sequence_length), 2),
+                ):
+                    continue
+                selected_ids.append(int(block["id"]))
+        return selected_ids
 
     def create_training_run(
         self,
@@ -3079,93 +3631,75 @@ class SpreadTracker:
     ) -> dict[str, object]:
         if self.db_path is None:
             raise RuntimeError("Tracker storage is not configured")
+        target_sequence_length = max(int(sequence_length), 1)
+        target_horizon_sec = max(int(prediction_horizon_sec), 1)
         unique_session_ids = [int(session_id) for session_id in dict.fromkeys(session_ids or []) if int(session_id) > 0]
         unique_block_ids = [int(block_id) for block_id in dict.fromkeys(block_ids or []) if int(block_id) > 0]
         now = time.time()
-        with self._connect() as conn:
-            session_order = {int(session_id): index for index, session_id in enumerate(unique_session_ids)}
-            if unique_session_ids:
-                session_placeholders = ",".join("?" for _ in unique_session_ids)
-                session_rows = list(
-                    conn.execute(
-                        f"""
-                        SELECT
-                            s.id,
-                            s.started_at,
-                            s.ended_at,
-                            s.status,
-                            s.approved_for_training,
-                            s.excluded_reason,
-                            COALESCE(MIN(b.start_ts), 0.0) AS data_start_ts,
-                            COALESCE(MAX(b.end_ts), 0.0) AS data_end_ts,
-                            COALESCE(COUNT(b.id), 0) AS block_count,
-                            COALESCE(SUM(CASE WHEN b.selected_for_training = 1 AND b.is_open = 0 AND b.record_count > 1 THEN 1 ELSE 0 END), 0) AS trainable_block_count,
-                            COALESCE(SUM(CASE WHEN {self._training_exception_sql('b')} THEN 1 ELSE 0 END), 0) AS exception_block_count
-                        FROM tracker_capture_sessions s
-                        LEFT JOIN tracker_pair_blocks b ON b.session_id = s.id
-                        WHERE s.id IN ({session_placeholders}) AND s.status != 'open' AND s.approved_for_training = 1
-                        GROUP BY s.id
-                        """,
-                        unique_session_ids,
-                    )
-                )
-                session_rows.sort(key=lambda row: session_order.get(int(row["id"]), len(session_order)))
+        session_listing = self.list_training_sessions(include_open=False)
+        sessions_by_id = {int(session["id"]): session for session in session_listing["sessions"]}
+        if not unique_session_ids:
+            if unique_block_ids:
+                block_listing = self.list_training_blocks(include_open=False)
+                unique_session_ids = [
+                    int(session["id"])
+                    for session in block_listing["sessions"]
+                    if any(int(block["id"]) in set(unique_block_ids) for block in session["blocks"])
+                ]
             else:
-                derived_session_ids = []
-                if unique_block_ids:
-                    placeholders = ",".join("?" for _ in unique_block_ids)
-                    derived_session_ids = [
-                        int(row["session_id"])
-                        for row in conn.execute(
-                            f"""
-                            SELECT DISTINCT session_id
-                            FROM tracker_pair_blocks
-                            WHERE id IN ({placeholders})
-                            ORDER BY session_id ASC
-                            """,
-                            unique_block_ids,
-                        )
-                    ]
-                else:
-                    derived_session_ids = self.get_approved_training_session_ids(include_open=False)
-                unique_session_ids = [int(session_id) for session_id in dict.fromkeys(derived_session_ids) if int(session_id) > 0]
-                if not unique_session_ids:
-                    raise ValueError("No approved sessions available for training")
-                session_order = {int(session_id): index for index, session_id in enumerate(unique_session_ids)}
-                session_placeholders = ",".join("?" for _ in unique_session_ids)
-                session_rows = list(
-                    conn.execute(
-                        f"""
-                        SELECT
-                            s.id,
-                            s.started_at,
-                            s.ended_at,
-                            s.status,
-                            s.approved_for_training,
-                            s.excluded_reason,
-                            COALESCE(MIN(b.start_ts), 0.0) AS data_start_ts,
-                            COALESCE(MAX(b.end_ts), 0.0) AS data_end_ts,
-                            COALESCE(COUNT(b.id), 0) AS block_count,
-                            COALESCE(SUM(CASE WHEN b.selected_for_training = 1 AND b.is_open = 0 AND b.record_count > 1 THEN 1 ELSE 0 END), 0) AS trainable_block_count,
-                            COALESCE(SUM(CASE WHEN {self._training_exception_sql('b')} THEN 1 ELSE 0 END), 0) AS exception_block_count
-                        FROM tracker_capture_sessions s
-                        LEFT JOIN tracker_pair_blocks b ON b.session_id = s.id
-                        WHERE s.id IN ({session_placeholders})
-                        GROUP BY s.id
-                        """,
-                        unique_session_ids,
-                    )
+                unique_session_ids = self.get_approved_training_session_ids(
+                    include_open=False,
+                    sequence_length=target_sequence_length,
+                    prediction_horizon_sec=target_horizon_sec,
                 )
-                session_rows.sort(key=lambda row: session_order.get(int(row["id"]), len(session_order)))
-            if not session_rows:
-                raise ValueError("No approved closed sessions available for training")
-            if not unique_block_ids:
-                unique_block_ids = self.get_selected_training_block_ids(
-                    trainable_only=True,
-                    session_ids=[int(row["id"]) for row in session_rows],
+        if not unique_session_ids:
+            raise ValueError("No approved sessions available for training")
+        session_order = {int(session_id): index for index, session_id in enumerate(unique_session_ids)}
+        selected_sessions = [sessions_by_id.get(int(session_id)) for session_id in unique_session_ids]
+        session_payloads = [session for session in selected_sessions if session is not None]
+        if len(session_payloads) != len(unique_session_ids):
+            raise ValueError("One or more requested sessions were not found.")
+        for session in session_payloads:
+            if not self._session_meets_run_gates(
+                status=str(session["status"]),
+                critical_anomaly_count=int(session.get("critical_anomaly_count", 0)),
+                session_span_sec=float(session.get("session_span_sec", 0.0) or 0.0),
+                record_interval_sec=float(session.get("record_interval_sec", self.record_interval_sec) or self.record_interval_sec),
+                sequence_length=target_sequence_length,
+                prediction_horizon_sec=target_horizon_sec,
+            ):
+                raise ValueError(
+                    f"Session {int(session['id'])} does not meet clean-cycle quality gates for sequence_length={target_sequence_length} "
+                    f"and prediction_horizon_sec={target_horizon_sec}."
                 )
-            if not unique_block_ids:
-                raise ValueError("No selected blocks available for training")
+            if not bool(session.get("approved_for_training", False)):
+                raise ValueError(f"Session {int(session['id'])} is not approved for training.")
+        if not unique_block_ids:
+            unique_block_ids = self.get_selected_training_block_ids(
+                trainable_only=True,
+                session_ids=[int(session["id"]) for session in session_payloads],
+                sequence_length=target_sequence_length,
+            )
+        if not unique_block_ids:
+            raise ValueError("No selected blocks available for training")
+        block_listing = self.list_training_blocks(include_open=False)
+        blocks_by_id = {
+            int(block["id"]): (session, block)
+            for session in block_listing["sessions"]
+            for block in session["blocks"]
+        }
+        for block_id in unique_block_ids:
+            session_block = blocks_by_id.get(int(block_id))
+            if session_block is None:
+                raise ValueError(f"Block {int(block_id)} was not found.")
+            session_payload, block_payload = session_block
+            if not self._block_is_trainable(
+                block_payload,
+                record_interval_sec=float(session_payload.get("record_interval_sec", self.record_interval_sec) or self.record_interval_sec),
+                sequence_length=target_sequence_length,
+            ):
+                raise ValueError(f"Block {int(block_id)} does not satisfy clean-cycle block gates.")
+        with self._connect() as conn:
             placeholders = ",".join("?" for _ in unique_block_ids)
             block_rows = list(
                 conn.execute(
@@ -3191,10 +3725,10 @@ class SpreadTracker:
             )
             if not block_rows:
                 raise ValueError("No trainable closed blocks selected")
-            estimated_window_count = sum(max(0, int(row["record_count"]) - int(sequence_length)) for row in block_rows)
+            estimated_window_count = sum(max(0, int(row["record_count"]) - target_sequence_length) for row in block_rows)
             if estimated_window_count <= 0:
                 raise ValueError(
-                    f"Selected sessions do not contain enough contiguous records for sequence_length={int(sequence_length)}."
+                    f"Selected sessions do not contain enough contiguous records for sequence_length={target_sequence_length}."
                 )
             cursor = conn.execute(
                 """
@@ -3209,8 +3743,8 @@ class SpreadTracker:
                     str(self.db_path),
                     str(artifact_dir or ""),
                     self.gap_threshold_sec,
-                    int(sequence_length),
-                    int(prediction_horizon_sec),
+                    target_sequence_length,
+                    target_horizon_sec,
                     len(block_rows),
                 ),
             )
@@ -3239,7 +3773,7 @@ class SpreadTracker:
                         int(row["trainable_block_count"]),
                         int(row["exception_block_count"]),
                     )
-                    for index, row in enumerate(session_rows)
+                    for index, row in enumerate(session_payloads)
                 ],
             )
             conn.executemany(
@@ -3431,6 +3965,117 @@ class SpreadTracker:
         if row is None:
             raise KeyError("No training runs found")
         return self.get_training_run(int(row["id"]))
+
+    def get_training_quality_report(
+        self,
+        *,
+        sequence_length: int = _DEFAULT_CLEAN_SEQUENCE_LENGTH,
+        prediction_horizon_sec: int = _DEFAULT_CLEAN_PREDICTION_HORIZON_SEC,
+    ) -> dict[str, Any]:
+        if self.db_path is None or not self.db_path.is_file():
+            return {
+                "config": self.get_training_config(),
+                "summary": {
+                    "total_sessions": 0,
+                    "critical_sessions": 0,
+                    "training_ready_sessions": 0,
+                    "burn_in_passed_sessions": 0,
+                    "checkpoint_ready_sessions": 0,
+                },
+                "sessions": [],
+            }
+        listing = self.list_training_sessions(include_open=True)
+        allowed_training_ids = set(
+            self.get_approved_training_session_ids(
+                include_open=False,
+                sequence_length=int(sequence_length),
+                prediction_horizon_sec=int(prediction_horizon_sec),
+            )
+        )
+        sessions = []
+        for session in listing["sessions"]:
+            dynamic_status = self._session_quality_status(
+                status=str(session["status"]),
+                critical_anomaly_count=int(session.get("critical_anomaly_count", 0)),
+                session_span_sec=float(session.get("session_span_sec", 0.0) or 0.0),
+                record_interval_sec=float(session.get("record_interval_sec", self.record_interval_sec) or self.record_interval_sec),
+                sequence_length=int(sequence_length),
+                prediction_horizon_sec=int(prediction_horizon_sec),
+            )
+            session_payload = dict(session)
+            session_payload["dynamic_quality_status"] = dynamic_status
+            session_payload["dynamic_training_ready"] = int(session["id"]) in allowed_training_ids
+            sessions.append(session_payload)
+        return {
+            "config": self.get_training_config(),
+            "summary": dict(listing["summary"]),
+            "sequence_length": int(sequence_length),
+            "prediction_horizon_sec": int(prediction_horizon_sec),
+            "sessions": sessions,
+        }
+
+    def reset_training_cycle(self, *, archive_root: str | Path | None = None) -> dict[str, Any]:
+        if self.db_path is None:
+            raise RuntimeError("Tracker storage is not configured")
+        now = time.time()
+        self.flush_to_storage(now_ts=now, force=True)
+        if self._active_session_id:
+            self.close_active_session(status="interrupted", ended_at=now)
+        quality_report = self.get_training_quality_report()
+        storage_stats = self.get_storage_stats()
+        timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
+        archive_base = Path(archive_root) if archive_root is not None else self.db_path.parent.parent / "archive" / "tracker_cycles"
+        archive_dir = archive_base / timestamp
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archived_files: list[str] = []
+        for suffix in ("", "-wal", "-shm"):
+            source_path = Path(f"{self.db_path}{suffix}")
+            if not source_path.exists():
+                continue
+            target_path = archive_dir / source_path.name
+            shutil.copy2(str(source_path), str(target_path))
+            archived_files.append(str(target_path))
+        manifest = {
+            "archived_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+            "source_db_path": str(self.db_path),
+            "archived_files": archived_files,
+            "storage_stats": storage_stats,
+            "quality_report_summary": quality_report.get("summary", {}),
+        }
+        (archive_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+        with self._lock:
+            self._pairs = defaultdict(PairStats)
+            self._dirty_pairs.clear()
+            self._deleted_pairs.clear()
+            self._last_flush_at = 0.0
+            self._active_session_id = 0
+            self._ephemeral_session_id = 1
+            self._ephemeral_block_id = 1
+        with self._connect() as conn:
+            conn.executescript(
+                """
+                DROP TABLE IF EXISTS ml_training_run_blocks;
+                DROP TABLE IF EXISTS ml_training_run_sessions;
+                DROP TABLE IF EXISTS ml_training_runs;
+                DROP TABLE IF EXISTS tracker_pair_episodes;
+                DROP TABLE IF EXISTS tracker_pair_blocks;
+                DROP TABLE IF EXISTS tracker_capture_sessions;
+                DROP TABLE IF EXISTS tracker_events;
+                DROP TABLE IF EXISTS tracker_records;
+                DROP TABLE IF EXISTS tracker_pairs;
+                DROP TABLE IF EXISTS tracker_meta;
+                """
+            )
+        self._initialize_storage()
+        self._open_runtime_session()
+        return {
+            "archive_dir": str(archive_dir),
+            "manifest_path": str(archive_dir / "manifest.json"),
+            "archived_files": archived_files,
+            "quality_report_summary": quality_report.get("summary", {}),
+            "new_db_path": str(self.db_path),
+            "new_active_session_id": int(self._active_session_id),
+        }
 
     def get_storage_stats(self) -> Dict[str, object]:
         stats: Dict[str, object] = {

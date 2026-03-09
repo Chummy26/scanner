@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import statistics
@@ -12,6 +13,22 @@ from pathlib import Path
 def default_report_path(workspace_root: Path | None = None) -> Path:
     base = Path(workspace_root) if workspace_root is not None else Path(os.environ.get("GEMINI_WORKSPACE_DIR", "."))
     return base / "best_lstm_model.runtime_diagnostic.md"
+
+
+def resolve_runtime_paths(
+    report_path_arg: str,
+    db_path_arg: str,
+    *,
+    workspace_root: Path | None = None,
+) -> tuple[Path, Path]:
+    base = Path(workspace_root) if workspace_root is not None else Path(os.environ.get("GEMINI_WORKSPACE_DIR", "."))
+    report_path = Path(report_path_arg) if report_path_arg else default_report_path(base)
+    if not report_path.is_absolute():
+        report_path = (base / report_path).resolve()
+    db_path = Path(db_path_arg)
+    if not db_path.is_absolute():
+        db_path = (base / db_path).resolve()
+    return report_path, db_path
 
 
 def build_report(metrics: dict[str, float | int]) -> str:
@@ -41,24 +58,14 @@ Este diagnóstico mede saúde de runtime e integridade do payload. Ele não prov
 """.strip() + "\n"
 
 
-def main():
-    print("Starting 10-minute Deep Learning Runtime Diagnostic...")
-    duration_minutes = 10
-    iterations = duration_minutes * 6
-
-    server_process = subprocess.Popen(
-        [sys.executable, "src/server.py"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        cwd=os.getcwd(),
-    )
-
-    print("Waiting 15 seconds for server to start and WS connections to establish...")
-    time.sleep(15)
-
-    api_url = "http://127.0.0.1:8000/api/v1/ml/dashboard"
-    db_path = Path("out/config/tracker_history.sqlite")
-
+def collect_runtime_metrics(
+    *,
+    api_url: str,
+    db_path: Path,
+    duration_sec: int = 600,
+    probe_interval_sec: int = 10,
+) -> dict[str, float | int]:
+    iterations = max(1, int(duration_sec) // max(1, int(probe_interval_sec)))
     latencies = []
     db_sizes = []
     quality_errors = 0
@@ -67,53 +74,46 @@ def main():
     degraded_rows_seen = 0
     ready_rows_seen = 0
 
-    try:
-        for index in range(iterations):
-            start_t = time.time()
-            try:
-                req = urllib.request.urlopen(api_url, timeout=5)
-                res = req.read()
-                latency_ms = (time.time() - start_t) * 1000
-                latencies.append(latency_ms)
+    for index in range(iterations):
+        start_t = time.time()
+        try:
+            req = urllib.request.urlopen(api_url, timeout=5)
+            res = req.read()
+            latency_ms = (time.time() - start_t) * 1000
+            latencies.append(latency_ms)
 
-                payload = json.loads(res.decode("utf-8"))
-                data = payload.get("data", [])
-                total_samples += len(data)
+            payload = json.loads(res.decode("utf-8"))
+            data = payload.get("data", [])
+            total_samples += len(data)
 
-                for opp in data:
-                    ml = opp.get("mlContext")
-                    if not ml:
-                        degraded_rows_seen += 1
-                        continue
-                    if ml.get("ml_score") is None or not isinstance(ml.get("ml_score"), int):
-                        quality_errors += 1
-                    if ml.get("signal_action") not in ["WAIT", "EXECUTE", "STRONG_EXECUTE"]:
-                        quality_errors += 1
-                    if "success_probability" not in ml:
-                        quality_errors += 1
-                    if ml.get("model_status") not in ["ready", "missing_artifact", "load_failed", "insufficient_history", "stale_artifact"]:
-                        quality_errors += 1
-                    if "inversion_probability" not in ml:
-                        quality_errors += 1
-                    if "signal_reason" not in ml:
-                        quality_errors += 1
-                    if ml.get("model_status") == "ready":
-                        ready_rows_seen += 1
-                    else:
-                        degraded_rows_seen += 1
+            for opp in data:
+                ml = opp.get("mlContext")
+                if not ml:
+                    degraded_rows_seen += 1
+                    continue
+                if ml.get("ml_score") is None or not isinstance(ml.get("ml_score"), int):
+                    quality_errors += 1
+                if ml.get("signal_action") not in ["WAIT", "EXECUTE", "STRONG_EXECUTE"]:
+                    quality_errors += 1
+                if "success_probability" not in ml:
+                    quality_errors += 1
+                if ml.get("model_status") not in ["ready", "missing_artifact", "load_failed", "insufficient_history", "stale_artifact"]:
+                    quality_errors += 1
+                if "inversion_probability" not in ml:
+                    quality_errors += 1
+                if "signal_reason" not in ml:
+                    quality_errors += 1
+                if ml.get("model_status") == "ready":
+                    ready_rows_seen += 1
+                else:
+                    degraded_rows_seen += 1
 
-                records_tracked = len(data)
-            except Exception as exc:
-                print(f"Error fetching data at iter {index}: {exc}")
+            records_tracked = len(data)
+        except Exception as exc:
+            print(f"Error fetching data at iter {index}: {exc}")
 
-            db_sizes.append(db_path.stat().st_size / 1024 if db_path.exists() else 0.0)
-            if (index + 1) % 6 == 0:
-                print(f"Progress: {(index + 1) // 6} / {duration_minutes} minutes elapsed...")
-            time.sleep(10)
-    finally:
-        print("Test complete. Shutting down server...")
-        server_process.terminate()
-        server_process.wait()
+        db_sizes.append(db_path.stat().st_size / 1024 if db_path.exists() else 0.0)
+        time.sleep(max(1, int(probe_interval_sec)))
 
     avg_latency = statistics.mean(latencies) if latencies else 0.0
     max_latency = max(latencies) if latencies else 0.0
@@ -125,24 +125,65 @@ def main():
     total_rows = ready_rows_seen + degraded_rows_seen
     artifact_ready_ratio = (ready_rows_seen / total_rows) if total_rows else 0.0
 
-    report = build_report(
-        {
-            "avg_latency_ms": avg_latency,
-            "p99_latency_ms": p99_latency,
-            "max_latency_ms": max_latency,
-            "min_latency_ms": min_latency,
-            "start_db_kb": start_db,
-            "end_db_kb": end_db,
-            "db_growth_kb": db_growth,
-            "total_samples": total_samples,
-            "quality_errors": quality_errors,
-            "records_tracked": records_tracked,
-            "degraded_rows_seen": degraded_rows_seen,
-            "artifact_ready_ratio": artifact_ready_ratio,
-        }
-    )
+    return {
+        "avg_latency_ms": avg_latency,
+        "p99_latency_ms": p99_latency,
+        "max_latency_ms": max_latency,
+        "min_latency_ms": min_latency,
+        "start_db_kb": start_db,
+        "end_db_kb": end_db,
+        "db_growth_kb": db_growth,
+        "total_samples": total_samples,
+        "quality_errors": quality_errors,
+        "records_tracked": records_tracked,
+        "degraded_rows_seen": degraded_rows_seen,
+        "artifact_ready_ratio": artifact_ready_ratio,
+    }
 
-    report_path = default_report_path()
+
+def main():
+    parser = argparse.ArgumentParser(description="Run runtime payload diagnostic against the ML dashboard.")
+    parser.add_argument("--duration-sec", type=int, default=600)
+    parser.add_argument("--probe-interval-sec", type=int, default=10)
+    parser.add_argument("--startup-wait-sec", type=int, default=15)
+    parser.add_argument("--base-url", default="http://127.0.0.1:8000")
+    parser.add_argument("--db-path", default=os.environ.get("TEAM_OP_TRACKER_DB_PATH", "out/config/tracker_history.sqlite"))
+    parser.add_argument("--output", default="")
+    parser.add_argument("--spawn-server", action="store_true")
+    args = parser.parse_args()
+
+    print("Starting runtime diagnostic...")
+    report_path, db_path = resolve_runtime_paths(
+        args.output,
+        args.db_path,
+        workspace_root=Path(os.getcwd()),
+    )
+    api_url = args.base_url.rstrip("/") + "/api/v1/ml/dashboard"
+    server_process = None
+    if args.spawn_server:
+        server_process = subprocess.Popen(
+            [sys.executable, "src/server.py"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=os.getcwd(),
+            env=os.environ.copy(),
+        )
+        print(f"Waiting {int(args.startup_wait_sec)} seconds for server startup...")
+        time.sleep(max(0, int(args.startup_wait_sec)))
+    try:
+        metrics = collect_runtime_metrics(
+            api_url=api_url,
+            db_path=db_path,
+            duration_sec=int(args.duration_sec),
+            probe_interval_sec=int(args.probe_interval_sec),
+        )
+    finally:
+        if server_process is not None:
+            print("Test complete. Shutting down server...")
+            server_process.terminate()
+            server_process.wait()
+
+    report = build_report(metrics)
     report_path.write_text(report, encoding="utf-8")
     print("Report generated successfully.")
     print("=" * 40)

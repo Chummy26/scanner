@@ -26,3 +26,16 @@ def test_runtime_diagnostic_report_is_separate_and_cautious(tmp_path: Path):
     assert "ml_diagnostic_report.md" not in str(report_path)
     assert "não prova qualidade do modelo" in report
     assert "estável" not in report.lower()
+
+
+def test_runtime_diagnostic_resolves_paths_absolutely(tmp_path: Path):
+    report_path, db_path = run_10m_diagnostic.resolve_runtime_paths(
+        "out/reports/runtime.md",
+        "out/config/tracker.sqlite",
+        workspace_root=tmp_path,
+    )
+
+    assert report_path.is_absolute()
+    assert db_path.is_absolute()
+    assert str(report_path).endswith(str(Path("out") / "reports" / "runtime.md"))
+    assert str(db_path).endswith(str(Path("out") / "config" / "tracker.sqlite"))

@@ -138,6 +138,8 @@ class SpreadEngine:
     def calculate_all(
         self,
         on_spread: Optional[Callable[[str, str, str, str, str, float, float], None]] = None,
+        *,
+        record_sink: Optional[list] = None,
     ) -> List[SpreadOpportunity]:
         """Calculate spreads across all symbol/exchange/market combinations.
 
@@ -206,7 +208,9 @@ class SpreadEngine:
             opps, stale_n, records = self._calc_symbol(
                 symbol, exchanges, now, stale_threshold,
                 use_top_of_book, notional_usd,
-                min_spread, max_spread, on_spread is not None,
+                min_spread,
+                max_spread,
+                (on_spread is not None) or (record_sink is not None),
             )
             _stale_count += stale_n
             self._opps_by_symbol[symbol] = opps
@@ -266,6 +270,9 @@ class SpreadEngine:
                 if sym not in live:
                     del self._opps_by_symbol[sym]
         aging_finished = time.perf_counter()
+
+        if record_sink is not None and spread_records:
+            record_sink.extend(spread_records)
 
         # ------ batch on_spread callbacks ------
         callbacks_started = time.perf_counter()

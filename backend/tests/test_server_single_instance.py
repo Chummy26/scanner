@@ -16,6 +16,45 @@ def test_looks_like_server_process_matches_module_and_script_forms():
     assert server_module._looks_like_server_process(["python", "something_else.py"]) is False
 
 
+def test_looks_like_server_process_rejects_wrapper_processes():
+    """cmd.exe, bash.exe, and timeout.exe wrappers must NOT match."""
+    assert server_module._looks_like_server_process(
+        ["cmd", "/c", "start", "/b", ".venv\\Scripts\\python.exe", "-u", "src/server.py"]
+    ) is False
+    assert server_module._looks_like_server_process(
+        ["bash", "-c", ".venv/Scripts/python.exe -u src/server.py"]
+    ) is False
+    assert server_module._looks_like_server_process(
+        ["timeout", "12", ".venv/Scripts/python.exe", "-u", "src/server.py"]
+    ) is False
+    assert server_module._looks_like_server_process(
+        ["C:\\Program Files\\Git\\usr\\bin\\timeout.exe", "15", ".venv/Scripts/python.exe", "-u", "src/server.py"]
+    ) is False
+
+
+def test_looks_like_server_process_matches_venv_python():
+    """Venv python paths should still match."""
+    assert server_module._looks_like_server_process(
+        [".venv/Scripts/python.exe", "-u", "src/server.py"]
+    ) is True
+    assert server_module._looks_like_server_process(
+        [".venv\\Scripts\\python.exe", "-u", "src\\server.py"]
+    ) is True
+    assert server_module._looks_like_server_process(
+        ["C:\\Users\\user\\backend\\.venv\\Scripts\\python.exe", "-u", "src/server.py"]
+    ) is True
+
+
+def test_looks_like_server_process_rejects_inline_scripts():
+    """python -c '...src/server.py...' should NOT match."""
+    assert server_module._looks_like_server_process(
+        ["python", "-c", "import subprocess; subprocess.Popen(['python', '-u', 'src/server.py'])"]
+    ) is False
+    assert server_module._looks_like_server_process(
+        [".venv/Scripts/python.exe", "-c", "from server import main"]
+    ) is False
+
+
 def test_find_conflicting_server_processes_ignores_current_pid(monkeypatch):
     fake_procs = [
         _FakeProc(100, ["python", "-m", "src.server"]),

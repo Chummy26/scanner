@@ -615,7 +615,12 @@ class WSManager:
         # --- 1. Spread calculation ----------------------------------------
         _perf_started = time.perf_counter()
         record_started_at_by_key = {}
-        opportunities = self.engine.calculate_all(on_spread=None)
+        capture_mode = str(getattr(self.config, "tracker_capture_mode", "continuous_all_pairs") or "continuous_all_pairs").strip().lower()
+        raw_capture_records = [] if (on_spread_cb and capture_mode == "continuous_all_pairs") else None
+        try:
+            opportunities = self.engine.calculate_all(on_spread=None, record_sink=raw_capture_records)
+        except TypeError:
+            opportunities = self.engine.calculate_all(on_spread=None)
         _t_calc = time.time()
         _perf_after_calc = time.perf_counter()
 
@@ -770,9 +775,13 @@ class WSManager:
             ]
         _perf_after_filter = time.perf_counter()
 
-        # Batch-record only the filtered operational opportunities.
         _records_batch = []
-        if on_spread_cb:
+        if on_spread_cb and capture_mode == "continuous_all_pairs":
+            _records_batch = list(raw_capture_records or [])
+            for record in _records_batch:
+                key = self.tracker._pair_key(*record[:5])
+                record_started_at_by_key[key] = time.perf_counter()
+        elif on_spread_cb:
             for opp in opportunities:
                 record = (
                     opp.asset,

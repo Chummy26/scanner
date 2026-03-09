@@ -129,6 +129,15 @@ def _looks_like_server_process(cmdline: list[str] | tuple[str, ...] | None) -> b
     normalized = [_normalize_cmdline_part(part) for part in cmdline if str(part or "").strip()]
     if not normalized:
         return False
+    # The process must be a Python interpreter to be a server instance.
+    # This filters out wrapper processes (cmd.exe, bash.exe, timeout.exe)
+    # that happen to contain server.py in their cmdline arguments.
+    if "python" not in normalized[0]:
+        return False
+    # Skip inline scripts (python -c "...code mentioning server.py...")
+    # These are helper scripts, not actual server processes.
+    if "-c" in normalized:
+        return False
     if any(part == "src.server" for part in normalized):
         return True
     server_path = _normalize_cmdline_part(SRC_DIR / "server.py")
@@ -150,11 +159,17 @@ def find_conflicting_server_processes(current_pid: int | None = None) -> list[di
     if psutil is None:
         return []
     current = int(current_pid or os.getpid())
+    # Exclude the current process and its parent (start.bat / cmd.exe / bash wrapper).
+    exclude_pids = {current}
+    try:
+        exclude_pids.add(psutil.Process(current).ppid())
+    except Exception:
+        pass
     conflicts: list[dict[str, object]] = []
     for proc in psutil.process_iter(["pid", "name", "cmdline"]):
         try:
             pid = int(proc.info.get("pid") or 0)
-            if pid <= 0 or pid == current:
+            if pid <= 0 or pid in exclude_pids:
                 continue
             cmdline = proc.info.get("cmdline") or []
             if not _looks_like_server_process(cmdline):
@@ -898,6 +913,7 @@ async def handle_debug_status(request):
             "tracking_window_sec": ws_mgr.config.tracking_window_sec,
             "tracker_record_interval_sec": ws_mgr.config.tracker_record_interval_sec,
             "tracker_gap_threshold_sec": getattr(ws_mgr.config, "tracker_gap_threshold_sec", 0.0),
+            "tracker_capture_mode": str(getattr(ws_mgr.config, "tracker_capture_mode", "continuous_all_pairs") or "continuous_all_pairs"),
             "min_total_spread_pct": getattr(ws_mgr.config, "min_total_spread_pct", 1.0),
             "tracker_db_path": getattr(ws_mgr.config, "tracker_db_path", ""),
             "total_configured_symbols": len(ws_mgr.config.symbols),
@@ -1556,11 +1572,19 @@ async def handle_ml_training_cohort_preview(request):
     except Exception:
         payload = {}
     session_ids = payload.get("session_ids") if isinstance(payload, dict) else None
+    sequence_length = int(payload.get("sequence_length") or 15) if isinstance(payload, dict) else 15
+    prediction_horizon_sec = int(payload.get("prediction_horizon_sec") or 14_400) if isinstance(payload, dict) else 14_400
     try:
         normalized_session_ids = [int(value) for value in session_ids] if session_ids is not None else None
     except (TypeError, ValueError):
         return web.json_response({"error": "invalid session_ids"}, status=400)
-    return web.json_response(ws_mgr.tracker.preview_training_cohorts(session_ids=normalized_session_ids))
+    return web.json_response(
+        ws_mgr.tracker.preview_training_cohorts(
+            session_ids=normalized_session_ids,
+            sequence_length=sequence_length,
+            prediction_horizon_sec=prediction_horizon_sec,
+        )
+    )
 
 
 async def handle_ml_training_blocks_api(request):
@@ -1641,8 +1665,8 @@ async def handle_ml_training_config_patch(request):
         payload = await request.json()
     except Exception:
         return web.json_response({"error": "invalid json"}, status=400)
-    if "gap_threshold_sec" not in payload and "min_total_spread_pct" not in payload:
-        return web.json_response({"error": "gap_threshold_sec or min_total_spread_pct is required"}, status=400)
+    if "gap_threshold_sec" not in payload and "min_total_spread_pct" not in payload and "capture_mode" not in payload:
+        return web.json_response({"error": "gap_threshold_sec, min_total_spread_pct or capture_mode is required"}, status=400)
     try:
         if "gap_threshold_sec" in payload:
             ws_mgr.config.tracker_gap_threshold_sec = ws_mgr.tracker.update_gap_threshold_sec(float(payload["gap_threshold_sec"]))
@@ -1651,12 +1675,15 @@ async def handle_ml_training_config_patch(request):
             ws_mgr.config.min_total_spread_pct = min_total_spread_pct
             if getattr(ws_mgr, "ml_analyzer", None) is not None:
                 ws_mgr.ml_analyzer.min_total_spread_pct = float(min_total_spread_pct)
+        if "capture_mode" in payload:
+            ws_mgr.config.tracker_capture_mode = str(payload["capture_mode"] or "continuous_all_pairs").strip().lower() or "continuous_all_pairs"
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=400)
     return web.json_response(
         {
             "gap_threshold_sec": float(ws_mgr.tracker.gap_threshold_sec),
             "min_total_spread_pct": float(ws_mgr.tracker.min_total_spread_pct),
+            "capture_mode": str(getattr(ws_mgr.config, "tracker_capture_mode", "continuous_all_pairs") or "continuous_all_pairs"),
         }
     )
 
@@ -1681,6 +1708,40 @@ async def handle_ml_training_resegment(request):
         return web.json_response({"error": str(exc)}, status=400)
     if "gap_threshold_sec" in result:
         ws_mgr.config.tracker_gap_threshold_sec = float(result["gap_threshold_sec"])
+    return web.json_response(result)
+
+
+async def handle_ml_training_quality_report(request):
+    ws_mgr = request.app.get("ws_manager")
+    if not ws_mgr:
+        return web.json_response({"config": {}, "summary": {"total_sessions": 0}, "sessions": []})
+    try:
+        sequence_length = int(request.query.get("sequence_length", "15") or 15)
+        prediction_horizon_sec = int(request.query.get("prediction_horizon_sec", "14400") or 14_400)
+    except (TypeError, ValueError):
+        return web.json_response({"error": "invalid sequence_length or prediction_horizon_sec"}, status=400)
+    return web.json_response(
+        ws_mgr.tracker.get_training_quality_report(
+            sequence_length=sequence_length,
+            prediction_horizon_sec=prediction_horizon_sec,
+        )
+    )
+
+
+async def handle_ml_training_reset_cycle(request):
+    ws_mgr = request.app.get("ws_manager")
+    if not ws_mgr:
+        return web.json_response({"error": "tracker unavailable"}, status=503)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    archive_root = payload.get("archive_root") if isinstance(payload, dict) else None
+    result = ws_mgr.tracker.reset_training_cycle(archive_root=archive_root)
+    if hasattr(ws_mgr, "_ml_cache"):
+        ws_mgr._ml_cache.clear()
+    if hasattr(ws_mgr, "_ml_pending_refreshes"):
+        ws_mgr._ml_pending_refreshes.clear()
     return web.json_response(result)
 
 
@@ -2747,6 +2808,8 @@ async def on_startup(app):
                 config.tracker_max_records_per_pair = int(os.environ["TEAM_OP_TRACKER_MAX_RECORDS_PER_PAIR"])
             if os.environ.get("TEAM_OP_TRACKER_GAP_THRESHOLD_SEC"):
                 config.tracker_gap_threshold_sec = float(os.environ["TEAM_OP_TRACKER_GAP_THRESHOLD_SEC"])
+            if os.environ.get("TEAM_OP_TRACKER_CAPTURE_MODE"):
+                config.tracker_capture_mode = os.environ["TEAM_OP_TRACKER_CAPTURE_MODE"].strip().lower()
             if os.environ.get("TEAM_OP_MIN_TOTAL_SPREAD_PCT"):
                 config.min_total_spread_pct = float(os.environ["TEAM_OP_MIN_TOTAL_SPREAD_PCT"])
             if os.environ.get("TEAM_OP_TRACKER_DB_PATH"):
@@ -2965,7 +3028,9 @@ def create_app() -> web.Application:
     app.router.add_post("/api/v1/ml/training/blocks/{block_id}/split", handle_ml_training_block_split)
     app.router.add_post("/api/v1/ml/training/blocks/{block_id}/merge-next", handle_ml_training_block_merge_next)
     app.router.add_patch("/api/v1/ml/training/config", handle_ml_training_config_patch)
+    app.router.add_get("/api/v1/ml/training/quality-report", handle_ml_training_quality_report)
     app.router.add_post("/api/v1/ml/training/resegment", handle_ml_training_resegment)
+    app.router.add_post("/api/v1/ml/training/reset-cycle", handle_ml_training_reset_cycle)
     app.router.add_post("/api/v1/ml/training/runs", handle_ml_training_run_create)
     app.router.add_get("/api/v1/ml/training/runs/{run_id}", handle_ml_training_run_status)
     app.router.add_get("/api/v1/ml/training/runs/latest", handle_ml_training_run_latest)

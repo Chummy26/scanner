@@ -104,7 +104,7 @@ def test_ws_manager_reuses_prediction_when_tracker_marker_is_unchanged(tmp_path:
     ws_mgr = WSManager(config)
     ws_mgr.tracker = _FakeTracker()
     ws_mgr.ml_analyzer = _FakeAnalyzer()
-    ws_mgr.engine.calculate_all = lambda on_spread=None: [_make_opportunity()]
+    ws_mgr.engine.calculate_all = lambda on_spread=None, record_sink=None: [_make_opportunity()]
 
     ws_mgr._enrich_tracker_cycle = 15
     ws_mgr._do_calc_enrich(None)
@@ -125,7 +125,7 @@ def test_ws_manager_refreshes_prediction_when_tracker_marker_changes(tmp_path: P
     fake_tracker = _FakeTracker()
     ws_mgr.tracker = fake_tracker
     ws_mgr.ml_analyzer = _FakeAnalyzer()
-    ws_mgr.engine.calculate_all = lambda on_spread=None: [_make_opportunity()]
+    ws_mgr.engine.calculate_all = lambda on_spread=None, record_sink=None: [_make_opportunity()]
 
     ws_mgr._enrich_tracker_cycle = 15
     ws_mgr._do_calc_enrich(None)
@@ -220,3 +220,28 @@ def test_ws_manager_prunes_stale_ml_runtime_state_when_active_keys_shrink(tmp_pa
     assert active_key in ws_mgr._ml_pending_refreshes
     assert stale_key not in ws_mgr._ml_cache
     assert ws_mgr._ml_cache[active_key]["last_seen_at"] == old_ts + 1.0
+
+
+def test_ws_manager_continuous_capture_uses_raw_records_not_filtered_opportunities(tmp_path: Path):
+    config = SpreadConfig(exchanges=[], symbols=[], tracker_db_path=str(tmp_path / "tracker.sqlite"))
+    ws_mgr = WSManager(config)
+    captured_batches = []
+
+    class _CaptureTracker(_FakeTracker):
+        def batch_record(self, records, *, now_ts=None):
+            captured_batches.append((list(records), now_ts))
+
+    ws_mgr.tracker = _CaptureTracker()
+    ws_mgr.ml_analyzer = _FakeAnalyzer()
+
+    def _fake_calculate_all(on_spread=None, record_sink=None):
+        if record_sink is not None:
+            record_sink.append(("BTC", "mexc", "spot", "gate", "futures", 0.4, -0.2))
+        return []
+
+    ws_mgr.engine.calculate_all = _fake_calculate_all
+
+    ws_mgr._do_calc_enrich(object())
+
+    assert len(captured_batches) == 1
+    assert captured_batches[0][0] == [("BTC", "mexc", "spot", "gate", "futures", 0.4, -0.2)]

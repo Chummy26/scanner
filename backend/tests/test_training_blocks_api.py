@@ -63,7 +63,7 @@ def test_training_blocks_api_lists_real_sqlite_sessions_and_blocks(tmp_path: Pat
 
     assert payload["summary"]["total_sessions"] == 1
     assert payload["summary"]["total_blocks"] == 2
-    assert payload["summary"]["trainable_blocks"] == 2
+    assert payload["summary"]["trainable_blocks"] == 1
     assert payload["sessions"][0]["status"] == "closed"
     assert [block["boundary_reason"] for block in payload["sessions"][0]["blocks"]] == ["initial", "auto_gap"]
 
@@ -125,12 +125,12 @@ def test_training_run_handlers_snapshot_selected_blocks(tmp_path: Path, monkeypa
 
     create_response = asyncio.run(
         handle_ml_training_run_create(
-            _FakeRequest(
-                app,
-                payload={"sequence_length": 2, "prediction_horizon_sec": 240},
+                _FakeRequest(
+                    app,
+                    payload={"sequence_length": 2, "prediction_horizon_sec": 30},
+                )
             )
         )
-    )
     create_payload = json.loads(create_response.text)
     assert create_response.status == 202
     assert [session["session_id"] for session in create_payload["sessions"]] == [session_id]
@@ -164,7 +164,7 @@ def test_execute_training_run_uses_clean_training_cycle(tmp_path: Path, monkeypa
     run_payload = tracker.create_training_run(
         session_ids=[session_id],
         sequence_length=2,
-        prediction_horizon_sec=240,
+        prediction_horizon_sec=30,
     )
     called: dict[str, object] = {}
 

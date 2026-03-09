@@ -1,4 +1,7 @@
+import sqlite3
 from pathlib import Path
+
+import pytest
 
 from src.spread.spread_tracker import SpreadTracker
 
@@ -157,13 +160,12 @@ def test_tracker_split_merge_and_training_run_snapshot(tmp_path: Path):
     assert split_result["new_block_id"] in {block["id"] for block in blocks_after_split}
 
     first_block_id = int(blocks_after_split[0]["id"])
-    run_payload = tracker.create_training_run(
-        block_ids=[block["id"] for block in blocks_after_split],
-        sequence_length=2,
-        prediction_horizon_sec=240,
-    )
-    assert run_payload["selected_block_count"] == 2
-    assert [block["block_id"] for block in run_payload["blocks"]] == [block["id"] for block in blocks_after_split]
+    with pytest.raises(ValueError, match="clean-cycle block gates"):
+        tracker.create_training_run(
+            block_ids=[block["id"] for block in blocks_after_split],
+            sequence_length=2,
+            prediction_horizon_sec=30,
+        )
 
     merge_result = tracker.merge_next_block(first_block_id)
     merged_blocks = tracker.list_training_blocks()["sessions"][0]["blocks"]
@@ -453,3 +455,78 @@ def test_tracker_batch_record_flush_materializes_runtime_block_ids(tmp_path: Pat
     storage = tracker.get_storage_stats()
     assert storage["records_total"] == 3
     assert storage["blocks_total"] == 2
+
+
+def test_tracker_quality_report_flags_structural_anomalies(tmp_path: Path):
+    db_path = tmp_path / "tracker_history.sqlite"
+    tracker = SpreadTracker(
+        window_sec=7200,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=db_path,
+    )
+    pair = ("BTC", "mexc", "spot", "gate", "futures")
+    for ts in (0.0, 15.0, 30.0, 45.0):
+        tracker.record_spread(*pair, 0.4, -0.2, now_ts=ts)
+    assert tracker.flush_to_storage(now_ts=45.0, force=True)
+    tracker.close_active_session(ended_at=45.0)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        block_id = int(conn.execute("SELECT id FROM tracker_pair_blocks ORDER BY id ASC LIMIT 1").fetchone()["id"])
+        session_id = int(conn.execute("SELECT id FROM tracker_capture_sessions ORDER BY id ASC LIMIT 1").fetchone()["id"])
+        pair_id = int(conn.execute("SELECT id FROM tracker_pairs ORDER BY id ASC LIMIT 1").fetchone()["id"])
+        conn.execute(
+            """
+            INSERT INTO tracker_pair_blocks(
+                pair_id, session_id, start_ts, end_ts, record_count, max_gap_sec, boundary_reason,
+                selected_for_training, disabled_reason, manual_override, notes, is_open, created_at, updated_at
+            )
+            VALUES(?, ?, ?, ?, 0, 0.0, 'auto_gap', 1, '', 0, '', 0, ?, ?)
+            """,
+            (pair_id, session_id, 120.0, 120.0, 120.0, 120.0),
+        )
+        conn.execute("UPDATE tracker_events SET block_id = NULL WHERE block_id = ?", (block_id,))
+        conn.execute(
+            """
+            INSERT INTO tracker_events(pair_id, event_type, ts, session_id, block_id)
+            VALUES(?, 'entry', ?, ?, NULL)
+            """,
+            (pair_id, 300.0, session_id),
+        )
+        conn.commit()
+
+    report = tracker.get_training_quality_report(sequence_length=4, prediction_horizon_sec=30)
+
+    assert report["summary"]["zero_record_blocks"] >= 1
+    assert report["summary"]["missing_event_blocks"] >= 1
+    assert report["sessions"][0]["critical_anomaly_count"] >= 2
+
+
+def test_tracker_reset_training_cycle_archives_existing_db_and_reopens_runtime_session(tmp_path: Path):
+    db_path = tmp_path / "tracker_history.sqlite"
+    tracker = SpreadTracker(
+        window_sec=7200,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=db_path,
+    )
+    pair = ("BTC", "mexc", "spot", "gate", "futures")
+    tracker.record_spread(*pair, 0.4, -0.2, now_ts=0.0)
+    tracker.record_spread(*pair, 0.5, -0.1, now_ts=15.0)
+    assert tracker.flush_to_storage(now_ts=15.0, force=True)
+
+    result = tracker.reset_training_cycle(archive_root=tmp_path / "archive")
+
+    assert Path(result["archive_dir"]).is_dir()
+    assert Path(result["manifest_path"]).is_file()
+    assert Path(result["new_db_path"]).is_file()
+    assert result["new_active_session_id"] > 0
+    fresh_stats = tracker.get_storage_stats()
+    assert fresh_stats["records_total"] == 0

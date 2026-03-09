@@ -30,6 +30,7 @@ def inspect_runtime(db_path: Path, base_url: str, run_id: int | None = None) -> 
     sessions_payload = _fetch_json(base_url, "/api/v1/ml/training/sessions?include_open=1")
     preview_payload = _post_json(base_url, "/api/v1/ml/training/cohorts/preview", {})
     blocks_payload = _fetch_json(base_url, "/api/v1/ml/training/blocks")
+    quality_payload = _fetch_json(base_url, "/api/v1/ml/training/quality-report")
     html = _fetch_text(base_url, "/dashboard/training")
 
     with sqlite3.connect(db_path) as conn:
@@ -95,11 +96,17 @@ def inspect_runtime(db_path: Path, base_url: str, run_id: int | None = None) -> 
         )
         record_count_mismatches = []
         max_gap_mismatches = []
+        zero_record_blocks = []
+        range_mismatches = []
+        missing_event_blocks = []
+        open_blocks_after_close = []
         for block in blocks:
             timestamps = [
                 float(row["ts"])
                 for row in conn.execute("SELECT ts FROM tracker_records WHERE block_id = ? ORDER BY ts ASC", (int(block["id"]),))
             ]
+            if int(block["record_count"]) <= 0:
+                zero_record_blocks.append({"block_id": int(block["id"])})
             if len(timestamps) != int(block["record_count"]):
                 record_count_mismatches.append(
                     {
@@ -117,6 +124,47 @@ def inspect_runtime(db_path: Path, base_url: str, run_id: int | None = None) -> 
                         "observed_max_gap_sec": float(observed_gap),
                     }
                 )
+            if timestamps and (
+                abs(float(min(timestamps)) - float(block["start_ts"])) > 1e-9
+                or abs(float(max(timestamps)) - float(block["end_ts"])) > 1e-9
+            ):
+                range_mismatches.append(
+                    {
+                        "block_id": int(block["id"]),
+                        "expected_start_ts": float(block["start_ts"]),
+                        "observed_start_ts": float(min(timestamps)),
+                        "expected_end_ts": float(block["end_ts"]),
+                        "observed_end_ts": float(max(timestamps)),
+                    }
+                )
+        open_blocks_after_close = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT b.id AS block_id, b.session_id
+                FROM tracker_pair_blocks b
+                JOIN tracker_capture_sessions s ON s.id = b.session_id
+                WHERE b.is_open = 1 AND s.status != 'open'
+                ORDER BY b.session_id ASC, b.id ASC
+                """
+            )
+        ]
+        missing_event_blocks = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT e.pair_id, e.event_type, e.ts, e.session_id, e.block_id
+                FROM tracker_events e
+                LEFT JOIN tracker_pair_blocks b ON b.id = e.block_id
+                WHERE e.block_id IS NULL
+                   OR b.id IS NULL
+                   OR b.session_id != e.session_id
+                   OR e.ts < b.start_ts
+                   OR e.ts > b.end_ts
+                ORDER BY e.session_id ASC, e.ts ASC
+                """
+            )
+        ]
 
     selected_session_ids_api = [int(session["id"]) for session in preview_payload.get("sessions", [])]
     selected_sessions_db = [
@@ -159,6 +207,7 @@ def inspect_runtime(db_path: Path, base_url: str, run_id: int | None = None) -> 
         "sessions_api_summary": sessions_payload.get("summary", {}),
         "preview_summary": preview_payload.get("summary", {}),
         "blocks_api_summary": blocks_payload.get("summary", {}),
+        "quality_summary": quality_payload.get("summary", {}),
         "sessions": [dict(row) for row in sessions],
         "blocks_total": len(blocks),
         "selected_session_ids_api": selected_session_ids_api,
@@ -173,6 +222,10 @@ def inspect_runtime(db_path: Path, base_url: str, run_id: int | None = None) -> 
         "snapshot_matches_selection": sorted(run_snapshot_ids) == sorted(selected_block_ids_db if run_id is not None else selected_block_ids_api),
         "record_count_mismatches": record_count_mismatches,
         "max_gap_mismatches": max_gap_mismatches,
+        "zero_record_blocks": zero_record_blocks,
+        "range_mismatches": range_mismatches,
+        "missing_event_blocks": missing_event_blocks,
+        "open_blocks_after_close": open_blocks_after_close,
         "runs": [dict(row) for row in run_rows],
     }
 
@@ -200,6 +253,14 @@ def build_report(result: dict) -> str:
         f"- Total sessions: {int(result.get('blocks_api_summary', {}).get('total_sessions', 0))}\n"
         f"- Total blocks: {int(result.get('blocks_api_summary', {}).get('total_blocks', 0))}\n"
         f"- Trainable blocks: {int(result.get('blocks_api_summary', {}).get('trainable_blocks', 0))}\n\n"
+        "## Quality Report Summary\n"
+        f"- Critical sessions: {int(result.get('quality_summary', {}).get('critical_sessions', 0))}\n"
+        f"- Training-ready sessions: {int(result.get('quality_summary', {}).get('training_ready_sessions', 0))}\n"
+        f"- Burn-in passed sessions: {int(result.get('quality_summary', {}).get('burn_in_passed_sessions', 0))}\n"
+        f"- Zero-record blocks: {int(result.get('quality_summary', {}).get('zero_record_blocks', 0))}\n"
+        f"- Record-count mismatches: {int(result.get('quality_summary', {}).get('record_count_mismatches', 0))}\n"
+        f"- Range mismatches: {int(result.get('quality_summary', {}).get('range_mismatches', 0))}\n"
+        f"- Missing event blocks: {int(result.get('quality_summary', {}).get('missing_event_blocks', 0))}\n\n"
         "## Sessions\n"
         + ("\n".join(
             f"- Session {int(session['id'])}: status={session['status']} approved={bool(session['approved_for_training'])} data={float(session['data_start_ts']):.3f}->{float(session['data_end_ts']):.3f} blocks={int(session['block_count'])} trainable={int(session['trainable_block_count'])}"
@@ -218,8 +279,12 @@ def build_report(result: dict) -> str:
         f"- Training snapshot matches selected blocks: {result.get('snapshot_matches_selection')}\n\n"
         "## SQLite Integrity\n"
         f"- Blocks total: {int(result.get('blocks_total', 0))}\n"
+        f"- Zero-record blocks: {len(result.get('zero_record_blocks', []))}\n"
         f"- Record count mismatches: {len(result.get('record_count_mismatches', []))}\n"
         f"- Max gap mismatches: {len(result.get('max_gap_mismatches', []))}\n\n"
+        f"- Range mismatches: {len(result.get('range_mismatches', []))}\n"
+        f"- Missing event blocks: {len(result.get('missing_event_blocks', []))}\n"
+        f"- Open blocks after close: {len(result.get('open_blocks_after_close', []))}\n\n"
         "## Runs\n"
         + ("\n".join(
             f"- Run {int(run['id'])}: status={run['status']} selected_block_count={int(run['selected_block_count'])} sequence_length={int(run['sequence_length'])} horizon={int(run['prediction_horizon_sec'])}"

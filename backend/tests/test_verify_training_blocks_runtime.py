@@ -11,6 +11,7 @@ def test_build_report_includes_runtime_sections():
             "sessions_api_summary": {"total_sessions": 2, "approved_sessions": 2, "trainable_sessions": 2, "exception_sessions": 1},
             "preview_summary": {"eligible_sessions": 2, "eligible_blocks": 8, "fold_count": 1},
             "blocks_api_summary": {"total_sessions": 2, "total_blocks": 8, "trainable_blocks": 8},
+            "quality_summary": {"critical_sessions": 1, "training_ready_sessions": 1, "burn_in_passed_sessions": 1, "zero_record_blocks": 0, "record_count_mismatches": 0, "range_mismatches": 0, "missing_event_blocks": 0},
             "sessions": [{"id": 1, "status": "closed", "approved_for_training": 1, "data_start_ts": 1.0, "data_end_ts": 2.0, "block_count": 4, "trainable_block_count": 4}],
             "blocks_total": 8,
             "selected_session_ids_api": [1, 2],
@@ -23,8 +24,12 @@ def test_build_report_includes_runtime_sections():
             "selection_matches_db": True,
             "snapshot_sessions_match": True,
             "snapshot_matches_selection": True,
+            "zero_record_blocks": [],
             "record_count_mismatches": [],
             "max_gap_mismatches": [],
+            "range_mismatches": [],
+            "missing_event_blocks": [],
+            "open_blocks_after_close": [],
             "runs": [{"id": 1, "status": "completed", "selected_block_count": 2, "sequence_length": 4, "prediction_horizon_sec": 240}],
         }
     )
@@ -33,6 +38,7 @@ def test_build_report_includes_runtime_sections():
     assert "## UI" in report
     assert "## Sessions API Summary" in report
     assert "## Cohort Preview Summary" in report
+    assert "## Quality Report Summary" in report
     assert "## Selection Consistency" in report
     assert "## SQLite Integrity" in report
     assert "Run 1: status=completed" in report

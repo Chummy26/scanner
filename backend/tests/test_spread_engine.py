@@ -1,3 +1,5 @@
+import pytest
+
 from src.spread.models import OrderBookSnapshot, SpreadConfig, SpreadOpportunity
 from src.spread.spread_engine import SpreadEngine
 
@@ -70,3 +72,23 @@ def test_spread_engine_incremental_aging_keeps_connected_cached_opportunities(mo
     assert second[0].buy_book_age >= 30.0
     assert second[0].sell_book_age >= 30.0
 
+
+def test_spread_engine_collects_raw_records_separately_from_filtered_opportunities(monkeypatch):
+    monkeypatch.setattr("src.spread.spread_engine.time.time", lambda: 1_000.0)
+    engine = SpreadEngine(SpreadConfig(min_spread_pct=5.0))
+    engine._snapshots = {
+        "BTC": {
+            "mexc": {"spot": _snapshot(exchange="mexc", market_type="spot", bid=99.0, ask=100.0, timestamp=1_000.0, connected=True)},
+            "gate": {"futures": _snapshot(exchange="gate", market_type="futures", bid=101.0, ask=102.0, timestamp=1_000.0, connected=True)},
+        }
+    }
+    engine._dirty_symbols = {"BTC"}
+    raw_records = []
+
+    opps = engine.calculate_all(record_sink=raw_records)
+
+    assert opps == []
+    assert len(raw_records) == 1
+    assert raw_records[0][:5] == ("BTC", "mexc", "spot", "gate", "futures")
+    assert raw_records[0][5] == pytest.approx(1.0)
+    assert raw_records[0][6] == pytest.approx(-2.941176470588236)
