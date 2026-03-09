@@ -496,7 +496,7 @@ def _build_gate(
     }
 
 
-def _find_runtime_audit_package(runtime_audit_dir: Path | None) -> dict[str, Any]:
+def _find_runtime_audit_package(runtime_audit_dir: Path | None, *, state_path: Path | None = None) -> dict[str, Any]:
     candidates: list[Path] = []
     if runtime_audit_dir is not None:
         base = Path(runtime_audit_dir)
@@ -505,7 +505,17 @@ def _find_runtime_audit_package(runtime_audit_dir: Path | None) -> dict[str, Any
         elif (base / "summary.json").is_file():
             candidates.append(base)
     if not candidates:
-        default_root = Path(__file__).resolve().parent.parent.parent / "out" / "runtime_audit"
+        if state_path is not None:
+            resolved_state_path = Path(state_path).resolve()
+            project_root = Path(__file__).resolve().parent.parent.parent
+            if resolved_state_path.parent.name == "config":
+                default_root = resolved_state_path.parent.parent / "runtime_audit"
+            elif resolved_state_path.is_relative_to(project_root):
+                default_root = project_root / "out" / "runtime_audit"
+            else:
+                default_root = resolved_state_path.parent / "runtime_audit"
+        else:
+            default_root = Path(__file__).resolve().parent.parent.parent / "out" / "runtime_audit"
         if default_root.is_dir():
             candidates.extend(path.parent for path in default_root.glob("**/summary.json"))
     candidates = [path for path in candidates if (path / "summary.json").is_file()]
@@ -561,7 +571,7 @@ def run_training_certification(
     effective_block_ids = list(scope["effective_block_ids"])
     runtime_session_rows = list(scope["runtime_session_rows"])
     rejection_stats = dict(scope["hot_path_rejection_stats"])
-    runtime_package = _find_runtime_audit_package(runtime_audit_dir)
+    runtime_package = _find_runtime_audit_package(runtime_audit_dir, state_path=state_path)
     blocks, _, _ = _load_blocks_from_sqlite(
         state_path,
         selected_block_ids=effective_block_ids or None,
