@@ -7,7 +7,7 @@ import shutil
 import sqlite3
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -68,9 +68,6 @@ def _iter_ndjson(path: Path) -> Iterable[dict[str, Any]]:
                 continue
             if isinstance(payload, dict):
                 yield payload
-
-
-_PAIR_ALERT_COOLDOWN_SEC = 5 * 60
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -277,7 +274,14 @@ class RuntimeAuditCollector:
         self._last_probability_by_pair: dict[str, float] = {}
         self._last_record_perf_by_pair: dict[str, float] = {}
         self._last_exchange_state: dict[str, tuple[bool, bool]] = {}
-        self._pair_alert_state: dict[tuple[str, str], dict[str, float | int]] = {}
+        self._alert_rate_limits: dict[str, dict[str, float]] = {}
+        self._alert_suppressed_counts: dict[str, int] = {}
+        self._ALERT_RATE_LIMIT_SEC = 300.0
+        self._ws_latency_by_exchange: dict[str, deque[float]] = {}
+        self._ws_latency_total_count: dict[str, int] = {}
+        self._WS_LATENCY_RESERVOIR_SIZE = 10_000
+        self._last_ws_flush_perf: float = 0.0
+        self._WS_FLUSH_INTERVAL_SEC = 60.0
         self._duration_sec = int(duration_sec)
         self._status_sample_sec = max(1, int(status_sample_sec))
         self._resource_sample_sec = max(1, int(resource_sample_sec))
@@ -313,10 +317,16 @@ class RuntimeAuditCollector:
         _write_json(self.manifest_path, self._manifest)
 
     def detach_ws_manager(self):
+        self.flush_ws_latency_summary()
         tracker = getattr(self._ws_manager, "tracker", None)
         if tracker is not None and hasattr(tracker, "remove_event_listener"):
             tracker.remove_event_listener(self.on_tracker_event)
         self._ws_manager = None
+
+    def flush_ws_latency_summary(self) -> None:
+        summary = self.get_ws_latency_summary()
+        if summary:
+            _write_json(self.output_dir / "ws_latency_summary.json", summary)
 
     def _base_event(self, kind: str) -> dict[str, Any]:
         return {
@@ -342,36 +352,18 @@ class RuntimeAuditCollector:
         data.update(payload)
         _append_ndjson(self.alerts_path, data, self._lock)
 
-    def _rate_limited_pair_alert(
-        self,
-        code: str,
-        *,
-        pair_key: str,
-        severity: str = "warning",
-        cooldown_sec: int = _PAIR_ALERT_COOLDOWN_SEC,
-        **payload: Any,
-    ) -> None:
-        normalized_pair_key = str(pair_key or "")
-        if not normalized_pair_key:
-            self.alert(code, severity=severity, **payload)
+    def _rate_limited_alert(self, code: str, *, pair_key: str, **kwargs: Any) -> None:
+        now = time.perf_counter()
+        bucket = self._alert_rate_limits.setdefault(code, {})
+        last = bucket.get(pair_key, 0.0)
+        if (now - last) < self._ALERT_RATE_LIMIT_SEC:
+            suppressed_key = f"{code}:{pair_key}"
+            self._alert_suppressed_counts[suppressed_key] = self._alert_suppressed_counts.get(suppressed_key, 0) + 1
             return
-        now = time.time()
-        state_key = (str(code), normalized_pair_key)
-        state = dict(self._pair_alert_state.get(state_key) or {})
-        last_ts = float(state.get("last_ts", 0.0) or 0.0)
-        suppressed_count = int(state.get("suppressed_since_last", 0) or 0)
-        if last_ts > 0.0 and (now - last_ts) < int(cooldown_sec):
-            state["suppressed_since_last"] = suppressed_count + 1
-            self._pair_alert_state[state_key] = state
-            return
-        enriched_payload = dict(payload)
-        if suppressed_count > 0:
-            enriched_payload["suppressed_since_last"] = suppressed_count
-        self.alert(code, severity=severity, pair_key=normalized_pair_key, **enriched_payload)
-        self._pair_alert_state[state_key] = {
-            "last_ts": now,
-            "suppressed_since_last": 0,
-        }
+        bucket[pair_key] = now
+        suppressed_key = f"{code}:{pair_key}"
+        suppressed = self._alert_suppressed_counts.pop(suppressed_key, 0)
+        self.alert(code, pair_key=pair_key, suppressed_since_last=suppressed, **kwargs)
 
     def api_probe(self, *, latency_ms: float, status_code: int, ok: bool, payload_count: int = 0, error: str = ""):
         self.sample(
@@ -384,14 +376,13 @@ class RuntimeAuditCollector:
         )
 
     def on_ws_ingest(self, *, exchange: str, symbol: str, market_type: str, latency_ms: float, connected: bool):
-        self.event(
-            "ws_ingest",
-            exchange=str(exchange),
-            symbol=str(symbol),
-            market_type=str(market_type),
-            latency_ms=round(float(latency_ms), 6),
-            connected=bool(connected),
-        )
+        ex = str(exchange)
+        buf = self._ws_latency_by_exchange.get(ex)
+        if buf is None:
+            buf = deque(maxlen=self._WS_LATENCY_RESERVOIR_SIZE)
+            self._ws_latency_by_exchange[ex] = buf
+        buf.append(float(latency_ms))
+        self._ws_latency_total_count[ex] = self._ws_latency_total_count.get(ex, 0) + 1
 
     def record_ws_ingest(
         self,
@@ -408,17 +399,20 @@ class RuntimeAuditCollector:
             latency_ms=latency_ms,
             connected=True,
         )
-        if source_delay_ms is not None:
-            self.event(
-                "ws_source_delay",
-                exchange=str(exchange),
-                symbol=str(symbol),
-                market_type=str(market_type),
-                source_delay_ms=round(float(source_delay_ms), 6),
-            )
+        # ws_source_delay is not consumed by build_runtime_summary;
+        # skip writing to events.ndjson to avoid volume explosion.
 
     def record_exchange_status(self, exchange_statuses: list[dict[str, Any]]):
         self.sample("exchange_status_batch", exchanges=list(exchange_statuses))
+
+    def get_ws_latency_summary(self) -> dict[str, dict[str, Any]]:
+        result: dict[str, dict[str, Any]] = {}
+        for exchange, buf in sorted(self._ws_latency_by_exchange.items()):
+            values = list(buf)
+            summary = _numeric_summary(values)
+            summary["total_count"] = self._ws_latency_total_count.get(exchange, len(values))
+            result[exchange] = summary
+        return result
 
     def on_tracker_event(self, payload: dict[str, Any]):
         kind = str(payload.get("kind") or "")
@@ -427,14 +421,14 @@ class RuntimeAuditCollector:
             self._last_record_perf_by_pair[pair_key] = time.perf_counter()
             delta_ts = float(payload.get("delta_ts") or 0.0)
             if delta_ts > max(self._record_interval_sec * 1.5, self._record_interval_sec + 1.0):
-                self._rate_limited_pair_alert(
+                self._rate_limited_alert(
                     "record_frequency_deviation",
                     pair_key=pair_key,
                     delta_ts=delta_ts,
                     expected_interval_sec=self._record_interval_sec,
                 )
             if payload.get("gap_detected"):
-                self._rate_limited_pair_alert(
+                self._rate_limited_alert(
                     "gap_detected",
                     pair_key=pair_key,
                     delta_ts=delta_ts,
@@ -443,19 +437,13 @@ class RuntimeAuditCollector:
                     session_id=int(payload.get("session_id") or 0),
                 )
             if not bool(payload.get("numeric_valid", True)):
-                self._rate_limited_pair_alert(
-                    "invalid_record",
-                    severity="error",
-                    pair_key=pair_key,
-                    payload=payload,
-                )
+                self.alert("invalid_record", severity="error", pair_key=pair_key, payload=payload)
             if not bool(payload.get("timestamp_monotonic", True)):
-                self._rate_limited_pair_alert(
-                    "non_monotonic_timestamp",
-                    severity="error",
-                    pair_key=pair_key,
-                    payload=payload,
-                )
+                self.alert("non_monotonic_timestamp", severity="error", pair_key=pair_key, payload=payload)
+            # tracker_record events are NOT written to events.ndjson —
+            # they dominate volume (>99% of events) and are never consumed
+            # by build_runtime_summary, _build_signal_confirmations, or
+            # _build_context_coverage. Alerts still go to alerts.ndjson above.
             return
         elif kind == "tracker_flush":
             if float(payload.get("duration_ms") or 0.0) > 5_000.0:
@@ -611,6 +599,10 @@ class RuntimeAuditCollector:
             except Exception:  # pragma: no cover
                 pass
         self.sample("system_sample", **payload)
+        now = time.perf_counter()
+        if (now - self._last_ws_flush_perf) >= self._WS_FLUSH_INTERVAL_SEC:
+            self.flush_ws_latency_summary()
+            self._last_ws_flush_perf = now
 
     def sample_runtime(self):
         ws_manager = self._ws_manager
@@ -656,7 +648,11 @@ class RuntimeAuditCollector:
             pass
 
     def finalize_runtime_only(self) -> dict[str, Any]:
-        summary = build_runtime_summary(self.output_dir)
+        self.flush_ws_latency_summary()
+        summary = build_runtime_summary(
+            self.output_dir,
+            ws_latency_summary=self.get_ws_latency_summary(),
+        )
         summary["manifest"] = dict(self._manifest)
         summary["finished_at_utc"] = _utc_now_iso()
         _write_json(self.summary_path, summary)
@@ -1230,6 +1226,7 @@ def build_runtime_summary(
     snapshot_path: Path | None = None,
     legacy_package_dir: Path | None = None,
     events: list[dict[str, Any]] | None = None,
+    ws_latency_summary: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     output_root = Path(output_dir)
     event_rows = events if events is not None else list(_iter_ndjson(output_root / "events.ndjson"))
@@ -1255,6 +1252,18 @@ def build_runtime_summary(
             model_status_counts[str(event.get("model_status") or "unknown")] += 1
         elif kind == "signal":
             signal_counts[str(event.get("signal_action") or "WAIT")] += 1
+
+    # Use in-memory ws latency stats if provided (no ws_ingest events on disk);
+    # fall back to parsing events for backward compat with old audit packages.
+    if ws_latency_summary is not None:
+        ws_ingest_latency_result = dict(ws_latency_summary)
+    elif ws_by_exchange:
+        ws_ingest_latency_result = {
+            exchange: _numeric_summary(values)
+            for exchange, values in sorted(ws_by_exchange.items())
+        }
+    else:
+        ws_ingest_latency_result = {}
 
     api_probe_latencies = [
         float(sample.get("latency_ms") or 0.0)
@@ -1319,10 +1328,7 @@ def build_runtime_summary(
         "signal_counts": dict(signal_counts),
         "model_status_counts": dict(model_status_counts),
         "alert_counts": dict(alert_counts),
-        "ws_ingest_latency_ms": {
-            exchange: _numeric_summary(values)
-            for exchange, values in sorted(ws_by_exchange.items())
-        },
+        "ws_ingest_latency_ms": ws_ingest_latency_result,
         "inference_latency_ms": _numeric_summary(inference_latencies),
         "end_to_end_latency_ms": _numeric_summary(end_to_end_latencies),
         "api_probe_latency_ms": _numeric_summary(api_probe_latencies),
@@ -1624,9 +1630,18 @@ def finalize_runtime_audit_package(
 ) -> dict[str, Any]:
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
+
+    # Load in-memory ws latency stats persisted by the collector before shutdown.
+    _ws_latency_path = output_root / "ws_latency_summary.json"
+    _ws_latency_summary: dict[str, dict[str, Any]] | None = None
+    if _ws_latency_path.is_file():
+        try:
+            _ws_latency_summary = json.loads(_ws_latency_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            _ws_latency_summary = None
     cached_events = list(_iter_ndjson(output_root / "events.ndjson"))
 
-    runtime_summary = build_runtime_summary(output_root, events=cached_events)
+    runtime_summary = build_runtime_summary(output_root, events=cached_events, ws_latency_summary=_ws_latency_summary)
     runtime_summary["finished_at_utc"] = _utc_now_iso()
     runtime_summary["duration_sec"] = int(duration_sec)
     runtime_summary["run_status"] = str(run_status)
@@ -1721,6 +1736,7 @@ def finalize_runtime_audit_package(
         snapshot_path=snapshot_path,
         legacy_package_dir=legacy_package_dir,
         events=cached_events,
+        ws_latency_summary=_ws_latency_summary,
     )
     runtime_summary["finished_at_utc"] = _utc_now_iso()
     runtime_summary["duration_sec"] = int(duration_sec)

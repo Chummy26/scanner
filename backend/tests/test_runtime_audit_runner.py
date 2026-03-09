@@ -95,10 +95,11 @@ def test_runtime_audit_collector_writes_events_samples_and_alerts(tmp_path: Path
     alerts = _read_ndjson(paths["alerts_path"])
     samples = _read_ndjson(paths["samples_path"])
     summary = json.loads(paths["summary_path"].read_text(encoding="utf-8"))
-    rebuilt_summary = build_runtime_summary(collector.output_dir)
-    rebuilt_summary_cached = build_runtime_summary(collector.output_dir, events=events)
+    ws_latency_summary = json.loads((collector.output_dir / "ws_latency_summary.json").read_text(encoding="utf-8"))
+    rebuilt_summary = build_runtime_summary(collector.output_dir, ws_latency_summary=ws_latency_summary)
+    rebuilt_summary_cached = build_runtime_summary(collector.output_dir, events=events, ws_latency_summary=ws_latency_summary)
 
-    assert any(event["kind"] == "ws_ingest" for event in events)
+    assert all(event["kind"] != "ws_ingest" for event in events)
     assert all(event["kind"] != "tracker_record" for event in events)
     assert any(event["kind"] == "inference" for event in events)
     assert samples and samples[0]["kind"] == "system_sample"
@@ -113,6 +114,8 @@ def test_runtime_audit_collector_writes_events_samples_and_alerts(tmp_path: Path
     assert summary["signal_counts"]["STRONG_EXECUTE"] == 1
     assert rebuilt_summary["api_probe_latency_ms"]["count"] == 1
     assert rebuilt_summary_cached["counts"]["events"] == rebuilt_summary["counts"]["events"]
+    assert rebuilt_summary["ws_ingest_latency_ms"]["mexc"]["total_count"] == 1
+    assert ws_latency_summary["mexc"]["total_count"] == 1
 
 
 def test_runtime_audit_record_inference_tolerates_duplicate_history_fields(tmp_path: Path):
@@ -154,8 +157,9 @@ def test_runtime_audit_rate_limits_pair_level_tracker_alerts(tmp_path: Path, mon
         gap_threshold_sec=60.0,
         duration_sec=120,
     )
-    timestamps = iter([1_000.0, 1_000.0, 1_001.0, 1_302.0, 1_302.0])
-    monkeypatch.setattr("src.spread.runtime_audit.time.time", lambda: next(timestamps))
+    perf_values = iter([1_000.0, 1_000.0, 1_000.0, 1_001.0, 1_001.0, 1_302.0, 1_302.0, 1_302.0])
+    monkeypatch.setattr("src.spread.runtime_audit.time.perf_counter", lambda: next(perf_values))
+    monkeypatch.setattr("src.spread.runtime_audit.time.time", lambda: 1_700_000_000.0)
 
     payload = {
         "kind": "tracker_record",

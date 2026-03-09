@@ -57,7 +57,9 @@ def test_ws_manager_on_book_update_emits_ws_ingest_metrics(tmp_path: Path):
     collector.finalize()
 
     events = "\n".join(_read_lines(collector.events_path))
-    assert "ws_ingest" in events
+    ws_latency_summary = (collector.output_dir / "ws_latency_summary.json").read_text(encoding="utf-8")
+    assert "ws_ingest" not in events
+    assert "mexc" in ws_latency_summary
 
 
 def test_tracker_invalid_record_rejections_emit_aggregated_counters_without_alert_flood(tmp_path: Path):
