@@ -238,15 +238,15 @@ def _build_lightweight_runtime_package(
 def collect_runtime_checkpoint(base_url: str, *, sequence_horizon_pairs: list[tuple[int, int]]) -> dict[str, object]:
     checkpoint = {
         "dashboard_summary": _fetch_json(base_url, "/api/v1/ml/dashboard").get("summary", {}),
-        "sessions_summary": _fetch_json(base_url, "/api/v1/ml/training/sessions?include_open=1").get("summary", {}),
-        "blocks_summary": _fetch_json(base_url, "/api/v1/ml/training/blocks").get("summary", {}),
-        "cohort_preview_summary": _post_json(base_url, "/api/v1/ml/training/cohorts/preview", {}).get("summary", {}),
+        "sessions_summary": _fetch_json(base_url, "/api/v1/ml/training/sessions?include_open=1&summary_only=1").get("summary", {}),
+        "blocks_summary": _fetch_json(base_url, "/api/v1/ml/training/blocks?summary_only=1").get("summary", {}),
+        "cohort_preview_summary": _post_json(base_url, "/api/v1/ml/training/cohorts/preview", {"summary_only": True}).get("summary", {}),
         "quality_reports": [],
     }
     for sequence_length, prediction_horizon_sec in sequence_horizon_pairs:
         quality_payload = _fetch_json(
             base_url,
-            f"/api/v1/ml/training/quality-report?sequence_length={int(sequence_length)}&prediction_horizon_sec={int(prediction_horizon_sec)}",
+            f"/api/v1/ml/training/quality-report?sequence_length={int(sequence_length)}&prediction_horizon_sec={int(prediction_horizon_sec)}&summary_only=1",
         )
         checkpoint["quality_reports"].append(
             {

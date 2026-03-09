@@ -121,6 +121,17 @@ def test_training_sessions_api_summarizes_sessions_and_exposes_exceptions(tmp_pa
     assert first_session["id"] not in preview_ids
 
 
+def test_training_sessions_api_summary_only_omits_session_payloads(tmp_path: Path):
+    tracker, db_path = _build_multi_session_tracker(tmp_path)
+    app = {"ws_manager": _FakeWSManager(tracker, db_path)}
+
+    response = asyncio.run(handle_ml_training_sessions_api(_FakeRequest(app, query={"include_open": "0", "summary_only": "1"})))
+    payload = json.loads(response.text)
+
+    assert payload["summary"]["total_sessions"] == 4
+    assert payload["sessions"] == []
+
+
 def test_training_session_patch_and_cohort_preview_follow_approved_sessions(tmp_path: Path):
     tracker, db_path = _build_multi_session_tracker(tmp_path)
     listing = tracker.list_training_sessions(include_open=False)

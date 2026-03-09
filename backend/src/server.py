@@ -1526,7 +1526,14 @@ async def handle_ml_training_sessions_api(request):
     if not ws_mgr:
         return web.json_response({"config": {}, "sessions": [], "summary": {"total_sessions": 0}})
     include_open = str(request.query.get("include_open", "1")).strip().lower() not in {"0", "false", "no", "off"}
-    return web.json_response(ws_mgr.tracker.list_training_sessions(include_open=include_open))
+    summary_only = str(request.query.get("summary_only", "0")).strip().lower() in {"1", "true", "yes", "on"}
+    return web.json_response(
+        ws_mgr.tracker.list_training_sessions(
+            include_open=include_open,
+            include_blocks_preview=not summary_only,
+            summary_only=summary_only,
+        )
+    )
 
 
 async def handle_ml_training_session_patch(request):
@@ -1574,6 +1581,7 @@ async def handle_ml_training_cohort_preview(request):
     session_ids = payload.get("session_ids") if isinstance(payload, dict) else None
     sequence_length = int(payload.get("sequence_length") or 15) if isinstance(payload, dict) else 15
     prediction_horizon_sec = int(payload.get("prediction_horizon_sec") or 14_400) if isinstance(payload, dict) else 14_400
+    summary_only = bool(payload.get("summary_only")) if isinstance(payload, dict) else False
     try:
         normalized_session_ids = [int(value) for value in session_ids] if session_ids is not None else None
     except (TypeError, ValueError):
@@ -1583,6 +1591,7 @@ async def handle_ml_training_cohort_preview(request):
             session_ids=normalized_session_ids,
             sequence_length=sequence_length,
             prediction_horizon_sec=prediction_horizon_sec,
+            summary_only=summary_only,
         )
     )
 
@@ -1597,7 +1606,14 @@ async def handle_ml_training_blocks_api(request):
     except (TypeError, ValueError):
         return web.json_response({"error": "invalid session_id"}, status=400)
     include_open = str(request.query.get("include_open", "1")).strip().lower() not in {"0", "false", "no", "off"}
-    return web.json_response(ws_mgr.tracker.list_training_blocks(session_id=session_id, include_open=include_open))
+    summary_only = str(request.query.get("summary_only", "0")).strip().lower() in {"1", "true", "yes", "on"}
+    return web.json_response(
+        ws_mgr.tracker.list_training_blocks(
+            session_id=session_id,
+            include_open=include_open,
+            include_block_details=not summary_only,
+        )
+    )
 
 
 async def handle_ml_training_block_patch(request):
@@ -1720,10 +1736,12 @@ async def handle_ml_training_quality_report(request):
         prediction_horizon_sec = int(request.query.get("prediction_horizon_sec", "14400") or 14_400)
     except (TypeError, ValueError):
         return web.json_response({"error": "invalid sequence_length or prediction_horizon_sec"}, status=400)
+    summary_only = str(request.query.get("summary_only", "0")).strip().lower() in {"1", "true", "yes", "on"}
     return web.json_response(
         ws_mgr.tracker.get_training_quality_report(
             sequence_length=sequence_length,
             prediction_horizon_sec=prediction_horizon_sec,
+            summary_only=summary_only,
         )
     )
 

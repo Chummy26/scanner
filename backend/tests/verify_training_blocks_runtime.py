@@ -27,10 +27,10 @@ def _fetch_text(base_url: str, path: str) -> str:
 
 
 def inspect_runtime(db_path: Path, base_url: str, run_id: int | None = None) -> dict:
-    sessions_payload = _fetch_json(base_url, "/api/v1/ml/training/sessions?include_open=1")
+    sessions_payload = _fetch_json(base_url, "/api/v1/ml/training/sessions?include_open=1&summary_only=1")
     preview_payload = _post_json(base_url, "/api/v1/ml/training/cohorts/preview", {})
-    blocks_payload = _fetch_json(base_url, "/api/v1/ml/training/blocks")
-    quality_payload = _fetch_json(base_url, "/api/v1/ml/training/quality-report")
+    blocks_payload = _fetch_json(base_url, "/api/v1/ml/training/blocks?summary_only=1")
+    quality_payload = _fetch_json(base_url, "/api/v1/ml/training/quality-report?summary_only=1")
     html = _fetch_text(base_url, "/dashboard/training")
 
     with sqlite3.connect(db_path) as conn:

@@ -78,6 +78,18 @@ def test_training_blocks_api_rejects_invalid_session_id(tmp_path: Path):
     assert "error" in json.loads(response.text)
 
 
+def test_training_blocks_api_summary_only_omits_block_payloads(tmp_path: Path):
+    tracker, db_path = _build_tracker(tmp_path)
+    app = {"ws_manager": _FakeWSManager(tracker, db_path)}
+
+    response = asyncio.run(handle_ml_training_blocks_api(_FakeRequest(app, query={"summary_only": "1"})))
+    payload = json.loads(response.text)
+
+    assert payload["summary"]["total_sessions"] == 1
+    assert payload["summary"]["total_blocks"] == 2
+    assert payload["sessions"][0]["blocks"] == []
+
+
 def test_training_block_handlers_patch_and_reject_invalid_split(tmp_path: Path):
     tracker, db_path = _build_tracker(tmp_path)
     app = {"ws_manager": _FakeWSManager(tracker, db_path)}
