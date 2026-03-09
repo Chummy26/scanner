@@ -2501,33 +2501,47 @@ class SpreadTracker:
                 """
             )
         )
-        record_rows = list(
-            conn.execute(
-                """
-                SELECT block_id, session_id, ts
-                FROM tracker_records
-                WHERE block_id IS NOT NULL
-                ORDER BY block_id ASC, ts ASC
-                """
-            )
-        )
         actual_by_block: dict[int, dict[str, float]] = {}
-        block_timestamps: dict[int, list[float]] = defaultdict(list)
-        for row in record_rows:
+        for row in conn.execute(
+            """
+            SELECT
+                block_id,
+                COUNT(*) AS actual_count,
+                MIN(ts) AS start_ts,
+                MAX(ts) AS end_ts
+            FROM tracker_records
+            WHERE block_id IS NOT NULL
+            GROUP BY block_id
+            """
+        ):
             block_id = int(row["block_id"] or 0)
             if block_id <= 0:
                 continue
-            block_timestamps[block_id].append(float(row["ts"]))
-        for block_id, timestamps in block_timestamps.items():
-            max_gap = 0.0
-            for previous, current in zip(timestamps, timestamps[1:]):
-                max_gap = max(max_gap, float(current) - float(previous))
             actual_by_block[block_id] = {
-                "count": float(len(timestamps)),
-                "start_ts": float(timestamps[0]),
-                "end_ts": float(timestamps[-1]),
-                "max_gap_sec": float(max_gap),
+                "count": float(row["actual_count"]),
+                "start_ts": float(row["start_ts"]),
+                "end_ts": float(row["end_ts"]),
+                "max_gap_sec": 0.0,
             }
+        # Compute actual max_gap per block inside SQLite instead of
+        # materializing all tracker_records rows in Python.
+        for row in conn.execute(
+            """
+            SELECT block_id, MAX(gap) AS max_gap
+            FROM (
+                SELECT
+                    block_id,
+                    ts - LAG(ts) OVER (PARTITION BY block_id ORDER BY ts) AS gap
+                FROM tracker_records
+                WHERE block_id IS NOT NULL
+            )
+            WHERE gap IS NOT NULL
+            GROUP BY block_id
+            """
+        ):
+            block_id = int(row["block_id"] or 0)
+            if block_id in actual_by_block:
+                actual_by_block[block_id]["max_gap_sec"] = float(row["max_gap"] or 0.0)
 
         blocks_by_session: dict[int, list[dict[str, Any]]] = defaultdict(list)
         block_lookup: dict[int, dict[str, Any]] = {}
@@ -2855,7 +2869,13 @@ class SpreadTracker:
             return "reviewed_ok"
         return "auto_approved"
 
-    def list_training_sessions(self, *, include_open: bool = True) -> dict[str, object]:
+    def list_training_sessions(
+        self,
+        *,
+        include_open: bool = True,
+        include_blocks_preview: bool = True,
+        _quality_state: dict[str, Any] | None = None,
+    ) -> dict[str, object]:
         if self.db_path is None or not self.db_path.is_file():
             return {
                 "config": self.get_training_config(),
@@ -2868,7 +2888,7 @@ class SpreadTracker:
                 },
             }
         with self._connect() as conn:
-            quality_state = self._collect_training_quality_state(conn)
+            quality_state = _quality_state if _quality_state is not None else self._collect_training_quality_state(conn)
             session_filter = "" if include_open else "WHERE s.status != 'open'"
             session_rows = list(
                 conn.execute(
@@ -2900,33 +2920,35 @@ class SpreadTracker:
                     """
                 )
             )
-            preview_rows = list(
-                conn.execute(
-                    """
-                    SELECT
-                        b.id,
-                        b.session_id,
-                        b.start_ts,
-                        b.end_ts,
-                        b.record_count,
-                        b.max_gap_sec,
-                        b.boundary_reason,
-                        b.selected_for_training,
-                        b.disabled_reason,
-                        b.manual_override,
-                        b.notes,
-                        b.is_open,
-                        p.symbol,
-                        p.buy_ex,
-                        p.buy_mt,
-                        p.sell_ex,
-                        p.sell_mt
-                    FROM tracker_pair_blocks b
-                    JOIN tracker_pairs p ON p.id = b.pair_id
-                    ORDER BY b.session_id DESC, b.start_ts ASC, b.id ASC
-                    """
+            preview_rows = []
+            if include_blocks_preview:
+                preview_rows = list(
+                    conn.execute(
+                        """
+                        SELECT
+                            b.id,
+                            b.session_id,
+                            b.start_ts,
+                            b.end_ts,
+                            b.record_count,
+                            b.max_gap_sec,
+                            b.boundary_reason,
+                            b.selected_for_training,
+                            b.disabled_reason,
+                            b.manual_override,
+                            b.notes,
+                            b.is_open,
+                            p.symbol,
+                            p.buy_ex,
+                            p.buy_mt,
+                            p.sell_ex,
+                            p.sell_mt
+                        FROM tracker_pair_blocks b
+                        JOIN tracker_pairs p ON p.id = b.pair_id
+                        ORDER BY b.session_id DESC, b.start_ts ASC, b.id ASC
+                        """
+                    )
                 )
-            )
 
         preview_by_session: dict[int, list[dict[str, object]]] = defaultdict(list)
         exception_reason_counts_by_session: dict[int, Counter[str]] = defaultdict(Counter)
@@ -4194,13 +4216,12 @@ class SpreadTracker:
                 },
                 "sessions": [],
             }
-        listing = self.list_training_sessions(include_open=True)
-        allowed_training_ids = set(
-            self.get_approved_training_session_ids(
-                include_open=False,
-                sequence_length=int(sequence_length),
-                prediction_horizon_sec=int(prediction_horizon_sec),
-            )
+        with self._connect() as conn:
+            quality_state = self._collect_training_quality_state(conn)
+        listing = self.list_training_sessions(
+            include_open=True,
+            include_blocks_preview=False,
+            _quality_state=quality_state,
         )
         sessions = []
         for session in listing["sessions"]:
@@ -4214,7 +4235,7 @@ class SpreadTracker:
             )
             session_payload = dict(session)
             session_payload["dynamic_quality_status"] = dynamic_status
-            session_payload["dynamic_training_ready"] = int(session["id"]) in allowed_training_ids
+            session_payload["dynamic_training_ready"] = bool(session.get("can_train", False))
             sessions.append(session_payload)
         return {
             "config": self.get_training_config(),

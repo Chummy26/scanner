@@ -15,7 +15,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from src.spread.ml_dataset import build_dataset_bundle, build_group_splits
 from src.spread.training_certification import collect_sqlite_integrity as collect_sqlite_integrity_lib
-from src.spread.runtime_audit import finalize_runtime_audit_package
+from src.spread.runtime_audit import _write_json, build_runtime_summary
 from src.spread.train_model import run_threshold_preflight
 from tests import run_10m_diagnostic, run_2h_runtime_audit, verify_training_blocks_runtime
 
@@ -205,6 +205,36 @@ def _terminate_process_tree(process: subprocess.Popen | None, *, base_url: str =
         _wait_for_api_down(base_url, timeout_sec=30)
 
 
+def _build_lightweight_runtime_package(
+    *,
+    output_dir: Path,
+    duration_sec: int,
+    run_status: str,
+) -> dict[str, object]:
+    runtime_package: dict[str, object] = {}
+    try:
+        audit_dir = output_dir / "runtime_audit"
+        if (audit_dir / "events.ndjson").is_file():
+            ws_latency_path = audit_dir / "ws_latency_summary.json"
+            ws_latency_summary = None
+            if ws_latency_path.is_file():
+                try:
+                    ws_latency_summary = json.loads(ws_latency_path.read_text(encoding="utf-8"))
+                except Exception:
+                    ws_latency_summary = None
+            summary = build_runtime_summary(audit_dir, ws_latency_summary=ws_latency_summary)
+            summary["finished_at_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            summary["duration_sec"] = int(duration_sec)
+            summary["run_status"] = str(run_status)
+            _write_json(audit_dir / "summary.json", summary)
+            runtime_package = {"path": str(audit_dir), "summary": summary}
+        else:
+            runtime_package = {"path": str(audit_dir), "summary": {}}
+    except Exception as exc:
+        runtime_package = {"path": str(output_dir / "runtime_audit"), "error": str(exc)}
+    return runtime_package
+
+
 def collect_runtime_checkpoint(base_url: str, *, sequence_horizon_pairs: list[tuple[int, int]]) -> dict[str, object]:
     checkpoint = {
         "dashboard_summary": _fetch_json(base_url, "/api/v1/ml/dashboard").get("summary", {}),
@@ -313,9 +343,10 @@ def run_server_track(
         reset_smoke = {}
         if run_reset_smoke:
             reset_smoke = _post_json(base_url, "/api/v1/ml/training/reset-cycle", {})
-        runtime_package = finalize_runtime_audit_package(
-            output_dir=output_dir / "runtime_audit",
-            state_path=db_path,
+        _terminate_process_tree(server_process, base_url=base_url)
+        server_process = None
+        runtime_package = _build_lightweight_runtime_package(
+            output_dir=output_dir,
             duration_sec=int(duration_sec),
             run_status=run_status,
         )
