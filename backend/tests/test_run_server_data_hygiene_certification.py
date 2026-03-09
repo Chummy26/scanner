@@ -62,3 +62,69 @@ def test_certification_report_mentions_both_tracks():
     assert "## Current Clone" in report
     assert "## Clean Cycle" in report
     assert "## Reset Smoke" in report
+
+
+def test_short_current_clone_skips_heavy_postprocessing(monkeypatch, tmp_path: Path):
+    output_dir = tmp_path / "certification_short"
+    canonical_db = tmp_path / "canonical.sqlite"
+    sqlite3.connect(canonical_db).close()
+    dataset_calls: list[str] = []
+    preflight_calls: list[str] = []
+
+    monkeypatch.setattr(
+        run_server_data_hygiene_certification,
+        "resolve_certification_paths",
+        lambda *_args, **_kwargs: (output_dir, canonical_db),
+    )
+    monkeypatch.setattr(
+        run_server_data_hygiene_certification,
+        "clone_db_family",
+        lambda source_db, target_db: [str(target_db)],
+    )
+    monkeypatch.setattr(
+        run_server_data_hygiene_certification,
+        "collect_sqlite_integrity",
+        lambda _db_path: {"anomalies": {"zero_record_blocks": 0}},
+    )
+    monkeypatch.setattr(
+        run_server_data_hygiene_certification,
+        "run_server_track",
+        lambda **kwargs: {"verify_runtime": {"quality_summary": {}}, "checkpoints": []},
+    )
+    monkeypatch.setattr(
+        run_server_data_hygiene_certification,
+        "collect_dataset_matrix",
+        lambda db_path, configs=None: dataset_calls.append(str(Path(db_path).parent.name)) or [{"ok": True}],
+    )
+    monkeypatch.setattr(
+        run_server_data_hygiene_certification,
+        "collect_threshold_preflights",
+        lambda db_path, configs=None: preflight_calls.append(str(Path(db_path).parent.name)) or [{"ok": True}],
+    )
+    monkeypatch.setattr(
+        run_server_data_hygiene_certification,
+        "_run_baseline_tests",
+        lambda: {"ok": True, "command": "skipped", "stdout": "", "stderr": "", "returncode": 0},
+    )
+    monkeypatch.setattr(
+        run_server_data_hygiene_certification.sys,
+        "argv",
+        [
+            "run_server_data_hygiene_certification.py",
+            "--output-dir",
+            str(output_dir),
+            "--canonical-db",
+            str(canonical_db),
+            "--current-duration-sec",
+            "60",
+            "--clean-duration-sec",
+            "300",
+            "--skip-baseline-tests",
+            "--skip-reset-smoke",
+        ],
+    )
+
+    run_server_data_hygiene_certification.main()
+
+    assert dataset_calls == ["clean_cycle"]
+    assert preflight_calls == ["clean_cycle"]

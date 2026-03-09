@@ -473,6 +473,17 @@ def main():
         )
         reset_smoke = reset_runtime.get("reset_smoke", {})
 
+    current_clone_dataset_matrix = (
+        collect_dataset_matrix(current_clone_db)
+        if int(args.current_duration_sec) >= 300
+        else []
+    )
+    current_clone_preflights = (
+        collect_threshold_preflights(current_clone_db)
+        if int(args.current_duration_sec) >= 300
+        else []
+    )
+
     certification = {
         "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "output_dir": str(output_dir),
@@ -483,8 +494,8 @@ def main():
                 "copied_files": current_clone_files,
                 "pre_integrity": current_pre,
                 "post_integrity": current_post,
-                "dataset_matrix": collect_dataset_matrix(current_clone_db),
-                "preflights": collect_threshold_preflights(current_clone_db),
+                "dataset_matrix": current_clone_dataset_matrix,
+                "preflights": current_clone_preflights,
                 "runtime": current_runtime,
             },
             "clean_cycle": {
