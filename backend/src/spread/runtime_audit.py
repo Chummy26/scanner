@@ -70,6 +70,9 @@ def _iter_ndjson(path: Path) -> Iterable[dict[str, Any]]:
                 yield payload
 
 
+_PAIR_ALERT_COOLDOWN_SEC = 5 * 60
+
+
 def _percentile(values: list[float], percentile: float) -> float:
     if not values:
         return 0.0
@@ -274,6 +277,7 @@ class RuntimeAuditCollector:
         self._last_probability_by_pair: dict[str, float] = {}
         self._last_record_perf_by_pair: dict[str, float] = {}
         self._last_exchange_state: dict[str, tuple[bool, bool]] = {}
+        self._pair_alert_state: dict[tuple[str, str], dict[str, float | int]] = {}
         self._duration_sec = int(duration_sec)
         self._status_sample_sec = max(1, int(status_sample_sec))
         self._resource_sample_sec = max(1, int(resource_sample_sec))
@@ -338,6 +342,37 @@ class RuntimeAuditCollector:
         data.update(payload)
         _append_ndjson(self.alerts_path, data, self._lock)
 
+    def _rate_limited_pair_alert(
+        self,
+        code: str,
+        *,
+        pair_key: str,
+        severity: str = "warning",
+        cooldown_sec: int = _PAIR_ALERT_COOLDOWN_SEC,
+        **payload: Any,
+    ) -> None:
+        normalized_pair_key = str(pair_key or "")
+        if not normalized_pair_key:
+            self.alert(code, severity=severity, **payload)
+            return
+        now = time.time()
+        state_key = (str(code), normalized_pair_key)
+        state = dict(self._pair_alert_state.get(state_key) or {})
+        last_ts = float(state.get("last_ts", 0.0) or 0.0)
+        suppressed_count = int(state.get("suppressed_since_last", 0) or 0)
+        if last_ts > 0.0 and (now - last_ts) < int(cooldown_sec):
+            state["suppressed_since_last"] = suppressed_count + 1
+            self._pair_alert_state[state_key] = state
+            return
+        enriched_payload = dict(payload)
+        if suppressed_count > 0:
+            enriched_payload["suppressed_since_last"] = suppressed_count
+        self.alert(code, severity=severity, pair_key=normalized_pair_key, **enriched_payload)
+        self._pair_alert_state[state_key] = {
+            "last_ts": now,
+            "suppressed_since_last": 0,
+        }
+
     def api_probe(self, *, latency_ms: float, status_code: int, ok: bool, payload_count: int = 0, error: str = ""):
         self.sample(
             "api_probe",
@@ -392,14 +427,14 @@ class RuntimeAuditCollector:
             self._last_record_perf_by_pair[pair_key] = time.perf_counter()
             delta_ts = float(payload.get("delta_ts") or 0.0)
             if delta_ts > max(self._record_interval_sec * 1.5, self._record_interval_sec + 1.0):
-                self.alert(
+                self._rate_limited_pair_alert(
                     "record_frequency_deviation",
                     pair_key=pair_key,
                     delta_ts=delta_ts,
                     expected_interval_sec=self._record_interval_sec,
                 )
             if payload.get("gap_detected"):
-                self.alert(
+                self._rate_limited_pair_alert(
                     "gap_detected",
                     pair_key=pair_key,
                     delta_ts=delta_ts,
@@ -408,9 +443,20 @@ class RuntimeAuditCollector:
                     session_id=int(payload.get("session_id") or 0),
                 )
             if not bool(payload.get("numeric_valid", True)):
-                self.alert("invalid_record", severity="error", pair_key=pair_key, payload=payload)
+                self._rate_limited_pair_alert(
+                    "invalid_record",
+                    severity="error",
+                    pair_key=pair_key,
+                    payload=payload,
+                )
             if not bool(payload.get("timestamp_monotonic", True)):
-                self.alert("non_monotonic_timestamp", severity="error", pair_key=pair_key, payload=payload)
+                self._rate_limited_pair_alert(
+                    "non_monotonic_timestamp",
+                    severity="error",
+                    pair_key=pair_key,
+                    payload=payload,
+                )
+            return
         elif kind == "tracker_flush":
             if float(payload.get("duration_ms") or 0.0) > 5_000.0:
                 self.alert("slow_tracker_flush", duration_ms=float(payload.get("duration_ms") or 0.0))
@@ -1178,9 +1224,15 @@ def _build_snapshot_replay(
     }
 
 
-def build_runtime_summary(output_dir: Path, *, snapshot_path: Path | None = None, legacy_package_dir: Path | None = None) -> dict[str, Any]:
+def build_runtime_summary(
+    output_dir: Path,
+    *,
+    snapshot_path: Path | None = None,
+    legacy_package_dir: Path | None = None,
+    events: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     output_root = Path(output_dir)
-    events = list(_iter_ndjson(output_root / "events.ndjson"))
+    event_rows = events if events is not None else list(_iter_ndjson(output_root / "events.ndjson"))
     alerts = list(_iter_ndjson(output_root / "alerts.ndjson"))
     samples = list(_iter_ndjson(output_root / "samples.ndjson"))
     api_probes = list(_iter_ndjson(output_root / "api_probe.ndjson"))
@@ -1192,7 +1244,7 @@ def build_runtime_summary(output_dir: Path, *, snapshot_path: Path | None = None
     model_status_counts: Counter[str] = Counter()
     alert_counts: Counter[str] = Counter(str(item.get("code") or "") for item in alerts)
 
-    for event in events:
+    for event in event_rows:
         kind = str(event.get("kind") or "")
         if kind == "ws_ingest":
             exchange = str(event.get("exchange") or "unknown")
@@ -1255,12 +1307,12 @@ def build_runtime_summary(output_dir: Path, *, snapshot_path: Path | None = None
         "probe_count": len(api_probes),
     }
 
-    context_coverage = _build_context_coverage(events, snapshot_path)
+    context_coverage = _build_context_coverage(event_rows, snapshot_path)
     legacy_comparison = _build_legacy_comparison(legacy_package_dir)
 
     return {
         "counts": {
-            "events": len(events),
+            "events": len(event_rows),
             "alerts": len(alerts),
             "samples": len(samples),
         },
@@ -1572,8 +1624,9 @@ def finalize_runtime_audit_package(
 ) -> dict[str, Any]:
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
+    cached_events = list(_iter_ndjson(output_root / "events.ndjson"))
 
-    runtime_summary = build_runtime_summary(output_root)
+    runtime_summary = build_runtime_summary(output_root, events=cached_events)
     runtime_summary["finished_at_utc"] = _utc_now_iso()
     runtime_summary["duration_sec"] = int(duration_sec)
     runtime_summary["run_status"] = str(run_status)
@@ -1628,7 +1681,7 @@ def finalize_runtime_audit_package(
         }
 
     signal_confirmations = _build_signal_confirmations(
-        list(_iter_ndjson(output_root / "events.ndjson")),
+        cached_events,
         snapshot_path,
         min_total_spread_pct=min_total_spread_pct,
     )
@@ -1667,6 +1720,7 @@ def finalize_runtime_audit_package(
         output_root,
         snapshot_path=snapshot_path,
         legacy_package_dir=legacy_package_dir,
+        events=cached_events,
     )
     runtime_summary["finished_at_utc"] = _utc_now_iso()
     runtime_summary["duration_sec"] = int(duration_sec)

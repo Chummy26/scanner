@@ -36,7 +36,7 @@ def test_spread_tracker_emits_runtime_audit_record_events(tmp_path: Path):
 
     alerts = "\n".join(_read_lines(collector.alerts_path))
     events = "\n".join(_read_lines(collector.events_path))
-    assert "tracker_record" in events
+    assert "tracker_record" not in events
     assert "gap_detected" in alerts
 
 

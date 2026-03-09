@@ -106,7 +106,11 @@ def _install_base_mocks(
     monkeypatch.setattr(tc, "_load_blocks_from_sqlite", lambda *args, **kwargs: ([{"block_id": 1001, "session_id": 101, "pair_id": "stub", "records": []}], 0.0, {}))
     monkeypatch.setattr(tc, "_scope_records", lambda blocks: list(records))
     monkeypatch.setattr(tc, "_scope_episodes", lambda blocks: list(episodes))
-    monkeypatch.setattr(tc, "_find_runtime_audit_package", lambda runtime_audit_dir: runtime_package or {"path": "", "summary": {}, "events": [], "alerts": [], "samples": []})
+    monkeypatch.setattr(
+        tc,
+        "_find_runtime_audit_package",
+        lambda runtime_audit_dir=None, **kwargs: runtime_package or {"path": "", "summary": {}, "events": [], "alerts": [], "samples": []},
+    )
     monkeypatch.setattr(tc, "build_dataset_bundle", lambda **kwargs: bundle or _make_bundle())
     return state_path
 

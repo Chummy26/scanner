@@ -163,6 +163,48 @@ def _post_json(base_url: str, path: str, payload: dict | None = None) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
+def _wait_for_api_down(base_url: str, timeout_sec: int = 30) -> bool:
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(f"{base_url.rstrip('/')}/api/v1/ml/dashboard", timeout=3)
+        except Exception:
+            return True
+        time.sleep(1)
+    return False
+
+
+def _terminate_process_tree(process: subprocess.Popen | None, *, base_url: str = "") -> None:
+    if process is None:
+        return
+    try:
+        if process.poll() is not None:
+            if base_url:
+                _wait_for_api_down(base_url, timeout_sec=5)
+            return
+    except Exception:
+        pass
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        try:
+            process.wait(timeout=10)
+        except Exception:
+            pass
+    else:
+        process.terminate()
+        try:
+            process.wait(timeout=30)
+        except Exception:
+            process.kill()
+    if base_url:
+        _wait_for_api_down(base_url, timeout_sec=30)
+
+
 def collect_runtime_checkpoint(base_url: str, *, sequence_horizon_pairs: list[tuple[int, int]]) -> dict[str, object]:
     checkpoint = {
         "dashboard_summary": _fetch_json(base_url, "/api/v1/ml/dashboard").get("summary", {}),
@@ -287,11 +329,7 @@ def run_server_track(
             "reset_smoke": reset_smoke,
         }
     finally:
-        server_process.terminate()
-        try:
-            server_process.wait(timeout=30)
-        except Exception:
-            server_process.kill()
+        _terminate_process_tree(server_process, base_url=base_url)
 
 
 def build_report(certification: dict[str, object]) -> str:

@@ -10,6 +10,7 @@ import re
 from typing import Dict, List, Set
 
 import aiohttp
+from aiohttp.resolver import ThreadedResolver
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,18 @@ _NORMALIZE_MAP = {
     "CAT1000": "CAT", "1000CAT": "CAT",
     "MOG1000000": "MOG", "1000000MOG": "MOG",
 }
+
+
+def _build_discovery_connector() -> aiohttp.TCPConnector:
+    # Force the threaded/system resolver.
+    #
+    # In environments where ``aiodns`` is installed, aiohttp switches its
+    # default resolver to ``AsyncResolver`` (c-ares). That resolver has proven
+    # fragile on this Windows setup and can fail with
+    # "Could not contact DNS servers" while the same requests succeed through
+    # the system resolver. Discovery is purely REST I/O, so the threaded
+    # resolver is the more robust default here.
+    return aiohttp.TCPConnector(resolver=ThreadedResolver())
 
 
 def normalize_base(raw: str) -> str:
@@ -247,7 +260,8 @@ async def discover_all_symbols(exchanges: List[str] = None) -> Dict[str, Dict[st
     result: Dict[str, Dict[str, Set[str]]] = {}
 
     async with aiohttp.ClientSession(
-        headers={"User-Agent": "Mozilla/5.0"}
+        headers={"User-Agent": "Mozilla/5.0"},
+        connector=_build_discovery_connector(),
     ) as session:
         tasks = {}
         for ex in exchanges:

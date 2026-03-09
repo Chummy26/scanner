@@ -96,9 +96,10 @@ def test_runtime_audit_collector_writes_events_samples_and_alerts(tmp_path: Path
     samples = _read_ndjson(paths["samples_path"])
     summary = json.loads(paths["summary_path"].read_text(encoding="utf-8"))
     rebuilt_summary = build_runtime_summary(collector.output_dir)
+    rebuilt_summary_cached = build_runtime_summary(collector.output_dir, events=events)
 
     assert any(event["kind"] == "ws_ingest" for event in events)
-    assert any(event["kind"] == "tracker_record" for event in events)
+    assert all(event["kind"] != "tracker_record" for event in events)
     assert any(event["kind"] == "inference" for event in events)
     assert samples and samples[0]["kind"] == "system_sample"
     assert any(alert["code"] == "gap_detected" for alert in alerts)
@@ -111,6 +112,7 @@ def test_runtime_audit_collector_writes_events_samples_and_alerts(tmp_path: Path
     assert summary["signal_counts"]["EXECUTE"] == 1
     assert summary["signal_counts"]["STRONG_EXECUTE"] == 1
     assert rebuilt_summary["api_probe_latency_ms"]["count"] == 1
+    assert rebuilt_summary_cached["counts"]["events"] == rebuilt_summary["counts"]["events"]
 
 
 def test_runtime_audit_record_inference_tolerates_duplicate_history_fields(tmp_path: Path):
@@ -141,6 +143,41 @@ def test_runtime_audit_record_inference_tolerates_duplicate_history_fields(tmp_p
     summary = collector.finalize_runtime_only()
 
     assert summary["counts"]["events"] >= 1
+
+
+def test_runtime_audit_rate_limits_pair_level_tracker_alerts(tmp_path: Path, monkeypatch):
+    from src.spread.runtime_audit import RuntimeAuditCollector
+
+    collector = RuntimeAuditCollector(
+        output_dir=tmp_path / "audit_rate_limit",
+        record_interval_sec=15.0,
+        gap_threshold_sec=60.0,
+        duration_sec=120,
+    )
+    timestamps = iter([1_000.0, 1_000.0, 1_001.0, 1_302.0, 1_302.0])
+    monkeypatch.setattr("src.spread.runtime_audit.time.time", lambda: next(timestamps))
+
+    payload = {
+        "kind": "tracker_record",
+        "pair_key": "BTC|mexc|spot|gate|futures",
+        "delta_ts": 0.0,
+        "gap_detected": True,
+        "gap_threshold_sec": 60.0,
+        "block_id": 12,
+        "session_id": 3,
+        "numeric_valid": True,
+        "timestamp_monotonic": True,
+    }
+    collector.on_tracker_event(dict(payload))
+    collector.on_tracker_event(dict(payload))
+    collector.on_tracker_event(dict(payload))
+    collector.finalize()
+
+    alerts = _read_ndjson(collector.alerts_path)
+    gap_alerts = [alert for alert in alerts if alert.get("code") == "gap_detected"]
+
+    assert len(gap_alerts) == 2
+    assert gap_alerts[-1]["suppressed_since_last"] == 1
 
 
 def test_finalize_runtime_audit_package_creates_snapshot_and_reports(tmp_path: Path):

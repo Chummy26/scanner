@@ -69,6 +69,48 @@ def _probe_dashboard(base_url: str, output_path: Path) -> None:
     )
 
 
+def _wait_for_api_down(base_url: str, timeout_sec: int = 30) -> bool:
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(f"{base_url.rstrip('/')}/api/v1/ml/dashboard", timeout=3)
+        except Exception:
+            return True
+        time.sleep(1)
+    return False
+
+
+def _terminate_process_tree(server_process, *, base_url: str = "") -> None:
+    if server_process is None:
+        return
+    try:
+        if server_process.poll() is not None:
+            if base_url:
+                _wait_for_api_down(base_url, timeout_sec=5)
+            return
+    except Exception:
+        pass
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(server_process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        try:
+            server_process.wait(timeout=10)
+        except Exception:
+            pass
+    else:
+        server_process.terminate()
+        try:
+            server_process.wait(timeout=30)
+        except Exception:
+            server_process.kill()
+    if base_url:
+        _wait_for_api_down(base_url, timeout_sec=30)
+
+
 def resolve_runtime_paths(output_dir_arg: str, db_path_arg: str) -> tuple[Path, Path]:
     if output_dir_arg:
         output_dir = Path(output_dir_arg)
@@ -130,8 +172,7 @@ def main():
         run_status = "operator_cancelled"
     finally:
         if server_process is not None:
-            server_process.terminate()
-            server_process.wait(timeout=30)
+            _terminate_process_tree(server_process, base_url=base_url)
 
     result = finalize_runtime_audit_package(
         output_dir=output_dir,
