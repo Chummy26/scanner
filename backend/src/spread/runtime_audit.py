@@ -429,8 +429,11 @@ class RuntimeAuditCollector:
         self.on_runtime_error(component=component, error=error, context=details or {})
 
     def on_inference(self, *, pair_key: str, current_entry: float, history_points: int, result: dict[str, Any]):
+        sanitized_result = dict(result)
+        sanitized_result.pop("current_entry", None)
+        sanitized_result.pop("history_points", None)
         previous = self._last_probability_by_pair.get(pair_key)
-        probability = float(result.get("inversion_probability") or 0.0)
+        probability = float(sanitized_result.get("inversion_probability") or 0.0)
         if previous is not None and abs(probability - previous) > 0.30:
             self.alert(
                 "signal_probability_jump",
@@ -459,29 +462,29 @@ class RuntimeAuditCollector:
             current_entry=round(float(current_entry), 6),
             history_points=int(history_points),
             e2e_latency_ms=round(e2e_latency_ms, 6),
-            **result,
+            **sanitized_result,
         )
-        if str(result.get("signal_action") or "WAIT") != "WAIT":
+        if str(sanitized_result.get("signal_action") or "WAIT") != "WAIT":
             self.event(
                 "signal",
                 pair_key=pair_key,
                 current_entry=round(float(current_entry), 6),
                 inversion_probability=round(probability, 6),
-                eta_seconds=int(result.get("eta_seconds") or 0),
-                display_eta_seconds=int(result.get("display_eta_seconds") or result.get("eta_seconds") or 0),
-                model_eta_seconds=int(result.get("model_eta_seconds") or 0),
-                signal_action=str(result.get("signal_action") or "WAIT"),
-                range_status=str(result.get("range_status") or "unknown"),
-                range_window=str(result.get("range_window") or "none"),
-                recommended_entry_range=str(result.get("recommended_entry_range") or "--"),
-                recommended_exit_range=str(result.get("recommended_exit_range") or "--"),
-                eta_alignment_status=str(result.get("eta_alignment_status") or "unknown"),
-                context_strength=str(result.get("context_strength") or ""),
-                entry_position_label=str(result.get("entry_position_label") or "unknown"),
-                signal_reason=str(result.get("signal_reason") or ""),
+                eta_seconds=int(sanitized_result.get("eta_seconds") or 0),
+                display_eta_seconds=int(sanitized_result.get("display_eta_seconds") or sanitized_result.get("eta_seconds") or 0),
+                model_eta_seconds=int(sanitized_result.get("model_eta_seconds") or 0),
+                signal_action=str(sanitized_result.get("signal_action") or "WAIT"),
+                range_status=str(sanitized_result.get("range_status") or "unknown"),
+                range_window=str(sanitized_result.get("range_window") or "none"),
+                recommended_entry_range=str(sanitized_result.get("recommended_entry_range") or "--"),
+                recommended_exit_range=str(sanitized_result.get("recommended_exit_range") or "--"),
+                eta_alignment_status=str(sanitized_result.get("eta_alignment_status") or "unknown"),
+                context_strength=str(sanitized_result.get("context_strength") or ""),
+                entry_position_label=str(sanitized_result.get("entry_position_label") or "unknown"),
+                signal_reason=str(sanitized_result.get("signal_reason") or ""),
                 inference_latency_ms=round(latency_ms, 6),
                 e2e_latency_ms=round(e2e_latency_ms, 6),
-                drift_status=str(result.get("drift_status") or "unknown"),
+                drift_status=str(sanitized_result.get("drift_status") or "unknown"),
             )
 
     def record_inference(self, *, pair_id: str, result: dict[str, Any], end_to_end_ms: float | None = None):

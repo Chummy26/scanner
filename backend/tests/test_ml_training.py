@@ -506,6 +506,140 @@ def _write_multi_session_sqlite_with_spacing(
     return path
 
 
+def _write_same_pair_multi_session_merge_sqlite(
+    path: Path,
+    *,
+    session_gap_sec: int = 90,
+) -> Path:
+    pair = ("BTC", "mexc", "spot", "gate", "futures")
+    base_ts = 1_706_000_000
+    tracker = SpreadTracker(
+        window_sec=604800,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=path,
+        gap_threshold_sec=60.0,
+    )
+    session_payloads = [
+        [
+            (0.10, -0.20),
+            (0.11, -0.19),
+            (0.12, -0.18),
+            (0.11, -0.18),
+            (0.10, -0.17),
+            (0.09, -0.17),
+        ],
+        [
+            (0.12, -0.16),
+            (0.14, -0.15),
+            (0.19, -0.12),
+            (0.82, -0.09),
+            (0.78, -0.03),
+            (0.08, 0.22),
+            (0.07, 0.20),
+        ],
+        [
+            (0.10, -0.15),
+            (0.11, -0.14),
+            (0.10, -0.13),
+            (0.12, -0.12),
+            (0.11, -0.11),
+            (0.09, -0.10),
+        ],
+    ]
+    for session_index, records in enumerate(session_payloads):
+        session_start = base_ts + (session_index * session_gap_sec)
+        for record_index, (entry_spread, exit_spread) in enumerate(records):
+            tracker.record_spread(
+                *pair,
+                entry_spread,
+                exit_spread,
+                now_ts=float(session_start + (record_index * 15)),
+            )
+        ended_at = float(session_start + ((len(records) - 1) * 15))
+        assert tracker.flush_to_storage(now_ts=ended_at, force=True)
+        tracker.close_active_session(ended_at=ended_at)
+        if session_index < len(session_payloads) - 1:
+            tracker._open_runtime_session()
+    return path
+
+
+def _write_same_pair_mergeable_groups_sqlite(path: Path) -> Path:
+    pair = ("BTC", "mexc", "spot", "gate", "futures")
+    tracker = SpreadTracker(
+        window_sec=604800,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=path,
+        gap_threshold_sec=60.0,
+    )
+    session_offsets = [0, 90, 1_000, 1_090]
+    session_payloads = [
+        [(0.10, -0.20), (0.11, -0.19), (0.12, -0.18), (0.11, -0.18), (0.10, -0.17), (0.09, -0.17)],
+        [(0.12, -0.16), (0.14, -0.15), (0.19, -0.12), (0.82, -0.09), (0.78, -0.03), (0.08, 0.22), (0.07, 0.20)],
+        [(0.10, -0.20), (0.11, -0.19), (0.10, -0.18), (0.09, -0.18), (0.08, -0.17), (0.07, -0.17)],
+        [(0.11, -0.16), (0.12, -0.15), (0.18, -0.12), (0.85, -0.09), (0.80, -0.03), (0.09, 0.21), (0.08, 0.19)],
+    ]
+    base_ts = 1_707_000_000
+    for session_index, records in enumerate(session_payloads):
+        session_start = base_ts + session_offsets[session_index]
+        for record_index, (entry_spread, exit_spread) in enumerate(records):
+            tracker.record_spread(
+                *pair,
+                entry_spread,
+                exit_spread,
+                now_ts=float(session_start + (record_index * 15)),
+            )
+        ended_at = float(session_start + ((len(records) - 1) * 15))
+        assert tracker.flush_to_storage(now_ts=ended_at, force=True)
+        tracker.close_active_session(ended_at=ended_at)
+        if session_index < len(session_payloads) - 1:
+            tracker._open_runtime_session()
+    return path
+
+
+def _write_same_pair_mergeable_session_chain_sqlite(path: Path) -> Path:
+    pair = ("BTC", "mexc", "spot", "gate", "futures")
+    tracker = SpreadTracker(
+        window_sec=604800,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=path,
+        gap_threshold_sec=60.0,
+    )
+    base_ts = 1_708_000_000
+    group_offsets = [0, 1_000, 2_000]
+    session_payload = [
+        [(0.10, -0.20), (0.11, -0.19), (0.12, -0.18), (0.11, -0.18), (0.10, -0.17), (0.09, -0.17)],
+        [(0.12, -0.16), (0.14, -0.15), (0.19, -0.12), (0.82, -0.09), (0.78, -0.03), (0.08, 0.22), (0.07, 0.20)],
+    ]
+    for group_offset in group_offsets:
+        for local_session_index, records in enumerate(session_payload):
+            session_start = base_ts + group_offset + (local_session_index * 90)
+            for record_index, (entry_spread, exit_spread) in enumerate(records):
+                tracker.record_spread(
+                    *pair,
+                    entry_spread,
+                    exit_spread,
+                    now_ts=float(session_start + (record_index * 15)),
+                )
+            ended_at = float(session_start + ((len(records) - 1) * 15))
+            assert tracker.flush_to_storage(now_ts=ended_at, force=True)
+            tracker.close_active_session(ended_at=ended_at)
+            if not (group_offset == group_offsets[-1] and local_session_index == len(session_payload) - 1):
+                tracker._open_runtime_session()
+    return path
+
+
 def _write_overlapping_tracker_state(path: Path) -> Path:
     pairs = {}
     for index in range(6):
@@ -859,6 +993,131 @@ def test_group_splits_fall_back_to_purged_sample_mode_when_session_gap_is_below_
     assert summary["split_mode_fallback_reason"] == "session_gap_below_horizon"
     assert summary["purged_temporal_separation_ok"] is True
     assert summary["embargo_time_sec"] == 240
+
+
+def test_build_dataset_bundle_cross_session_merge_recovers_future_labels_without_crossing_feature_blocks(tmp_path: Path):
+    sqlite_path = _write_same_pair_multi_session_merge_sqlite(
+        tmp_path / "tracker_history_cross_session_merge.sqlite",
+        session_gap_sec=90,
+    )
+
+    plain_bundle = build_dataset_bundle(
+        state_path=sqlite_path,
+        sequence_length=4,
+        prediction_horizon_sec=105,
+        allow_cross_session_merge=False,
+    )
+    merged_bundle = build_dataset_bundle(
+        state_path=sqlite_path,
+        sequence_length=4,
+        prediction_horizon_sec=105,
+        allow_cross_session_merge=True,
+        regime_shift_score_threshold=None,
+    )
+
+    assert merged_bundle.summary["cross_session_merge_enabled"] is True
+    assert merged_bundle.summary["cross_session_merges_applied"] >= 1
+    assert merged_bundle.summary["num_cross_block_windows"] == 0
+    assert merged_bundle.summary["skipped_windows_cross_session_boundary"] == 0
+    assert merged_bundle.summary["num_positive_samples"] > plain_bundle.summary["num_positive_samples"]
+
+
+def test_group_splits_preserve_purging_when_cross_session_merge_is_enabled(tmp_path: Path):
+    sqlite_path = _write_same_pair_mergeable_session_chain_sqlite(
+        tmp_path / "tracker_history_cross_session_split.sqlite",
+    )
+
+    bundle = build_dataset_bundle(
+        state_path=sqlite_path,
+        sequence_length=4,
+        prediction_horizon_sec=105,
+        allow_cross_session_merge=True,
+        regime_shift_score_threshold=None,
+    )
+    splits = build_group_splits(bundle, prediction_horizon_sec=105)
+    summary = splits["train"].summary["split_summary"]
+
+    assert summary["purged_temporal_separation_ok"] is True
+    assert summary["train_end_label_ts"] <= summary["val_start_ts"]
+    assert summary["val_end_label_ts"] <= summary["test_start_ts"]
+
+
+def test_threshold_preflight_reports_cross_session_merge_mode_and_failure_reasons(tmp_path: Path):
+    sqlite_path = _write_same_pair_multi_session_merge_sqlite(
+        tmp_path / "tracker_history_cross_session_preflight.sqlite",
+        session_gap_sec=90,
+    )
+
+    preflight_off = run_threshold_preflight(
+        state_file=sqlite_path,
+        sequence_length=4,
+        prediction_horizon_sec=105,
+        thresholds=[0.0],
+        min_train_positive_samples=1,
+        min_val_positive_samples=1,
+        min_test_positive_samples=1,
+        allow_cross_session_merge=False,
+    )
+    preflight_on = run_threshold_preflight(
+        state_file=sqlite_path,
+        sequence_length=4,
+        prediction_horizon_sec=105,
+        thresholds=[0.0],
+        min_train_positive_samples=1,
+        min_val_positive_samples=1,
+        min_test_positive_samples=1,
+        allow_cross_session_merge=True,
+    )
+
+    assert preflight_off["cross_session_merge_enabled"] is False
+    assert preflight_on["cross_session_merge_enabled"] is True
+    assert "failure_reasons" in preflight_off["thresholds"]["0.0"]
+    assert "cross_session_merge_diagnostics" in preflight_on["thresholds"]["0.0"]
+
+
+def test_dataset_fingerprint_is_stable_when_only_sqlite_mtime_changes(tmp_path: Path):
+    sqlite_path = _write_tracker_sqlite(
+        tmp_path / "tracker_history_fingerprint.sqlite",
+        json.loads(_write_tracker_state(tmp_path / "tracker_state_fingerprint.json").read_text(encoding="utf-8"))["pairs"],
+    )
+    artifact_dir_a = tmp_path / "artifacts_a"
+    artifact_dir_b = tmp_path / "artifacts_b"
+
+    report_a = run_training_loop(
+        state_file=sqlite_path,
+        artifact_dir=artifact_dir_a,
+        sequence_length=4,
+        prediction_horizon_sec=240,
+        hidden_size=8,
+        num_layers=1,
+        dropout=0.0,
+        batch_size=8,
+        max_epochs=2,
+        patience=1,
+        learning_rate=0.01,
+        min_train_positive_samples=0,
+        min_val_positive_samples=0,
+        min_test_positive_samples=0,
+    )
+    sqlite_path.touch()
+    report_b = run_training_loop(
+        state_file=sqlite_path,
+        artifact_dir=artifact_dir_b,
+        sequence_length=4,
+        prediction_horizon_sec=240,
+        hidden_size=8,
+        num_layers=1,
+        dropout=0.0,
+        batch_size=8,
+        max_epochs=2,
+        patience=1,
+        learning_rate=0.01,
+        min_train_positive_samples=0,
+        min_val_positive_samples=0,
+        min_test_positive_samples=0,
+    )
+
+    assert report_a["artifact_metadata"]["dataset_fingerprint"] == report_b["artifact_metadata"]["dataset_fingerprint"]
 
 
 def test_run_training_loop_saves_artifacts_and_beats_negative_baseline(tmp_path: Path):

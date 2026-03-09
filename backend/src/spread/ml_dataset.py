@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 from .spread_tracker import SpreadRecord, compute_closed_episodes
@@ -22,6 +23,9 @@ FEATURE_NAMES = [
 
 _ROLLING_WINDOW = 5
 _SQLITE_BLOCK_FETCH_CHUNK = 500
+_DEFAULT_REGIME_SHIFT_SCORE_THRESHOLD = 3.0
+_MIN_REGIME_WINDOW_RECORDS = 5
+_MAX_REGIME_WINDOW_RECORDS = 20
 
 
 @dataclass(slots=True)
@@ -456,6 +460,23 @@ def _load_pairs_payload(state_path: Path) -> tuple[dict[str, Any], float, str]:
     return pairs, saved_at, "sqlite"
 
 
+def _load_tracker_gap_threshold_sec(state_path: Path) -> float | None:
+    if Path(state_path).suffix.lower() == ".json" or not Path(state_path).exists():
+        return None
+    conn = sqlite3.connect(state_path, timeout=30.0)
+    try:
+        row = conn.execute(
+            "SELECT value FROM tracker_meta WHERE key = 'gap_threshold_sec'"
+        ).fetchone()
+        if row is None:
+            return None
+        return float(row[0])
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
 def _build_closed_episodes(
     records: list[dict[str, float]],
     *,
@@ -521,6 +542,236 @@ def _build_closed_episodes_for_blocks(blocks: list[dict[str, Any]]) -> list[Any]
         episodes,
         key=lambda episode: (float(episode.end_ts), float(episode.start_ts)),
     )
+
+
+def _windowed_entry_spreads(records: list[dict[str, Any]], *, tail: bool, limit: int) -> list[float]:
+    normalized = [
+        canonicalize_record(record, fallback_ts=float(index))
+        for index, record in enumerate(records)
+        if isinstance(record, dict)
+    ]
+    normalized.sort(key=lambda record: record["timestamp"])
+    if tail:
+        normalized = normalized[-max(int(limit), 0):]
+    else:
+        normalized = normalized[: max(int(limit), 0)]
+    return [float(record["entry_spread"]) for record in normalized]
+
+
+def _regime_window_size(left_record_count: int, right_record_count: int) -> int:
+    shortest = max(0, min(int(left_record_count), int(right_record_count)))
+    if shortest <= 0:
+        return 0
+    suggested = max(shortest // 2, _MIN_REGIME_WINDOW_RECORDS)
+    return max(1, min(_MAX_REGIME_WINDOW_RECORDS, suggested, shortest))
+
+
+def _regime_shift_metrics(
+    left_records: list[dict[str, Any]],
+    right_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    left_count = sum(1 for record in left_records if isinstance(record, dict))
+    right_count = sum(1 for record in right_records if isinstance(record, dict))
+    window_size = _regime_window_size(left_count, right_count)
+    if window_size <= 0:
+        return {
+            "window_size": 0,
+            "left_count": int(left_count),
+            "right_count": int(right_count),
+            "mean_delta": 0.0,
+            "std_ratio": 0.0,
+            "score": 0.0,
+        }
+    left_values = _windowed_entry_spreads(left_records, tail=True, limit=window_size)
+    right_values = _windowed_entry_spreads(right_records, tail=False, limit=window_size)
+    if not left_values or not right_values:
+        return {
+            "window_size": 0,
+            "left_count": int(left_count),
+            "right_count": int(right_count),
+            "mean_delta": 0.0,
+            "std_ratio": 0.0,
+            "score": 0.0,
+        }
+    left_np = np.asarray(left_values, dtype=float)
+    right_np = np.asarray(right_values, dtype=float)
+    left_mean = float(np.mean(left_np))
+    right_mean = float(np.mean(right_np))
+    left_std = float(np.std(left_np))
+    right_std = float(np.std(right_np))
+    mean_delta = abs(left_mean - right_mean) / max(left_std, right_std, 1e-6)
+    std_ratio = max(left_std, right_std, 1e-6) / max(min(left_std, right_std), 1e-6)
+    return {
+        "window_size": int(window_size),
+        "left_count": int(left_count),
+        "right_count": int(right_count),
+        "mean_delta": float(mean_delta),
+        "std_ratio": float(std_ratio),
+        "score": float(max(mean_delta, std_ratio)),
+    }
+
+
+def _merge_summary(values: list[float]) -> dict[str, float]:
+    return {
+        "p10": _linear_percentile(values, 10.0),
+        "p25": _linear_percentile(values, 25.0),
+        "p50": _linear_percentile(values, 50.0),
+        "p75": _linear_percentile(values, 75.0),
+        "p90": _linear_percentile(values, 90.0),
+        "max": max((float(value) for value in values), default=0.0),
+    } if values else {
+        "p10": 0.0,
+        "p25": 0.0,
+        "p50": 0.0,
+        "p75": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+    }
+
+
+def _build_pair_segments(
+    blocks: list[dict[str, Any]],
+    *,
+    allow_cross_session_merge: bool,
+    max_session_gap_sec: float | None,
+    regime_shift_score_threshold: float | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    blocks_by_pair_session: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+    for block in blocks:
+        pair_id = str(block.get("pair_id") or "")
+        session_id = int(block.get("session_id") or 0)
+        blocks_by_pair_session[(pair_id, session_id)].append(block)
+
+    session_segments_by_pair: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    diagnostics: dict[str, Any] = {
+        "candidate_count": 0,
+        "applied_count": 0,
+        "rejected_gap_count": 0,
+        "rejected_regime_shift_count": 0,
+        "gap_sec_quantiles": _merge_summary([]),
+        "score_quantiles": _merge_summary([]),
+        "window_size_quantiles": _merge_summary([]),
+        "threshold": None if regime_shift_score_threshold is None else float(regime_shift_score_threshold),
+        "max_session_gap_sec": None if max_session_gap_sec is None else float(max_session_gap_sec),
+        "calibration_log": [],
+    }
+    gap_values: list[float] = []
+    score_values: list[float] = []
+    window_sizes: list[float] = []
+
+    for (pair_id, session_id), pair_session_blocks in blocks_by_pair_session.items():
+        ordered_blocks = sorted(
+            pair_session_blocks,
+            key=lambda block: (
+                float(block.get("start_ts") or 0.0),
+                float(block.get("end_ts") or 0.0),
+                int(block.get("block_id") or 0),
+            ),
+        )
+        records: list[dict[str, float]] = []
+        observable_end_ts = 0.0
+        start_ts = 0.0
+        for block in ordered_blocks:
+            normalized_records = [
+                canonicalize_record(record, fallback_ts=float(index))
+                for index, record in enumerate(block.get("records", []))
+                if isinstance(record, dict)
+            ]
+            normalized_records.sort(key=lambda record: record["timestamp"])
+            if normalized_records and start_ts <= 0.0:
+                start_ts = float(normalized_records[0]["timestamp"])
+            if normalized_records:
+                observable_end_ts = max(observable_end_ts, float(normalized_records[-1]["timestamp"]))
+            records.extend(normalized_records)
+        session_segments_by_pair[pair_id].append(
+            {
+                "pair_id": pair_id,
+                "session_ids": [int(session_id)],
+                "blocks": ordered_blocks,
+                "records": records,
+                "episodes": _build_closed_episodes_for_blocks(ordered_blocks),
+                "observable_end_ts": float(observable_end_ts),
+                "start_ts": float(start_ts),
+                "end_ts": float(observable_end_ts),
+                "cross_session_boundaries": [],
+            }
+        )
+
+    merged_segments: list[dict[str, Any]] = []
+    for pair_id, segments in session_segments_by_pair.items():
+        ordered_segments = sorted(
+            segments,
+            key=lambda segment: (
+                float(segment.get("start_ts") or 0.0),
+                float(segment.get("end_ts") or 0.0),
+                int(segment.get("session_ids", [0])[0]),
+            ),
+        )
+        if not allow_cross_session_merge or len(ordered_segments) <= 1:
+            merged_segments.extend(ordered_segments)
+            continue
+        active_segment = dict(ordered_segments[0])
+        for next_segment in ordered_segments[1:]:
+            left_end_ts = float(active_segment.get("end_ts") or 0.0)
+            right_start_ts = float(next_segment.get("start_ts") or 0.0)
+            gap_sec = max(0.0, right_start_ts - left_end_ts)
+            metrics = _regime_shift_metrics(
+                list(active_segment.get("records") or []),
+                list(next_segment.get("records") or []),
+            )
+            diagnostics["candidate_count"] += 1
+            gap_values.append(float(gap_sec))
+            score_values.append(float(metrics["score"]))
+            window_sizes.append(float(metrics["window_size"]))
+            diagnostics["calibration_log"].append(
+                {
+                    "pair_id": pair_id,
+                    "left_session_id": int(active_segment.get("session_ids", [0])[-1]),
+                    "right_session_id": int(next_segment.get("session_ids", [0])[0]),
+                    "gap_sec": float(gap_sec),
+                    "regime_shift_score": float(metrics["score"]),
+                    "regime_window_size": int(metrics["window_size"]),
+                    "mean_delta": float(metrics["mean_delta"]),
+                    "std_ratio": float(metrics["std_ratio"]),
+                }
+            )
+            merge_allowed = True
+            if max_session_gap_sec is not None and float(gap_sec) > float(max_session_gap_sec):
+                diagnostics["rejected_gap_count"] += 1
+                merge_allowed = False
+            if (
+                merge_allowed
+                and regime_shift_score_threshold is not None
+                and float(metrics["score"]) > float(regime_shift_score_threshold)
+            ):
+                diagnostics["rejected_regime_shift_count"] += 1
+                merge_allowed = False
+            if merge_allowed:
+                diagnostics["applied_count"] += 1
+                active_segment["session_ids"] = list(active_segment.get("session_ids") or []) + list(next_segment.get("session_ids") or [])
+                active_segment["blocks"] = list(active_segment.get("blocks") or []) + list(next_segment.get("blocks") or [])
+                active_segment["records"] = list(active_segment.get("records") or []) + list(next_segment.get("records") or [])
+                active_segment["episodes"] = list(active_segment.get("episodes") or []) + list(next_segment.get("episodes") or [])
+                active_segment["observable_end_ts"] = float(next_segment.get("observable_end_ts") or active_segment.get("observable_end_ts") or 0.0)
+                active_segment["end_ts"] = float(next_segment.get("end_ts") or active_segment.get("end_ts") or 0.0)
+                active_segment["cross_session_boundaries"] = list(active_segment.get("cross_session_boundaries") or []) + [
+                    {
+                        "left_session_id": int(active_segment.get("session_ids", [0])[-2]),
+                        "right_session_id": int(next_segment.get("session_ids", [0])[0]),
+                        "gap_sec": float(gap_sec),
+                        "regime_shift_score": float(metrics["score"]),
+                        "regime_window_size": int(metrics["window_size"]),
+                    }
+                ]
+            else:
+                merged_segments.append(active_segment)
+                active_segment = dict(next_segment)
+        merged_segments.append(active_segment)
+
+    diagnostics["gap_sec_quantiles"] = _merge_summary(gap_values)
+    diagnostics["score_quantiles"] = _merge_summary(score_values)
+    diagnostics["window_size_quantiles"] = _merge_summary(window_sizes)
+    return merged_segments, diagnostics
 
 
 def _label_window_from_episodes(
@@ -728,6 +979,9 @@ def build_dataset_bundle(
     selected_session_ids: list[int] | None = None,
     selected_only: bool | None = None,
     closed_only: bool = True,
+    allow_cross_session_merge: bool = False,
+    max_session_gap_sec: float | None = None,
+    regime_shift_score_threshold: float | None = _DEFAULT_REGIME_SHIFT_SCORE_THRESHOLD,
 ) -> DatasetBundle:
     X_samples: list[list[list[float]]] = []
     y_class: list[float] = []
@@ -775,96 +1029,86 @@ def build_dataset_bundle(
         storage_kind = str(block_summary.get("state_storage_kind", "sqlite"))
 
     min_total_spread_pct = max(0.0, float(min_total_spread_pct or 0.0))
+    effective_max_session_gap_sec = max_session_gap_sec
+    if bool(allow_cross_session_merge) and effective_max_session_gap_sec is None:
+        effective_max_session_gap_sec = _load_tracker_gap_threshold_sec(state_path)
     block_diagnostics = _build_block_diagnostics(blocks, sequence_length=sequence_length)
-    episodes_by_pair_session: dict[tuple[str, int], list[Any]] = {}
-    blocks_by_pair_session: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
-    observable_end_by_pair_session: dict[tuple[str, int], float] = {}
-    for block in blocks:
-        pair_id = str(block.get("pair_id") or "")
-        session_id = int(block.get("session_id") or 0)
-        blocks_by_pair_session[(pair_id, session_id)].append(block)
-    for key, pair_session_blocks in blocks_by_pair_session.items():
-        episodes_by_pair_session[key] = _build_closed_episodes_for_blocks(pair_session_blocks)
-        observable_end_ts = 0.0
-        for block in pair_session_blocks:
+    pair_segments, cross_session_merge_diagnostics = _build_pair_segments(
+        blocks,
+        allow_cross_session_merge=bool(allow_cross_session_merge),
+        max_session_gap_sec=effective_max_session_gap_sec,
+        regime_shift_score_threshold=regime_shift_score_threshold,
+    )
+
+    skipped_blocks_too_short = 0
+    skipped_windows_cross_session_boundary = 0
+    for segment in pair_segments:
+        episodes = list(segment.get("episodes") or [])
+        observable_end_ts = float(segment.get("observable_end_ts") or 0.0)
+        for block in segment.get("blocks", []):
+            normalized_session_id = int(block.get("session_id") or 0)
+            normalized_pair_id = str(block.get("pair_id") or "")
             records = [
                 canonicalize_record(record, fallback_ts=float(index))
                 for index, record in enumerate(block.get("records", []))
                 if isinstance(record, dict)
             ]
-            records.sort(key=lambda record: record["timestamp"])
-            if records:
-                observable_end_ts = max(observable_end_ts, float(records[-1]["timestamp"]))
-        observable_end_by_pair_session[key] = float(observable_end_ts)
-
-    skipped_blocks_too_short = 0
-    for block in blocks:
-        normalized_session_id = int(block.get("session_id") or 0)
-        normalized_pair_id = str(block.get("pair_id") or "")
-        records = [
-            canonicalize_record(record, fallback_ts=float(index))
-            for index, record in enumerate(block.get("records", []))
-            if isinstance(record, dict)
-        ]
-        if len(records) < sequence_length:
-            skipped_blocks_too_short += 1
-            continue
-        records.sort(key=lambda record: record["timestamp"])
-        episodes = episodes_by_pair_session.get((normalized_pair_id, normalized_session_id), [])
-        observable_end_ts = float(observable_end_by_pair_session.get((normalized_pair_id, normalized_session_id), 0.0))
-
-        for start in range(len(records) - sequence_length + 1):
-            window = records[start : start + sequence_length]
-            current_ts = window[-1]["timestamp"]
-            if observable_end_ts > 0.0 and (float(current_ts) + float(prediction_horizon_sec)) > observable_end_ts:
-                skipped_windows_right_censored += 1
+            if len(records) < sequence_length:
+                skipped_blocks_too_short += 1
                 continue
-            label = _label_window_from_episodes(
-                current_ts,
-                episodes,
-                prediction_horizon_sec=prediction_horizon_sec,
-                min_total_spread_pct=min_total_spread_pct,
-            )
-
-            X_samples.append(_feature_window(window))
-            y_class.append(float(label["y_class"]))
-            y_eta.append(float(label["y_eta"]))
-            pair_ids.append(str(block.get("pair_id") or ""))
-            block_ids.append(int(block.get("block_id") or 0))
-            session_ids.append(normalized_session_id)
-            timestamps.append(current_ts)
-            label_end_timestamps.append(float(current_ts) + float(prediction_horizon_sec))
-            last_entries.append(window[-1]["entry_spread"])
-
-            future_episode_total_spreads.extend(float(value) for value in label["future_episode_total_spreads"])
-            if float(label["y_class"]) >= 0.5:
-                _bucket_count(
-                    window[-1]["entry_spread"],
-                    [
-                        ("lt_0_30", -float("inf"), 0.30),
-                        ("0_30_to_0_50", 0.30, 0.50),
-                        ("0_50_to_1_00", 0.50, 1.00),
-                        ("1_00_to_2_00", 1.00, 2.00),
-                        ("ge_2_00", 2.00, float("inf")),
-                    ],
-                    positive_entry_spread_buckets,
+            records.sort(key=lambda record: record["timestamp"])
+            for start in range(len(records) - sequence_length + 1):
+                window = records[start : start + sequence_length]
+                current_ts = window[-1]["timestamp"]
+                if observable_end_ts > 0.0 and (float(current_ts) + float(prediction_horizon_sec)) > observable_end_ts:
+                    skipped_windows_right_censored += 1
+                    continue
+                label = _label_window_from_episodes(
+                    current_ts,
+                    episodes,
+                    prediction_horizon_sec=prediction_horizon_sec,
+                    min_total_spread_pct=min_total_spread_pct,
                 )
-            else:
-                _bucket_count(
-                    float(label["peak_future_total_spread"]),
-                    [
-                        ("lt_0_30", -float("inf"), 0.30),
-                        ("0_30_to_0_50", 0.30, 0.50),
-                        ("0_50_to_0_80", 0.50, 0.80),
-                        ("0_80_to_1_00", 0.80, 1.00),
-                        ("ge_1_00", 1.00, float("inf")),
-                    ],
-                    timeout_peak_future_total_spread_buckets,
-                )
-                if label["timeout_reason"] == "no_future_episode":
-                    timeouts_without_future_episode += 1
-                elif label["timeout_reason"] == "sub_threshold_only":
-                    timeouts_with_only_sub_threshold_episode += 1
+
+                X_samples.append(_feature_window(window))
+                y_class.append(float(label["y_class"]))
+                y_eta.append(float(label["y_eta"]))
+                pair_ids.append(normalized_pair_id)
+                block_ids.append(int(block.get("block_id") or 0))
+                session_ids.append(normalized_session_id)
+                timestamps.append(current_ts)
+                label_end_timestamps.append(float(current_ts) + float(prediction_horizon_sec))
+                last_entries.append(window[-1]["entry_spread"])
+
+                future_episode_total_spreads.extend(float(value) for value in label["future_episode_total_spreads"])
+                if float(label["y_class"]) >= 0.5:
+                    _bucket_count(
+                        window[-1]["entry_spread"],
+                        [
+                            ("lt_0_30", -float("inf"), 0.30),
+                            ("0_30_to_0_50", 0.30, 0.50),
+                            ("0_50_to_1_00", 0.50, 1.00),
+                            ("1_00_to_2_00", 1.00, 2.00),
+                            ("ge_2_00", 2.00, float("inf")),
+                        ],
+                        positive_entry_spread_buckets,
+                    )
+                else:
+                    _bucket_count(
+                        float(label["peak_future_total_spread"]),
+                        [
+                            ("lt_0_30", -float("inf"), 0.30),
+                            ("0_30_to_0_50", 0.30, 0.50),
+                            ("0_50_to_0_80", 0.50, 0.80),
+                            ("0_80_to_1_00", 0.80, 1.00),
+                            ("ge_1_00", 1.00, float("inf")),
+                        ],
+                        timeout_peak_future_total_spread_buckets,
+                    )
+                    if label["timeout_reason"] == "no_future_episode":
+                        timeouts_without_future_episode += 1
+                    elif label["timeout_reason"] == "sub_threshold_only":
+                        timeouts_with_only_sub_threshold_episode += 1
 
     if X_samples:
         X_tensor = torch.tensor(X_samples, dtype=torch.float32)
@@ -890,10 +1134,16 @@ def build_dataset_bundle(
         "selected_session_ids": sorted({int(session_id) for session_id in (selected_session_ids or []) if int(session_id) > 0}),
         "skipped_blocks_too_short": int(skipped_blocks_too_short),
         "skipped_windows_right_censored": int(skipped_windows_right_censored),
+        "skipped_windows_cross_session_boundary": int(skipped_windows_cross_session_boundary),
         "num_cross_block_windows": 0,
         "prediction_horizon_sec": int(prediction_horizon_sec),
         "sequence_length": int(sequence_length),
         "min_total_spread_pct": float(min_total_spread_pct),
+        "cross_session_merge_enabled": bool(allow_cross_session_merge),
+        "cross_session_merges_applied": int(cross_session_merge_diagnostics.get("applied_count", 0)),
+        "cross_session_gap_threshold_sec": None if effective_max_session_gap_sec is None else float(effective_max_session_gap_sec),
+        "cross_session_boundaries": int(cross_session_merge_diagnostics.get("applied_count", 0)),
+        "cross_session_merge_diagnostics": dict(cross_session_merge_diagnostics),
         "labeling_method": "episode_take_profit_time_barrier",
         "labeling_timeout_only": True,
         "label_audit": _finalize_label_audit(

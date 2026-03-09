@@ -768,6 +768,44 @@ def _preflight_entry(
     min_val_positive_samples: int,
     min_test_positive_samples: int,
 ) -> dict[str, Any]:
+    def _failure_reasons(
+        *,
+        bundle_obj: DatasetBundle,
+        guardrail_ok_value: bool,
+        purging_ok_value: bool,
+        stability_obj: dict[str, Any],
+        positive_counts_obj: dict[str, int],
+    ) -> list[str]:
+        reasons: list[str] = []
+        if int(bundle_obj.summary.get("num_samples", 0)) <= 0:
+            reasons.append("no_samples")
+        if int(bundle_obj.summary.get("num_positive_samples", 0)) <= 0:
+            reasons.append("no_positive_samples")
+        if int(bundle_obj.summary.get("skipped_windows_right_censored", 0)) > 0:
+            reasons.append("right_censoring_present")
+        if int(
+            bundle_obj.summary.get("block_diagnostics", {})
+            .get("feature_window_feasibility", {})
+            .get("eligible_blocks_for_sequence_length", 0)
+        ) <= 0:
+            reasons.append("insufficient_eligible_blocks")
+        if not guardrail_ok_value:
+            if int(positive_counts_obj.get("train", 0)) < int(min_train_positive_samples):
+                reasons.append("insufficient_train_positives")
+            if int(positive_counts_obj.get("val", 0)) < int(min_val_positive_samples):
+                reasons.append("insufficient_val_positives")
+            if int(positive_counts_obj.get("test", 0)) < int(min_test_positive_samples):
+                reasons.append("insufficient_test_positives")
+        if not purging_ok_value:
+            reasons.append("purging_failed")
+        if not bool(stability_obj.get("stability_ok_primary", False)):
+            reasons.append("temporal_instability")
+        if bool(
+            bundle_obj.summary.get("cross_session_merge_enabled", False)
+        ) and int(bundle_obj.summary.get("cross_session_merges_applied", 0)) <= 0:
+            reasons.append("cross_session_merge_no_effect")
+        return list(dict.fromkeys(reasons))
+
     if bundle is None or splits is None:
         return {
             "threshold": float(threshold),
@@ -777,6 +815,8 @@ def _preflight_entry(
             "stability_ok": False,
             "stability_mode": "primary",
             "qualifies_for_training": False,
+            "qualifies_for_training_relaxed": False,
+            "failure_reasons": ["dataset_build_failed"],
             "error": str(error or "dataset_build_failed"),
         }
 
@@ -814,6 +854,16 @@ def _preflight_entry(
         "split_summary": split_summary,
         "label_audit": dict(bundle.summary.get("label_audit", {})),
         "block_diagnostics": dict(bundle.summary.get("block_diagnostics", {})),
+        "cross_session_merge_enabled": bool(bundle.summary.get("cross_session_merge_enabled", False)),
+        "cross_session_merges_applied": int(bundle.summary.get("cross_session_merges_applied", 0)),
+        "cross_session_merge_diagnostics": dict(bundle.summary.get("cross_session_merge_diagnostics", {})),
+        "failure_reasons": _failure_reasons(
+            bundle_obj=bundle,
+            guardrail_ok_value=guardrail_ok,
+            purging_ok_value=purging_ok,
+            stability_obj=stability,
+            positive_counts_obj=positive_counts,
+        ),
         "error": str(error or ""),
     }
 
@@ -826,6 +876,9 @@ def run_threshold_preflight(
     thresholds: list[float] | None = None,
     selected_session_ids: list[int] | None = None,
     selected_block_ids: list[int] | None = None,
+    allow_cross_session_merge: bool = False,
+    max_session_gap_sec: float | None = None,
+    regime_shift_score_threshold: float | None = 3.0,
     min_train_positive_samples: int = 500,
     min_val_positive_samples: int = 50,
     min_test_positive_samples: int = 50,
@@ -840,6 +893,9 @@ def run_threshold_preflight(
         "prediction_horizon_sec": int(prediction_horizon_sec),
         "thresholds": {},
         "block_diagnostics": {},
+        "cross_session_merge_enabled": bool(allow_cross_session_merge),
+        "max_session_gap_sec": None if max_session_gap_sec is None else float(max_session_gap_sec),
+        "regime_shift_score_threshold": None if regime_shift_score_threshold is None else float(regime_shift_score_threshold),
         "selected_threshold": None,
         "selection_mode": "none",
         "qualifies_for_training": False,
@@ -855,6 +911,9 @@ def run_threshold_preflight(
                 min_total_spread_pct=threshold,
                 selected_session_ids=selected_session_ids,
                 selected_block_ids=selected_block_ids,
+                allow_cross_session_merge=allow_cross_session_merge,
+                max_session_gap_sec=max_session_gap_sec,
+                regime_shift_score_threshold=regime_shift_score_threshold,
             )
             splits = build_group_splits(bundle, prediction_horizon_sec=prediction_horizon_sec)
             entry = _preflight_entry(
@@ -921,6 +980,53 @@ def _archive_existing_artifacts(artifact_root: Path) -> str:
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _build_dataset_fingerprint(
+    *,
+    state_path: Path,
+    bundle: DatasetBundle,
+    min_total_spread_pct: float,
+    selected_session_ids: list[int] | None,
+    selected_block_ids: list[int] | None,
+    allow_cross_session_merge: bool,
+    max_session_gap_sec: float | None,
+    regime_shift_score_threshold: float | None,
+) -> str:
+    digest = hashlib.sha1()
+    header = {
+        "state_path": str(state_path.resolve()),
+        "num_samples": int(bundle.summary.get("num_samples", 0)),
+        "num_positive_samples": int(bundle.summary.get("num_positive_samples", 0)),
+        "num_pairs": int(bundle.summary.get("num_pairs", 0)),
+        "blocks_used": int(bundle.summary.get("blocks_used", 0)),
+        "sessions_used": int(bundle.summary.get("sessions_used", 0)),
+        "min_total_spread_pct": float(min_total_spread_pct),
+        "selected_session_ids": [int(value) for value in selected_session_ids or []],
+        "selected_block_ids": [int(value) for value in selected_block_ids or []],
+        "allow_cross_session_merge": bool(allow_cross_session_merge),
+        "max_session_gap_sec": None if max_session_gap_sec is None else float(max_session_gap_sec),
+        "regime_shift_score_threshold": None if regime_shift_score_threshold is None else float(regime_shift_score_threshold),
+        "feature_names": list(bundle.feature_names),
+    }
+    digest.update(json.dumps(header, sort_keys=True, separators=(",", ":")).encode())
+    for pair_id, session_id, block_id, ts_value, label_end_ts, y_class_value, y_eta_value in zip(
+        bundle.pair_ids,
+        bundle.session_ids,
+        bundle.block_ids,
+        bundle.timestamps,
+        bundle.label_end_timestamps,
+        bundle.y_class.tolist(),
+        bundle.y_eta.tolist(),
+    ):
+        digest.update(
+            (
+                f"{pair_id}|{int(session_id)}|{int(block_id)}|"
+                f"{float(ts_value):.6f}|{float(label_end_ts):.6f}|"
+                f"{float(y_class_value):.6f}|{float(y_eta_value):.6f}"
+            ).encode()
+        )
+    return digest.hexdigest()
 
 
 def _build_psi_reference(
@@ -1153,6 +1259,9 @@ def run_training_loop(
     min_total_spread_pct: float = 1.0,
     selected_session_ids: list[int] | None = None,
     selected_block_ids: list[int] | None = None,
+    allow_cross_session_merge: bool = False,
+    max_session_gap_sec: float | None = None,
+    regime_shift_score_threshold: float | None = 3.0,
     hidden_size: int = 64,
     num_layers: int = 2,
     dropout: float = 0.3,
@@ -1196,6 +1305,9 @@ def run_training_loop(
         min_total_spread_pct=min_total_spread_pct,
         selected_session_ids=selected_session_ids,
         selected_block_ids=selected_block_ids,
+        allow_cross_session_merge=allow_cross_session_merge,
+        max_session_gap_sec=max_session_gap_sec,
+        regime_shift_score_threshold=regime_shift_score_threshold,
     )
     if bundle.summary["num_samples"] < 30:
         raise ValueError("Dataset construction failed or too small for robust training.")
@@ -1490,20 +1602,23 @@ def run_training_loop(
             "validation_partition_mode": validation_partition["mode"],
             "selected_session_ids": list(selected_session_ids or []),
             "selected_block_ids": list(selected_block_ids or []),
+            "allow_cross_session_merge": bool(allow_cross_session_merge),
+            "max_session_gap_sec": None if max_session_gap_sec is None else float(max_session_gap_sec),
+            "regime_shift_score_threshold": None if regime_shift_score_threshold is None else float(regime_shift_score_threshold),
             "psi_reference": feature_monitoring["psi_reference"],
         },
         use_attention=True,
         trained_at_utc=datetime.now(timezone.utc).isoformat(),
-        dataset_fingerprint=hashlib.sha1(
-            (
-                f"{state_path.resolve()}:{state_path.stat().st_mtime_ns}:"
-                f"{dataset_summary['num_samples']}:{dataset_summary['num_positive_samples']}:"
-                f"{dataset_summary['num_pairs']}:{dataset_summary.get('blocks_used', 0)}:{dataset_summary.get('sessions_used', 0)}:"
-                f"{float(min_total_spread_pct)}:"
-                f"{','.join(str(session_id) for session_id in dataset_summary.get('session_ids_used', []))}:"
-                f"{','.join(str(block_id) for block_id in dataset_summary.get('block_ids_used', []))}"
-            ).encode()
-        ).hexdigest(),
+        dataset_fingerprint=_build_dataset_fingerprint(
+            state_path=state_path,
+            bundle=bundle,
+            min_total_spread_pct=min_total_spread_pct,
+            selected_session_ids=selected_session_ids,
+            selected_block_ids=selected_block_ids,
+            allow_cross_session_merge=allow_cross_session_merge,
+            max_session_gap_sec=max_session_gap_sec,
+            regime_shift_score_threshold=regime_shift_score_threshold,
+        ),
         feature_schema_hash=current_feature_schema_hash(),
     )
     report["artifact_metadata"] = metadata.to_dict()
@@ -1533,6 +1648,9 @@ def run_clean_training_cycle(
     thresholds: list[float] | None = None,
     selected_session_ids: list[int] | None = None,
     selected_block_ids: list[int] | None = None,
+    allow_cross_session_merge: bool = False,
+    max_session_gap_sec: float | None = None,
+    regime_shift_score_threshold: float | None = 3.0,
     hidden_size: int = 64,
     num_layers: int = 2,
     dropout: float = 0.3,
@@ -1558,6 +1676,9 @@ def run_clean_training_cycle(
         thresholds=thresholds,
         selected_session_ids=selected_session_ids,
         selected_block_ids=selected_block_ids,
+        allow_cross_session_merge=allow_cross_session_merge,
+        max_session_gap_sec=max_session_gap_sec,
+        regime_shift_score_threshold=regime_shift_score_threshold,
         min_train_positive_samples=min_train_positive_samples,
         min_val_positive_samples=min_val_positive_samples,
         min_test_positive_samples=min_test_positive_samples,
@@ -1575,6 +1696,9 @@ def run_clean_training_cycle(
         min_total_spread_pct=selected_threshold,
         selected_session_ids=selected_session_ids,
         selected_block_ids=selected_block_ids,
+        allow_cross_session_merge=allow_cross_session_merge,
+        max_session_gap_sec=max_session_gap_sec,
+        regime_shift_score_threshold=regime_shift_score_threshold,
         hidden_size=hidden_size,
         num_layers=num_layers,
         dropout=dropout,

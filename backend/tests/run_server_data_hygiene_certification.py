@@ -219,13 +219,28 @@ def collect_dataset_matrix(db_path: Path, configs: list[dict[str, int]] | None =
 def collect_threshold_preflights(db_path: Path, configs: list[dict[str, object]] | None = None) -> list[dict[str, object]]:
     results: list[dict[str, object]] = []
     for config in configs or DEFAULT_PREFLIGHT_CONFIGS:
-        result = run_threshold_preflight(
+        merge_off = run_threshold_preflight(
             state_file=db_path,
             sequence_length=int(config["sequence_length"]),
             prediction_horizon_sec=int(config["prediction_horizon_sec"]),
             thresholds=[float(value) for value in config["thresholds"]],
+            allow_cross_session_merge=False,
         )
-        results.append(result)
+        merge_on = run_threshold_preflight(
+            state_file=db_path,
+            sequence_length=int(config["sequence_length"]),
+            prediction_horizon_sec=int(config["prediction_horizon_sec"]),
+            thresholds=[float(value) for value in config["thresholds"]],
+            allow_cross_session_merge=True,
+        )
+        results.append(
+            {
+                "sequence_length": int(config["sequence_length"]),
+                "prediction_horizon_sec": int(config["prediction_horizon_sec"]),
+                "merge_off": merge_off,
+                "merge_on": merge_on,
+            }
+        )
     return results
 
 

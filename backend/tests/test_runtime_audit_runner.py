@@ -113,6 +113,36 @@ def test_runtime_audit_collector_writes_events_samples_and_alerts(tmp_path: Path
     assert rebuilt_summary["api_probe_latency_ms"]["count"] == 1
 
 
+def test_runtime_audit_record_inference_tolerates_duplicate_history_fields(tmp_path: Path):
+    from src.spread.runtime_audit import RuntimeAuditCollector
+
+    collector = RuntimeAuditCollector(
+        output_dir=tmp_path / "audit_dup",
+        record_interval_sec=15.0,
+        gap_threshold_sec=60.0,
+        duration_sec=120,
+    )
+    collector.record_inference(
+        pair_id="BTC|mexc|spot|gate|futures",
+        result={
+            "current_entry": 0.44,
+            "history_points": 12,
+            "signal_action": "EXECUTE",
+            "inversion_probability": 0.66,
+            "eta_seconds": 600,
+            "context_strength": "normal",
+            "inference_latency_ms": 8.5,
+            "drift_status": "stable",
+            "drifted_features": [],
+            "model_status": "ready",
+        },
+        end_to_end_ms=12.0,
+    )
+    summary = collector.finalize_runtime_only()
+
+    assert summary["counts"]["events"] >= 1
+
+
 def test_finalize_runtime_audit_package_creates_snapshot_and_reports(tmp_path: Path):
     from src.spread.runtime_audit import RuntimeAuditCollector, finalize_runtime_audit_package
 

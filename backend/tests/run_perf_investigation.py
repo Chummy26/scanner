@@ -123,6 +123,9 @@ def _timed_json_get(base_url: str, name: str, path: str, *, timeout_sec: int = 2
         "rows": 0,
         "updated_at": "",
         "error": "",
+        "book_age_p95_sec": 0.0,
+        "book_age_p99_sec": 0.0,
+        "book_age_max_sec": 0.0,
     }
     try:
         with urllib.request.urlopen(url, timeout=timeout_sec) as response:
@@ -136,6 +139,25 @@ def _timed_json_get(base_url: str, name: str, path: str, *, timeout_sec: int = 2
                 data = payload.get("data")
                 if isinstance(data, list):
                     sample["rows"] = len(data)
+                    if name == "scanner_lite_list":
+                        book_ages = []
+                        for item in data:
+                            try:
+                                buy_age = float(item.get("buyBookAge") or 0.0)
+                            except Exception:
+                                buy_age = 0.0
+                            try:
+                                sell_age = float(item.get("sellBookAge") or 0.0)
+                            except Exception:
+                                sell_age = 0.0
+                            if buy_age > 0:
+                                book_ages.append(buy_age)
+                            if sell_age > 0:
+                                book_ages.append(sell_age)
+                        if book_ages:
+                            sample["book_age_p95_sec"] = round(_percentile(book_ages, 95.0), 6)
+                            sample["book_age_p99_sec"] = round(_percentile(book_ages, 99.0), 6)
+                            sample["book_age_max_sec"] = round(max(book_ages), 6)
                 elif isinstance(payload.get("summary"), dict):
                     try:
                         sample["rows"] = int(payload["summary"].get("total") or 0)
@@ -165,6 +187,9 @@ def summarize_probe_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
             "error_count": sum(1 for sample in subset if not sample.get("ok")),
             "latency_ms": _numeric_summary(latencies),
             "payload_bytes": _numeric_summary(payloads),
+            "book_age_p95_sec": _numeric_summary([float(sample.get("book_age_p95_sec") or 0.0) for sample in subset if float(sample.get("book_age_p95_sec") or 0.0) > 0.0]),
+            "book_age_p99_sec": _numeric_summary([float(sample.get("book_age_p99_sec") or 0.0) for sample in subset if float(sample.get("book_age_p99_sec") or 0.0) > 0.0]),
+            "book_age_max_sec": _numeric_summary([float(sample.get("book_age_max_sec") or 0.0) for sample in subset if float(sample.get("book_age_max_sec") or 0.0) > 0.0]),
         }
 
         last_updated_at = ""
@@ -246,6 +271,16 @@ def summarize_server_perf(samples: list[dict[str, Any]]) -> dict[str, Any]:
     return {"perf": perf, "runtime": runtime, "hot_windows": hot_windows[-20:]}
 
 
+def _load_runtime_audit_summary(output_dir: Path) -> dict[str, Any]:
+    summary_path = output_dir / "runtime_audit" / "summary.json"
+    if not summary_path.is_file():
+        return {}
+    try:
+        return json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 def render_report(summary: dict[str, Any]) -> str:
     scenario = summary.get("scenario", "unknown")
     lines = [
@@ -261,11 +296,17 @@ def render_report(summary: dict[str, Any]) -> str:
     for name, metrics in sorted((summary.get("probe_summary") or {}).get("endpoints", {}).items()):
         latency = metrics.get("latency_ms", {})
         payload = metrics.get("payload_bytes", {})
+        book_age_p95 = metrics.get("book_age_p95_sec", {})
+        book_age_p99 = metrics.get("book_age_p99_sec", {})
         lines.append(
             f"- `{name}`: ok `{metrics.get('ok_count', 0)}/{metrics.get('count', 0)}`, "
             f"p95 `{latency.get('p95', 0)}ms`, p99 `{latency.get('p99', 0)}ms`, "
             f"payload p95 `{payload.get('p95', 0)}B`"
         )
+        if metrics.get("book_age_p95_sec", {}).get("count", 0):
+            lines.append(
+                f"  book age p95/p99 `{book_age_p95.get('p95', 0)}s / {book_age_p99.get('p95', 0)}s`"
+            )
     lines.extend(["", "## Answers"])
 
     probe_summary = summary.get("probe_summary") or {}
@@ -284,7 +325,10 @@ def render_report(summary: dict[str, Any]) -> str:
     dominant_stage = max(cycle_candidates.items(), key=lambda item: item[1])[0] if cycle_candidates else "unknown"
     lag = ((server_perf.get("perf") or {}).get("event_loop_lag_ms") if isinstance(server_perf.get("perf"), dict) else {}) or {}
     rss = summary.get("memory_rss_mb", {})
+    runtime_audit = summary.get("runtime_audit", {})
+    alert_counts = runtime_audit.get("alert_counts", {})
     scanner_summary = (probe_summary.get("endpoints") or {}).get("scanner_lite_summary", {})
+    scanner_list = (probe_summary.get("endpoints") or {}).get("scanner_lite_list", {})
 
     lines.append(
         f"1. Scanner trava sem navegador? `{scanner_summary.get('error_count', 0) > 0 or float((scanner_summary.get('latency_ms') or {}).get('p99', 0)) >= 1000.0}`"
@@ -300,6 +344,12 @@ def render_report(summary: dict[str, Any]) -> str:
     )
     lines.append(
         f"5. Event loop lag p95/p99: `{lag.get('p95', 0)}ms / {lag.get('p99', 0)}ms`"
+    )
+    lines.append(
+        f"6. Reconnect/disconnect alerts: `reconnected={alert_counts.get('exchange_reconnected', 0)}` / `disconnected={alert_counts.get('exchange_disconnected', 0)}`"
+    )
+    lines.append(
+        f"7. Scanner book age p95/p99 (sample-level): `{((scanner_list.get('book_age_p95_sec') or {}).get('p95', 0))}s / {((scanner_list.get('book_age_p99_sec') or {}).get('p95', 0))}s`"
     )
     return "\n".join(lines) + "\n"
 
@@ -466,6 +516,8 @@ def run_single_scenario(
     env["TEAM_OP_MAX_SYMBOLS"] = str(int(max_symbols))
     env["TEAM_OP_SYMBOL_DISCOVERY_ENABLED"] = str(symbol_discovery_enabled)
     env["TEAM_OP_TRACKER_DB_PATH"] = str(resolve_tracker_db_path(output_dir))
+    env["TEAM_OP_RUNTIME_AUDIT_DIR"] = str((output_dir / "runtime_audit").resolve())
+    env["TEAM_OP_RUNTIME_AUDIT_DURATION_SEC"] = str(int(duration_sec))
 
     if spawn_server:
         with log_path.open("wb") as log_handle:
@@ -546,6 +598,7 @@ def run_single_scenario(
         "probe_summary": probe_summary,
         "server_perf": server_perf_summary,
         "browser_perf": browser_summary,
+        "runtime_audit": _load_runtime_audit_summary(output_dir),
         "memory_rss_mb": {
             **memory_summary,
             "growth_pct_from_first": growth_pct,
