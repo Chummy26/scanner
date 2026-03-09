@@ -1018,7 +1018,7 @@ def test_build_dataset_bundle_cross_session_merge_recovers_future_labels_without
     assert merged_bundle.summary["cross_session_merge_enabled"] is True
     assert merged_bundle.summary["cross_session_merges_applied"] >= 1
     assert merged_bundle.summary["num_cross_block_windows"] == 0
-    assert merged_bundle.summary["skipped_windows_cross_session_boundary"] == 0
+    assert merged_bundle.summary["skipped_windows_cross_session_boundary"] > 0
     assert merged_bundle.summary["num_positive_samples"] > plain_bundle.summary["num_positive_samples"]
 
 
@@ -1338,7 +1338,7 @@ def test_run_training_loop_aborts_when_filtered_dataset_has_too_few_positive_sam
         )
 
 
-def test_build_dataset_bundle_never_crosses_temporal_gap_blocks(tmp_path: Path):
+def test_build_dataset_bundle_restores_cross_block_windows_within_same_session(tmp_path: Path):
     tracker = SpreadTracker(
         window_sec=10 * 24 * 60 * 60,
         record_interval_sec=60.0,
@@ -1364,8 +1364,8 @@ def test_build_dataset_bundle_never_crosses_temporal_gap_blocks(tmp_path: Path):
     )
 
     assert bundle.summary["num_blocks"] == 2
-    assert bundle.summary["blocks_used"] == 1
-    assert bundle.summary["num_cross_block_windows"] == 0
+    assert bundle.summary["blocks_used"] == 2
+    assert bundle.summary["num_cross_block_windows"] > 0
     assert bundle.summary["skipped_windows_right_censored"] > 0
     assert sorted(set(bundle.block_ids)) == bundle.summary["block_ids_used"]
     assert all(block_id > 0 for block_id in bundle.block_ids)

@@ -558,6 +558,27 @@ def _windowed_entry_spreads(records: list[dict[str, Any]], *, tail: bool, limit:
     return [float(record["entry_spread"]) for record in normalized]
 
 
+def _normalized_block_records(block: dict[str, Any]) -> list[dict[str, float | int]]:
+    block_id = int(block.get("block_id") or 0)
+    session_id = int(block.get("session_id") or 0)
+    normalized = [
+        canonicalize_record(record, fallback_ts=float(index))
+        for index, record in enumerate(block.get("records", []))
+        if isinstance(record, dict)
+    ]
+    normalized.sort(key=lambda record: record["timestamp"])
+    return [
+        {
+            "timestamp": float(record["timestamp"]),
+            "entry_spread": float(record["entry_spread"]),
+            "exit_spread": float(record["exit_spread"]),
+            "block_id": int(block_id),
+            "session_id": int(session_id),
+        }
+        for record in normalized
+    ]
+
+
 def _regime_window_size(left_record_count: int, right_record_count: int) -> int:
     shortest = max(0, min(int(left_record_count), int(right_record_count)))
     if shortest <= 0:
@@ -668,16 +689,11 @@ def _build_pair_segments(
                 int(block.get("block_id") or 0),
             ),
         )
-        records: list[dict[str, float]] = []
+        records: list[dict[str, float | int]] = []
         observable_end_ts = 0.0
         start_ts = 0.0
         for block in ordered_blocks:
-            normalized_records = [
-                canonicalize_record(record, fallback_ts=float(index))
-                for index, record in enumerate(block.get("records", []))
-                if isinstance(record, dict)
-            ]
-            normalized_records.sort(key=lambda record: record["timestamp"])
+            normalized_records = _normalized_block_records(block)
             if normalized_records and start_ts <= 0.0:
                 start_ts = float(normalized_records[0]["timestamp"])
             if normalized_records:
@@ -879,6 +895,9 @@ def _empty_block_diagnostics(sequence_length: int) -> dict[str, Any]:
     return {
         "record_count_quantiles": _quantile_summary([]),
         "duration_sec_quantiles": _quantile_summary([]),
+        "inter_record_interval_sec_quantiles": _quantile_summary([]),
+        "max_to_median_interval_ratio_quantiles": _quantile_summary([]),
+        "irregular_block_count": 0,
         "record_count_threshold_counts": {
             "ge_8": 0,
             "ge_10": 0,
@@ -915,6 +934,9 @@ def _build_block_diagnostics(blocks: list[dict[str, Any]], *, sequence_length: i
 
     record_counts: list[int] = []
     durations: list[float] = []
+    median_intervals: list[float] = []
+    max_to_median_ratios: list[float] = []
+    irregular_block_count = 0
     session_blocks: dict[int, list[dict[str, Any]]] = defaultdict(list)
 
     for block in blocks:
@@ -930,12 +952,39 @@ def _build_block_diagnostics(blocks: list[dict[str, Any]], *, sequence_length: i
             normalized_records.sort(key=lambda record: record["timestamp"])
             start_ts = float(normalized_records[0]["timestamp"])
             end_ts = float(normalized_records[-1]["timestamp"])
+        else:
+            normalized_records = [
+                canonicalize_record(record, fallback_ts=float(index))
+                for index, record in enumerate(records)
+            ]
+            normalized_records.sort(key=lambda record: record["timestamp"])
+        intervals = [
+            float(curr["timestamp"]) - float(prev["timestamp"])
+            for prev, curr in zip(normalized_records, normalized_records[1:])
+        ]
+        median_interval = float(np.median(np.asarray(intervals, dtype=float))) if intervals else 0.0
+        max_interval = max(intervals) if intervals else 0.0
+        max_to_median_ratio = (
+            float(max_interval) / max(float(median_interval), 1e-6)
+            if intervals and median_interval > 0.0
+            else 0.0
+        )
+        is_irregular = bool(intervals and (max_to_median_ratio > 3.0))
         record_counts.append(record_count)
         durations.append(max(0.0, end_ts - start_ts))
+        if median_interval > 0.0:
+            median_intervals.append(float(median_interval))
+        if max_to_median_ratio > 0.0:
+            max_to_median_ratios.append(float(max_to_median_ratio))
+        if is_irregular:
+            irregular_block_count += 1
         session_blocks[int(block.get("session_id") or 0)].append(
             {
                 "record_count": record_count,
                 "duration_sec": max(0.0, end_ts - start_ts),
+                "median_inter_record_interval_sec": float(median_interval),
+                "max_to_median_interval_ratio": float(max_to_median_ratio),
+                "is_irregular": is_irregular,
             }
         )
 
@@ -951,6 +1000,13 @@ def _build_block_diagnostics(blocks: list[dict[str, Any]], *, sequence_length: i
             "num_blocks": len(items),
             "record_count_quantiles": _quantile_summary(session_record_counts),
             "duration_sec_quantiles": _quantile_summary([float(item["duration_sec"]) for item in items]),
+            "inter_record_interval_sec_quantiles": _quantile_summary(
+                [float(item["median_inter_record_interval_sec"]) for item in items if float(item["median_inter_record_interval_sec"]) > 0.0]
+            ),
+            "max_to_median_interval_ratio_quantiles": _quantile_summary(
+                [float(item["max_to_median_interval_ratio"]) for item in items if float(item["max_to_median_interval_ratio"]) > 0.0]
+            ),
+            "irregular_block_count": int(sum(1 for item in items if bool(item["is_irregular"]))),
             "max_record_count": max(session_record_counts) if session_record_counts else 0,
             "record_count_threshold_counts": session_threshold_counts,
             "eligible_blocks_for_sequence_length": eligible_block_count,
@@ -959,6 +1015,9 @@ def _build_block_diagnostics(blocks: list[dict[str, Any]], *, sequence_length: i
     return {
         "record_count_quantiles": _quantile_summary(record_counts),
         "duration_sec_quantiles": _quantile_summary(durations),
+        "inter_record_interval_sec_quantiles": _quantile_summary(median_intervals),
+        "max_to_median_interval_ratio_quantiles": _quantile_summary(max_to_median_ratios),
+        "irregular_block_count": int(irregular_block_count),
         "record_count_threshold_counts": _block_threshold_counts(record_counts),
         "feature_window_feasibility": {
             "sequence_length": int(sequence_length),
@@ -1039,76 +1098,91 @@ def build_dataset_bundle(
         max_session_gap_sec=effective_max_session_gap_sec,
         regime_shift_score_threshold=regime_shift_score_threshold,
     )
+    segment_episodes = [
+        episode
+        for segment in pair_segments
+        for episode in list(segment.get("episodes") or [])
+    ]
+    episode_diagnostics = {
+        "episode_count": int(len(segment_episodes)),
+        "total_spread_quantiles": _quantile_summary([float(getattr(episode, "total_spread", 0.0) or 0.0) for episode in segment_episodes]),
+        "duration_sec_quantiles": _quantile_summary([float(getattr(episode, "duration_sec", 0.0) or 0.0) for episode in segment_episodes]),
+    }
 
-    skipped_blocks_too_short = 0
+    skipped_blocks_too_short = sum(
+        1
+        for block in blocks
+        if len(_normalized_block_records(block)) < int(sequence_length)
+    )
     skipped_windows_cross_session_boundary = 0
+    cross_block_window_count = 0
+    cross_session_window_count = 0
     for segment in pair_segments:
         episodes = list(segment.get("episodes") or [])
         observable_end_ts = float(segment.get("observable_end_ts") or 0.0)
-        for block in segment.get("blocks", []):
-            normalized_session_id = int(block.get("session_id") or 0)
-            normalized_pair_id = str(block.get("pair_id") or "")
-            records = [
-                canonicalize_record(record, fallback_ts=float(index))
-                for index, record in enumerate(block.get("records", []))
-                if isinstance(record, dict)
-            ]
-            if len(records) < sequence_length:
-                skipped_blocks_too_short += 1
+        segment_records = list(segment.get("records") or [])
+        if len(segment_records) < sequence_length:
+            continue
+        normalized_pair_id = str(segment.get("pair_id") or "")
+        for start in range(len(segment_records) - sequence_length + 1):
+            window = segment_records[start : start + sequence_length]
+            unique_session_ids = {int(record.get("session_id") or 0) for record in window}
+            if len(unique_session_ids) > 1:
+                skipped_windows_cross_session_boundary += 1
                 continue
-            records.sort(key=lambda record: record["timestamp"])
-            for start in range(len(records) - sequence_length + 1):
-                window = records[start : start + sequence_length]
-                current_ts = window[-1]["timestamp"]
-                if observable_end_ts > 0.0 and (float(current_ts) + float(prediction_horizon_sec)) > observable_end_ts:
-                    skipped_windows_right_censored += 1
-                    continue
-                label = _label_window_from_episodes(
-                    current_ts,
-                    episodes,
-                    prediction_horizon_sec=prediction_horizon_sec,
-                    min_total_spread_pct=min_total_spread_pct,
+            unique_block_ids = {int(record.get("block_id") or 0) for record in window}
+            if len(unique_block_ids) > 1:
+                cross_block_window_count += 1
+            current_ts = float(window[-1]["timestamp"])
+            if observable_end_ts > 0.0 and (float(current_ts) + float(prediction_horizon_sec)) > observable_end_ts:
+                skipped_windows_right_censored += 1
+                continue
+            label = _label_window_from_episodes(
+                current_ts,
+                episodes,
+                prediction_horizon_sec=prediction_horizon_sec,
+                min_total_spread_pct=min_total_spread_pct,
+            )
+
+            X_samples.append(_feature_window(window))
+            y_class.append(float(label["y_class"]))
+            y_eta.append(float(label["y_eta"]))
+            pair_ids.append(normalized_pair_id)
+            block_ids.append(int(window[-1].get("block_id") or 0))
+            session_ids.append(int(window[-1].get("session_id") or 0))
+            timestamps.append(current_ts)
+            label_end_timestamps.append(float(current_ts) + float(prediction_horizon_sec))
+            last_entries.append(float(window[-1]["entry_spread"]))
+
+            future_episode_total_spreads.extend(float(value) for value in label["future_episode_total_spreads"])
+            if float(label["y_class"]) >= 0.5:
+                _bucket_count(
+                    float(window[-1]["entry_spread"]),
+                    [
+                        ("lt_0_30", -float("inf"), 0.30),
+                        ("0_30_to_0_50", 0.30, 0.50),
+                        ("0_50_to_1_00", 0.50, 1.00),
+                        ("1_00_to_2_00", 1.00, 2.00),
+                        ("ge_2_00", 2.00, float("inf")),
+                    ],
+                    positive_entry_spread_buckets,
                 )
-
-                X_samples.append(_feature_window(window))
-                y_class.append(float(label["y_class"]))
-                y_eta.append(float(label["y_eta"]))
-                pair_ids.append(normalized_pair_id)
-                block_ids.append(int(block.get("block_id") or 0))
-                session_ids.append(normalized_session_id)
-                timestamps.append(current_ts)
-                label_end_timestamps.append(float(current_ts) + float(prediction_horizon_sec))
-                last_entries.append(window[-1]["entry_spread"])
-
-                future_episode_total_spreads.extend(float(value) for value in label["future_episode_total_spreads"])
-                if float(label["y_class"]) >= 0.5:
-                    _bucket_count(
-                        window[-1]["entry_spread"],
-                        [
-                            ("lt_0_30", -float("inf"), 0.30),
-                            ("0_30_to_0_50", 0.30, 0.50),
-                            ("0_50_to_1_00", 0.50, 1.00),
-                            ("1_00_to_2_00", 1.00, 2.00),
-                            ("ge_2_00", 2.00, float("inf")),
-                        ],
-                        positive_entry_spread_buckets,
-                    )
-                else:
-                    _bucket_count(
-                        float(label["peak_future_total_spread"]),
-                        [
-                            ("lt_0_30", -float("inf"), 0.30),
-                            ("0_30_to_0_50", 0.30, 0.50),
-                            ("0_50_to_0_80", 0.50, 0.80),
-                            ("0_80_to_1_00", 0.80, 1.00),
-                            ("ge_1_00", 1.00, float("inf")),
-                        ],
-                        timeout_peak_future_total_spread_buckets,
-                    )
-                    if label["timeout_reason"] == "no_future_episode":
-                        timeouts_without_future_episode += 1
-                    elif label["timeout_reason"] == "sub_threshold_only":
-                        timeouts_with_only_sub_threshold_episode += 1
+            else:
+                _bucket_count(
+                    float(label["peak_future_total_spread"]),
+                    [
+                        ("lt_0_30", -float("inf"), 0.30),
+                        ("0_30_to_0_50", 0.30, 0.50),
+                        ("0_50_to_0_80", 0.50, 0.80),
+                        ("0_80_to_1_00", 0.80, 1.00),
+                        ("ge_1_00", 1.00, float("inf")),
+                    ],
+                    timeout_peak_future_total_spread_buckets,
+                )
+                if label["timeout_reason"] == "no_future_episode":
+                    timeouts_without_future_episode += 1
+                elif label["timeout_reason"] == "sub_threshold_only":
+                    timeouts_with_only_sub_threshold_episode += 1
 
     if X_samples:
         X_tensor = torch.tensor(X_samples, dtype=torch.float32)
@@ -1135,7 +1209,8 @@ def build_dataset_bundle(
         "skipped_blocks_too_short": int(skipped_blocks_too_short),
         "skipped_windows_right_censored": int(skipped_windows_right_censored),
         "skipped_windows_cross_session_boundary": int(skipped_windows_cross_session_boundary),
-        "num_cross_block_windows": 0,
+        "num_cross_block_windows": int(cross_block_window_count),
+        "num_cross_session_windows": int(cross_session_window_count),
         "prediction_horizon_sec": int(prediction_horizon_sec),
         "sequence_length": int(sequence_length),
         "min_total_spread_pct": float(min_total_spread_pct),
@@ -1144,6 +1219,7 @@ def build_dataset_bundle(
         "cross_session_gap_threshold_sec": None if effective_max_session_gap_sec is None else float(effective_max_session_gap_sec),
         "cross_session_boundaries": int(cross_session_merge_diagnostics.get("applied_count", 0)),
         "cross_session_merge_diagnostics": dict(cross_session_merge_diagnostics),
+        "episode_diagnostics": episode_diagnostics,
         "labeling_method": "episode_take_profit_time_barrier",
         "labeling_timeout_only": True,
         "label_audit": _finalize_label_audit(

@@ -783,12 +783,23 @@ def _preflight_entry(
             reasons.append("no_positive_samples")
         if int(bundle_obj.summary.get("skipped_windows_right_censored", 0)) > 0:
             reasons.append("right_censoring_present")
+        if int(bundle_obj.summary.get("block_diagnostics", {}).get("irregular_block_count", 0)) > 0:
+            reasons.append("intra_block_irregularity")
         if int(
             bundle_obj.summary.get("block_diagnostics", {})
             .get("feature_window_feasibility", {})
             .get("eligible_blocks_for_sequence_length", 0)
         ) <= 0:
             reasons.append("insufficient_eligible_blocks")
+        if (
+            int(bundle_obj.summary.get("num_samples", 0)) <= 0
+            and int(
+                bundle_obj.summary.get("block_diagnostics", {})
+                .get("feature_window_feasibility", {})
+                .get("eligible_sessions_with_any_eligible_block", 0)
+            ) > 1
+        ):
+            reasons.append("fragmentation_across_short_sessions")
         if not guardrail_ok_value:
             if int(positive_counts_obj.get("train", 0)) < int(min_train_positive_samples):
                 reasons.append("insufficient_train_positives")
@@ -854,6 +865,7 @@ def _preflight_entry(
         "split_summary": split_summary,
         "label_audit": dict(bundle.summary.get("label_audit", {})),
         "block_diagnostics": dict(bundle.summary.get("block_diagnostics", {})),
+        "episode_diagnostics": dict(bundle.summary.get("episode_diagnostics", {})),
         "cross_session_merge_enabled": bool(bundle.summary.get("cross_session_merge_enabled", False)),
         "cross_session_merges_applied": int(bundle.summary.get("cross_session_merges_applied", 0)),
         "cross_session_merge_diagnostics": dict(bundle.summary.get("cross_session_merge_diagnostics", {})),
@@ -1074,7 +1086,7 @@ def write_audit_report(report: dict[str, Any], audit_path: Path) -> Path:
     label_audit = report.get("label_audit", {})
     checks = {
         "dataset_non_degenerate": bool(dataset_summary["num_samples"] > 0 and dataset_summary["feature_abs_sum"] > 0.0),
-        "windows_respect_blocks": int(dataset_summary.get("num_cross_block_windows", 0)) == 0,
+        "windows_respect_session_boundaries": int(dataset_summary.get("num_cross_session_windows", 0)) == 0,
         "global_temporal_order": bool(split_summary["global_temporal_order"]),
         "purged_temporal_separation_ok": bool(split_summary.get("purged_temporal_separation_ok", False)),
         "beats_negative_baseline_recall": bool(metrics["recall"] > baselines["always_negative"]["recall"]),
@@ -1095,8 +1107,8 @@ def write_audit_report(report: dict[str, Any], audit_path: Path) -> Path:
     findings: list[str] = []
     if not checks["dataset_non_degenerate"]:
         findings.append("- Crítico: o dataset continua degenerado ou vazio.")
-    if not checks["windows_respect_blocks"]:
-        findings.append("- Crítico: existem janelas cruzando blocos temporais, violando a continuidade do treino.")
+    if not checks["windows_respect_session_boundaries"]:
+        findings.append("- Crítico: existem janelas cruzando boundaries de sessão/merge, violando a continuidade do treino.")
     if not checks["global_temporal_order"]:
         findings.append("- Crítico: treino, validação e teste ainda se sobrepõem no tempo global.")
     if not checks["purged_temporal_separation_ok"]:
@@ -1134,6 +1146,7 @@ def write_audit_report(report: dict[str, Any], audit_path: Path) -> Path:
         f"- Blocks used: {dataset_summary.get('blocks_used', 0)}",
         f"- Skipped short blocks: {dataset_summary.get('skipped_blocks_too_short', 0)}",
         f"- Cross-block windows: {dataset_summary.get('num_cross_block_windows', 0)}",
+        f"- Cross-session windows: {dataset_summary.get('num_cross_session_windows', 0)}",
         f"- Feature abs sum: {dataset_summary['feature_abs_sum']:.4f}",
         "",
         "## Split Integrity",
