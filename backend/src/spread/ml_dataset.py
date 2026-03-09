@@ -1128,6 +1128,7 @@ def build_dataset_bundle(
             window = segment_records[start : start + sequence_length]
             unique_session_ids = {int(record.get("session_id") or 0) for record in window}
             if len(unique_session_ids) > 1:
+                cross_session_window_count += 1
                 skipped_windows_cross_session_boundary += 1
                 continue
             unique_block_ids = {int(record.get("block_id") or 0) for record in window}

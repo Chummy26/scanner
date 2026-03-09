@@ -15,6 +15,7 @@ Key optimisations over the naive O(N²) approach:
 """
 
 import logging
+import math
 import time
 import threading
 from typing import Callable, Dict, List, Optional, Set, Tuple
@@ -35,6 +36,14 @@ _FULL_RECALC_EVERY = 80  # ~12s at 0.15s broadcast interval
 # Remaining dirty symbols carry over to the next cycle.
 # With thread-per-exchange, calc ~25ms for 500 symbols (within 150ms budget).
 _MAX_DIRTY_PER_CYCLE = 500
+
+
+def _valid_tracker_spread(value: float, *, max_spread: float) -> bool:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(numeric) and abs(numeric) <= float(max_spread)
 
 
 class SpreadEngine:
@@ -140,6 +149,7 @@ class SpreadEngine:
         on_spread: Optional[Callable[[str, str, str, str, str, float, float], None]] = None,
         *,
         record_sink: Optional[list] = None,
+        rejection_sink: Optional[list] = None,
     ) -> List[SpreadOpportunity]:
         """Calculate spreads across all symbol/exchange/market combinations.
 
@@ -205,17 +215,19 @@ class SpreadEngine:
                 self._opps_by_symbol.pop(symbol, None)
                 continue
 
-            opps, stale_n, records = self._calc_symbol(
+            opps, stale_n, records, rejections = self._calc_symbol(
                 symbol, exchanges, now, stale_threshold,
                 use_top_of_book, notional_usd,
                 min_spread,
                 max_spread,
-                (on_spread is not None) or (record_sink is not None),
+                (on_spread is not None) or (record_sink is not None) or (rejection_sink is not None),
             )
             _stale_count += stale_n
             self._opps_by_symbol[symbol] = opps
             if records:
                 spread_records.extend(records)
+            if rejection_sink is not None and rejections:
+                rejection_sink.extend(rejections)
         calc_finished = time.perf_counter()
 
         # ------ update cached (non-dirty) opps in incremental mode ------
@@ -329,7 +341,7 @@ class SpreadEngine:
         min_spread: float,
         max_spread: float,
         collect_records: bool,
-    ) -> Tuple[List[SpreadOpportunity], int, list]:
+    ) -> Tuple[List[SpreadOpportunity], int, list, list]:
         """Calculate all opportunities for a single symbol.
 
         Returns (opportunities, stale_count, spread_records).
@@ -375,6 +387,30 @@ class SpreadEngine:
 
         opps: List[SpreadOpportunity] = []
         records: list = []
+        rejections: list = []
+
+        def _record_rejection(
+            buy_ex: str,
+            buy_market_type: str,
+            sell_ex: str,
+            sell_market_type: str,
+            *,
+            invalid_fields: list[str],
+            reason: str,
+        ) -> None:
+            if not collect_records:
+                return
+            rejections.append(
+                {
+                    "symbol": symbol,
+                    "buy_ex": buy_ex,
+                    "buy_mt": buy_market_type,
+                    "sell_ex": sell_ex,
+                    "sell_mt": sell_market_type,
+                    "invalid_fields": list(invalid_fields),
+                    "reason": str(reason),
+                }
+            )
 
         # ---------- spot_futures: buy spot, sell futures ----------
         for buy_ex, buy_snap, buy_bid, buy_ask in spot_src:
@@ -383,14 +419,37 @@ class SpreadEngine:
                     continue
                 entry_spread = (sell_bid / buy_ask - 1.0) * 100.0
 
-                if abs(entry_spread) > max_spread:
+                if buy_bid <= 0 or sell_ask <= 0:
+                    _record_rejection(
+                        buy_ex,
+                        "spot",
+                        sell_ex,
+                        "futures",
+                        invalid_fields=["exit"],
+                        reason="exit_spread_uncomputable",
+                    )
                     continue
-
-                exit_spread = (
-                    (buy_bid / sell_ask - 1.0) * 100.0
-                    if buy_bid > 0 and sell_ask > 0
-                    else 0.0
-                )
+                exit_spread = (buy_bid / sell_ask - 1.0) * 100.0
+                if not _valid_tracker_spread(entry_spread, max_spread=max_spread):
+                    _record_rejection(
+                        buy_ex,
+                        "spot",
+                        sell_ex,
+                        "futures",
+                        invalid_fields=["entry"],
+                        reason="entry_spread_invalid",
+                    )
+                    continue
+                if not _valid_tracker_spread(exit_spread, max_spread=max_spread):
+                    _record_rejection(
+                        buy_ex,
+                        "spot",
+                        sell_ex,
+                        "futures",
+                        invalid_fields=["exit"],
+                        reason="exit_spread_invalid",
+                    )
+                    continue
 
                 if collect_records:
                     records.append((
@@ -429,14 +488,37 @@ class SpreadEngine:
 
                 entry_spread = (sell_bid / buy_ask - 1.0) * 100.0
 
-                if abs(entry_spread) > max_spread:
+                if buy_bid <= 0 or sell_ask <= 0:
+                    _record_rejection(
+                        buy_ex,
+                        "futures",
+                        sell_ex,
+                        "futures",
+                        invalid_fields=["exit"],
+                        reason="exit_spread_uncomputable",
+                    )
                     continue
-
-                exit_spread = (
-                    (buy_bid / sell_ask - 1.0) * 100.0
-                    if buy_bid > 0 and sell_ask > 0
-                    else 0.0
-                )
+                exit_spread = (buy_bid / sell_ask - 1.0) * 100.0
+                if not _valid_tracker_spread(entry_spread, max_spread=max_spread):
+                    _record_rejection(
+                        buy_ex,
+                        "futures",
+                        sell_ex,
+                        "futures",
+                        invalid_fields=["entry"],
+                        reason="entry_spread_invalid",
+                    )
+                    continue
+                if not _valid_tracker_spread(exit_spread, max_spread=max_spread):
+                    _record_rejection(
+                        buy_ex,
+                        "futures",
+                        sell_ex,
+                        "futures",
+                        invalid_fields=["exit"],
+                        reason="exit_spread_invalid",
+                    )
+                    continue
 
                 if collect_records:
                     records.append((
@@ -460,7 +542,7 @@ class SpreadEngine:
                         sell_book_age=now - sell_snap.timestamp,
                     ))
 
-        return opps, stale_n, records
+        return opps, stale_n, records, rejections
 
     # ------------------------------------------------------------------
     # Public: opportunity queries

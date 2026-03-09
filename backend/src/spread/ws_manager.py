@@ -617,10 +617,21 @@ class WSManager:
         record_started_at_by_key = {}
         capture_mode = str(getattr(self.config, "tracker_capture_mode", "continuous_all_pairs") or "continuous_all_pairs").strip().lower()
         raw_capture_records = [] if (on_spread_cb and capture_mode == "continuous_all_pairs") else None
+        raw_capture_rejections = [] if (on_spread_cb and capture_mode == "continuous_all_pairs") else None
         try:
-            opportunities = self.engine.calculate_all(on_spread=None, record_sink=raw_capture_records)
+            opportunities = self.engine.calculate_all(
+                on_spread=None,
+                record_sink=raw_capture_records,
+                rejection_sink=raw_capture_rejections,
+            )
         except TypeError:
-            opportunities = self.engine.calculate_all(on_spread=None)
+            try:
+                opportunities = self.engine.calculate_all(
+                    on_spread=None,
+                    record_sink=raw_capture_records,
+                )
+            except TypeError:
+                opportunities = self.engine.calculate_all(on_spread=None)
         _t_calc = time.time()
         _perf_after_calc = time.perf_counter()
 
@@ -797,6 +808,8 @@ class WSManager:
                 record_started_at_by_key[key] = time.perf_counter()
         if _records_batch:
             self.tracker.batch_record(_records_batch, now_ts=now_ts)
+        if raw_capture_rejections:
+            self.tracker.batch_record_rejections(list(raw_capture_rejections))
         _perf_after_batch_record = time.perf_counter()
 
         self._refresh_scanner_lite_state(opportunities)
@@ -1126,16 +1139,70 @@ class WSManager:
         statuses: list[dict] = []
         for ex_name, instance in self._exchange_instances.items():
             try:
+                ages: list[float] = []
+                invalid_books = 0
+                for book in getattr(instance, "_books", {}).values():
+                    book_ts = float(getattr(book, "_timestamp", 0.0) or 0.0)
+                    if book_ts <= 0.0:
+                        invalid_books += 1
+                        continue
+                    ages.append(max(0.0, time.time() - book_ts))
+                ordered_ages = sorted(ages)
+                median_age = ordered_ages[len(ordered_ages) // 2] if ordered_ages else 0.0
+                p95_age = ordered_ages[min(len(ordered_ages) - 1, int(len(ordered_ages) * 0.95))] if ordered_ages else 0.0
                 statuses.append(
                     {
                         "name": ex_name,
                         "ws_running": not instance.shutdown.is_set(),
                         "book_count": len(getattr(instance, "_books", {})),
+                        "median_book_age_sec": round(float(median_age), 6),
+                        "p95_book_age_sec": round(float(p95_age), 6),
+                        "max_book_age_sec": round(float(max(ages, default=0.0)), 6),
+                        "invalid_book_count": int(invalid_books),
                     }
                 )
             except Exception:
                 statuses.append({"name": ex_name, "ws_running": False, "book_count": 0})
         return statuses
+
+    def _runtime_audit_book_health(self) -> dict[str, float | int]:
+        buy_ages: list[float] = []
+        sell_ages: list[float] = []
+        asymmetries: list[float] = []
+        invalid_quote_count = 0
+        opportunities = list(getattr(self, "_last_filtered_opps", []) or [])
+        for opp in opportunities:
+            buy_age = float(getattr(opp, "buy_book_age", -1.0) or -1.0)
+            sell_age = float(getattr(opp, "sell_book_age", -1.0) or -1.0)
+            if buy_age >= 0.0:
+                buy_ages.append(buy_age)
+            if sell_age >= 0.0:
+                sell_ages.append(sell_age)
+            if buy_age >= 0.0 and sell_age >= 0.0:
+                asymmetries.append(abs(buy_age - sell_age))
+            if (
+                float(getattr(opp, "buy_price", 0.0) or 0.0) <= 0.0
+                or float(getattr(opp, "sell_price", 0.0) or 0.0) <= 0.0
+            ):
+                invalid_quote_count += 1
+
+        def _percentile(values: list[float], pct: float) -> float:
+            if not values:
+                return 0.0
+            ordered = sorted(values)
+            index = min(len(ordered) - 1, max(0, int(round((pct / 100.0) * (len(ordered) - 1)))))
+            return float(ordered[index])
+
+        total_quotes = len(opportunities)
+        combined_ages = buy_ages + sell_ages
+        return {
+            "sample_count": int(total_quotes),
+            "median_book_age_sec": round(_percentile(combined_ages, 50.0), 6),
+            "p95_book_age_sec": round(_percentile(combined_ages, 95.0), 6),
+            "max_book_age_sec": round(max(combined_ages, default=0.0), 6),
+            "p95_book_asymmetry_sec": round(_percentile(asymmetries, 95.0), 6),
+            "invalid_quote_rate": round(float(invalid_quote_count / total_quotes), 6) if total_quotes else 0.0,
+        }
 
     async def _runtime_audit_loop(self):
         sample_index = 0
@@ -1155,6 +1222,7 @@ class WSManager:
                             "pairs_active": len(self._ml_cache),
                             "scanner_clients": len(self._scanner_clients),
                             "opportunities": len(self._last_filtered_opps),
+                            "book_health": self._runtime_audit_book_health(),
                         },
                     )
                 sample_index += 1

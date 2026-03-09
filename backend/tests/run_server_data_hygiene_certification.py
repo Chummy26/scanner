@@ -14,6 +14,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from src.spread.ml_dataset import build_dataset_bundle, build_group_splits
+from src.spread.training_certification import collect_sqlite_integrity as collect_sqlite_integrity_lib
 from src.spread.runtime_audit import finalize_runtime_audit_package
 from src.spread.train_model import run_threshold_preflight
 from tests import run_10m_diagnostic, run_2h_runtime_audit, verify_training_blocks_runtime
@@ -66,105 +67,7 @@ def _table_count(conn: sqlite3.Connection, table_name: str) -> int:
 
 
 def collect_sqlite_integrity(db_path: Path) -> dict[str, object]:
-    if not db_path.exists():
-        return {
-            "db_exists": False,
-            "db_path": str(db_path),
-            "db_size_bytes": 0,
-            "table_counts": {},
-            "anomalies": {
-                "zero_record_blocks": 0,
-                "record_count_mismatches": 0,
-                "range_mismatches": 0,
-                "missing_event_blocks": 0,
-                "open_blocks_after_close": 0,
-            },
-        }
-    with sqlite3.connect(db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        table_counts = {
-            table_name: _table_count(conn, table_name)
-            for table_name in (
-                "tracker_pairs",
-                "tracker_records",
-                "tracker_events",
-                "tracker_pair_blocks",
-                "tracker_capture_sessions",
-                "tracker_pair_episodes",
-                "ml_training_runs",
-                "ml_training_run_blocks",
-                "ml_training_run_sessions",
-            )
-        }
-        zero_record_blocks = int(
-            conn.execute("SELECT COUNT(*) FROM tracker_pair_blocks WHERE record_count <= 0").fetchone()[0]
-        ) if table_counts.get("tracker_pair_blocks", 0) else 0
-        record_count_mismatches = int(
-            conn.execute(
-                """
-                SELECT COUNT(*) FROM (
-                    SELECT b.id
-                    FROM tracker_pair_blocks b
-                    LEFT JOIN tracker_records r ON r.block_id = b.id
-                    GROUP BY b.id
-                    HAVING COUNT(r.ts) != b.record_count
-                )
-                """
-            ).fetchone()[0]
-        ) if table_counts.get("tracker_pair_blocks", 0) else 0
-        range_mismatches = int(
-            conn.execute(
-                """
-                SELECT COUNT(*) FROM (
-                    SELECT b.id
-                    FROM tracker_pair_blocks b
-                    LEFT JOIN tracker_records r ON r.block_id = b.id
-                    GROUP BY b.id
-                    HAVING COUNT(r.ts) > 0
-                       AND (ABS(MIN(r.ts) - b.start_ts) > 1e-9 OR ABS(MAX(r.ts) - b.end_ts) > 1e-9)
-                )
-                """
-            ).fetchone()[0]
-        ) if table_counts.get("tracker_pair_blocks", 0) else 0
-        missing_event_blocks = int(
-            conn.execute(
-                """
-                SELECT COUNT(*) FROM (
-                    SELECT e.rowid
-                    FROM tracker_events e
-                    LEFT JOIN tracker_pair_blocks b ON b.id = e.block_id
-                    WHERE e.block_id IS NULL
-                       OR b.id IS NULL
-                       OR b.session_id != e.session_id
-                       OR e.ts < b.start_ts
-                       OR e.ts > b.end_ts
-                )
-                """
-            ).fetchone()[0]
-        ) if table_counts.get("tracker_events", 0) else 0
-        open_blocks_after_close = int(
-            conn.execute(
-                """
-                SELECT COUNT(*)
-                FROM tracker_pair_blocks b
-                JOIN tracker_capture_sessions s ON s.id = b.session_id
-                WHERE b.is_open = 1 AND s.status != 'open'
-                """
-            ).fetchone()[0]
-        ) if table_counts.get("tracker_pair_blocks", 0) else 0
-    return {
-        "db_exists": True,
-        "db_path": str(db_path),
-        "db_size_bytes": int(db_path.stat().st_size),
-        "table_counts": table_counts,
-        "anomalies": {
-            "zero_record_blocks": zero_record_blocks,
-            "record_count_mismatches": record_count_mismatches,
-            "range_mismatches": range_mismatches,
-            "missing_event_blocks": missing_event_blocks,
-            "open_blocks_after_close": open_blocks_after_close,
-        },
-    }
+    return collect_sqlite_integrity_lib(db_path)
 
 
 def collect_dataset_matrix(db_path: Path, configs: list[dict[str, int]] | None = None) -> list[dict[str, object]]:

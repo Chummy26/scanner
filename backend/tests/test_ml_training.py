@@ -1252,14 +1252,79 @@ def test_threshold_preflight_reports_block_window_feasibility(tmp_path: Path):
     assert block_diagnostics["feature_window_feasibility"]["eligible_sessions_with_any_eligible_block"] == 1
 
 
-def test_clean_training_cycle_archives_existing_artifacts_and_writes_preflight(tmp_path: Path):
-    json_state = _write_tracker_state(tmp_path / "tracker_state_clean_cycle.json")
-    payload = json.loads(json_state.read_text(encoding="utf-8"))
-    state_path = _write_tracker_sqlite(tmp_path / "tracker_history_clean_cycle.sqlite", payload["pairs"])
+def test_clean_training_cycle_archives_existing_artifacts_and_writes_preflight(monkeypatch, tmp_path: Path):
+    state_path = _write_multi_session_sqlite(tmp_path / "tracker_history_clean_cycle.sqlite", num_sessions=4)
     artifact_dir = tmp_path / "artifacts_clean_cycle"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     artifact_dir.joinpath("best_lstm_model.pth").write_bytes(b"legacy-model")
     artifact_dir.joinpath("best_lstm_model.meta.json").write_text(json.dumps({"version": "legacy"}), encoding="utf-8")
+
+    def _fake_certify(**kwargs):
+        target_dir = Path(kwargs["artifact_dir"])
+        gate_dir = target_dir / "gate_results"
+        gate_dir.mkdir(parents=True, exist_ok=True)
+        certification = {
+            "certified": True,
+            "verdict": "CERTIFIED",
+            "failure_reasons": [],
+            "warnings": [],
+            "gate_results": {
+                "gate_10_dual_mode_preflight": {"metrics": {"qualifying_configs": ["seq4_h240_merge_off"]}},
+            },
+            "recommendations": [],
+            "certification_mode": kwargs.get("certification_mode", "full"),
+            "certification_duration_sec": 0.01,
+            "certification_id": "test-certification-id",
+            "runtime_audit_package_path": "",
+            "preflight_off_vs_on_summary": {"qualifying_configs": ["seq4_h240_merge_off"]},
+            "effective_session_scope": {
+                "effective_session_ids": [1, 2, 3, 4],
+                "selected_session_ids": [],
+                "selected_block_ids": [],
+                "legacy_session_ids": [],
+                "legacy_sessions_excluded": 0,
+            },
+            "legacy_sessions_excluded": 0,
+            "legacy_session_ids": [],
+        }
+        (target_dir / "data_certification.json").write_text(json.dumps(certification), encoding="utf-8")
+        (gate_dir / "gate_12_entry_exit_quality.json").write_text(json.dumps({"status": "PASSED"}), encoding="utf-8")
+        return certification
+
+    def _fake_preflight(**kwargs):
+        output_path = Path(kwargs["output_path"])
+        payload = {
+            "qualifies_for_training": True,
+            "selected_threshold": 0.8,
+            "selection_mode": "primary",
+            "thresholds": {"0.8": {"qualifies_for_training": True, "failure_reasons": []}},
+            "block_diagnostics": {},
+        }
+        output_path.write_text(json.dumps(payload), encoding="utf-8")
+        return payload
+
+    def _fake_training_loop(**kwargs):
+        target_dir = Path(kwargs["artifact_dir"])
+        target_dir.mkdir(parents=True, exist_ok=True)
+        meta_path = target_dir / "best_lstm_model.meta.json"
+        meta_path.write_text(json.dumps({"training_config": {}, "dataset_fingerprint": "fp"}), encoding="utf-8")
+        report_path = target_dir / "best_lstm_model.report.json"
+        report_path.write_text(json.dumps({"ok": True}), encoding="utf-8")
+        audit_path = target_dir / "best_lstm_model.audit.md"
+        audit_path.write_text("# audit\n", encoding="utf-8")
+        return {
+            "training": {},
+            "artifact_metadata": {"training_config": {}},
+            "artifacts": {
+                "metadata_path": str(meta_path),
+                "report_path": str(report_path),
+                "audit_path": str(audit_path),
+            },
+        }
+
+    monkeypatch.setattr("src.spread.train_model.certify_data_for_training", _fake_certify)
+    monkeypatch.setattr("src.spread.train_model.run_threshold_preflight", _fake_preflight)
+    monkeypatch.setattr("src.spread.train_model.run_training_loop", _fake_training_loop)
 
     report = run_clean_training_cycle(
         state_file=state_path,
@@ -1281,7 +1346,10 @@ def test_clean_training_cycle_archives_existing_artifacts_and_writes_preflight(t
 
     legacy_dir = artifact_dir / "legacy_artifacts"
     assert report["preflight"]["selected_threshold"] in {1.0, 0.8, 0.7}
+    assert report["data_certification"]["certification_id"]
     assert artifact_dir.joinpath("threshold_preflight.json").is_file()
+    assert artifact_dir.joinpath("data_certification.json").is_file()
+    assert artifact_dir.joinpath("gate_results", "gate_12_entry_exit_quality.json").is_file()
     assert legacy_dir.is_dir()
     assert any(path.is_dir() for path in legacy_dir.iterdir())
 

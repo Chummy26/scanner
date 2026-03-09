@@ -115,6 +115,9 @@ def summarize_dashboard_payload(payload: dict[str, Any]) -> dict[str, Any]:
     above_band_mismatch_count = 0
     range_core_mismatch_count = 0
     reason_lane_message_mismatch_count = 0
+    book_ages: list[float] = []
+    book_age_asymmetries: list[float] = []
+    invalid_quote_rows = 0
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -126,6 +129,30 @@ def summarize_dashboard_payload(payload: dict[str, Any]) -> dict[str, Any]:
         action_lane = str(row.get("action_lane") or "blocked")
         signal_reason_code = str(row.get("signal_reason_code") or "")
         operator_message = str(row.get("operator_message") or "")
+        try:
+            buy_age = float(row.get("buyBookAge") or 0.0)
+        except (TypeError, ValueError):
+            buy_age = 0.0
+        try:
+            sell_age = float(row.get("sellBookAge") or 0.0)
+        except (TypeError, ValueError):
+            sell_age = 0.0
+        if buy_age > 0.0:
+            book_ages.append(buy_age)
+        if sell_age > 0.0:
+            book_ages.append(sell_age)
+        if buy_age > 0.0 and sell_age > 0.0:
+            book_age_asymmetries.append(abs(buy_age - sell_age))
+        try:
+            buy_price = float(row.get("buyPrice") or 0.0)
+        except (TypeError, ValueError):
+            buy_price = 0.0
+        try:
+            sell_price = float(row.get("sellPrice") or 0.0)
+        except (TypeError, ValueError):
+            sell_price = 0.0
+        if buy_price <= 0.0 or sell_price <= 0.0:
+            invalid_quote_rows += 1
 
         adjusting_count += 1 if str(ml.get("recommended_entry_range") or "") == "Ajustando..." else 0
         adjusting_count += 1 if str(ml.get("recommended_exit_range") or "") == "Ajustando..." else 0
@@ -182,6 +209,15 @@ def summarize_dashboard_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "above_band_mismatch_count": above_band_mismatch_count,
         "range_core_mismatch_count": range_core_mismatch_count,
         "reason_lane_message_mismatch_count": reason_lane_message_mismatch_count,
+        "book_age_count": len(book_ages),
+        "book_age_median_sec": round(_percentile(book_ages, 50.0), 6) if book_ages else 0.0,
+        "book_age_p95_sec": round(_percentile(book_ages, 95.0), 6) if book_ages else 0.0,
+        "book_age_max_sec": round(max(book_ages), 6) if book_ages else 0.0,
+        "book_asymmetry_p95_sec": round(_percentile(book_age_asymmetries, 95.0), 6) if book_age_asymmetries else 0.0,
+        "book_age_asymmetry_p95_sec": round(_percentile(book_age_asymmetries, 95.0), 6) if book_age_asymmetries else 0.0,
+        "quote_row_count": len(rows),
+        "empty_invalid_quote_count": invalid_quote_rows,
+        "empty_invalid_quote_rate_pct": round((invalid_quote_rows / len(rows)) * 100.0, 6) if rows else 0.0,
     }
 
 
@@ -1201,6 +1237,21 @@ def build_runtime_summary(output_dir: Path, *, snapshot_path: Path | None = None
         "above_band_mismatch_count": sum(int(sample.get("above_band_mismatch_count") or 0) for sample in api_probes),
         "range_core_mismatch_count": sum(int(sample.get("range_core_mismatch_count") or 0) for sample in api_probes),
         "reason_lane_message_mismatch_count": sum(int(sample.get("reason_lane_message_mismatch_count") or 0) for sample in api_probes),
+        "book_age_median_sec": _numeric_summary(
+            [float(sample.get("book_age_median_sec") or 0.0) for sample in api_probes if float(sample.get("book_age_median_sec") or 0.0) > 0.0]
+        ),
+        "book_age_p95_sec": _numeric_summary(
+            [float(sample.get("book_age_p95_sec") or 0.0) for sample in api_probes if float(sample.get("book_age_p95_sec") or 0.0) > 0.0]
+        ),
+        "book_age_max_sec": _numeric_summary(
+            [float(sample.get("book_age_max_sec") or 0.0) for sample in api_probes if float(sample.get("book_age_max_sec") or 0.0) > 0.0]
+        ),
+        "book_age_asymmetry_p95_sec": _numeric_summary(
+            [float(sample.get("book_age_asymmetry_p95_sec") or 0.0) for sample in api_probes if float(sample.get("book_age_asymmetry_p95_sec") or 0.0) > 0.0]
+        ),
+        "empty_invalid_quote_rate_pct": _numeric_summary(
+            [float(sample.get("empty_invalid_quote_rate_pct") or 0.0) for sample in api_probes]
+        ),
         "probe_count": len(api_probes),
     }
 
@@ -1318,7 +1369,7 @@ def _dataset_summary_payload(bundle: Any) -> dict[str, Any]:
         "feature_has_inf": bool(getattr(bundle.X, "isinf")().any().item()),
         "class_has_nan": bool(getattr(bundle.y_class, "isnan")().any().item()),
         "eta_has_nan": bool(getattr(bundle.y_eta, "isnan")().any().item()),
-        "num_cross_block_windows": 0,
+        "num_cross_block_windows": int(bundle.summary.get("num_cross_block_windows", 0) or 0),
         "manual_feature_checks": _manual_feature_checks(bundle),
         "manual_label_checks": _manual_label_checks(bundle),
     }

@@ -58,3 +58,34 @@ def test_ws_manager_on_book_update_emits_ws_ingest_metrics(tmp_path: Path):
 
     events = "\n".join(_read_lines(collector.events_path))
     assert "ws_ingest" in events
+
+
+def test_tracker_invalid_record_rejections_emit_aggregated_counters_without_alert_flood(tmp_path: Path):
+    collector = RuntimeAuditCollector(
+        output_dir=tmp_path / "audit_rejections",
+        record_interval_sec=15.0,
+        gap_threshold_sec=60.0,
+        duration_sec=60,
+    )
+    tracker = SpreadTracker(
+        window_sec=3600,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=tmp_path / "tracker_rejections.sqlite",
+        gap_threshold_sec=60.0,
+    )
+    tracker.audit_collector = collector
+    tracker.add_event_listener(collector.on_tracker_event)
+
+    tracker.record_spread("BTC", "mexc", "spot", "gate", "futures", 0.30, float("nan"), now_ts=100.0)
+    assert tracker.flush_to_storage(now_ts=100.0, force=True)
+    collector.finalize()
+
+    alerts = "\n".join(_read_lines(collector.alerts_path))
+    events = "\n".join(_read_lines(collector.events_path))
+
+    assert "invalid_record" not in alerts
+    assert "tracker_rejection_stats" in events

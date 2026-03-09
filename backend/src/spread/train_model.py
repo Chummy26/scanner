@@ -35,6 +35,7 @@ from .ml_dataset import (
     compute_feature_stats,
     normalize_features,
 )
+from .training_certification import run_training_certification as _certify_data_for_training_impl
 from .ml_model import (
     ARTIFACT_BASENAME,
     ModelArtifactMetadata,
@@ -989,9 +990,19 @@ def _archive_existing_artifacts(artifact_root: Path) -> str:
     return str(legacy_dir)
 
 
+def _json_default(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, set):
+        return sorted(value)
+    if isinstance(value, tuple):
+        return list(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=_json_default), encoding="utf-8")
 
 
 def _build_dataset_fingerprint(
@@ -1041,6 +1052,49 @@ def _build_dataset_fingerprint(
     return digest.hexdigest()
 
 
+def certify_data_for_training(
+    *,
+    state_file: Path | None = None,
+    artifact_dir: Path | None = None,
+    selected_session_ids: list[int] | None = None,
+    selected_block_ids: list[int] | None = None,
+    thresholds: list[float] | None = None,
+    sequence_length: int = 15,
+    prediction_horizon_sec: int = 14_400,
+    allow_cross_session_merge: bool = False,
+    max_session_gap_sec: float | None = None,
+    regime_shift_score_threshold: float | None = 3.0,
+    certification_mode: str = "full",
+    max_certification_duration_sec: int = 300,
+    allow_legacy_sessions: bool = False,
+    runtime_audit_dir: Path | None = None,
+    run_reconnection_stress: bool = False,
+) -> dict[str, Any]:
+    default_state = Path(__file__).resolve().parent.parent.parent / "out" / "config" / "tracker_history.sqlite"
+    state_path = Path(state_file) if state_file is not None else default_state
+    artifact_root = Path(artifact_dir) if artifact_dir is not None else get_default_artifact_dir()
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    return _certify_data_for_training_impl(
+        state_file=state_path,
+        artifact_dir=artifact_root,
+        selected_session_ids=selected_session_ids,
+        selected_block_ids=selected_block_ids,
+        thresholds=thresholds,
+        sequence_length=sequence_length,
+        prediction_horizon_sec=prediction_horizon_sec,
+        allow_cross_session_merge=allow_cross_session_merge,
+        max_session_gap_sec=max_session_gap_sec,
+        regime_shift_score_threshold=regime_shift_score_threshold,
+        certification_mode=certification_mode,
+        max_certification_duration_sec=max_certification_duration_sec,
+        allow_legacy_sessions=allow_legacy_sessions,
+        runtime_audit_dir=runtime_audit_dir,
+        run_reconnection_stress=run_reconnection_stress,
+        preflight_fn=run_threshold_preflight,
+        dataset_fingerprint_fn=_build_dataset_fingerprint,
+    )
+
+
 def _build_psi_reference(
     X: torch.Tensor,
     feature_names: list[str],
@@ -1070,8 +1124,6 @@ def _build_psi_reference(
         "feature_bins": feature_bins,
         "min_samples_required": 200,
     }
-
-
 def write_audit_report(report: dict[str, Any], audit_path: Path) -> Path:
     dataset_summary = report["dataset_summary"]
     split_summary = report["split_summary"]
@@ -1290,6 +1342,7 @@ def run_training_loop(
     min_test_positive_samples: int = 50,
     seed: int = 42,
     audit_output: Path | None = None,
+    certification_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     logger.info("Initializing robust ArbML training pipeline...")
     torch.manual_seed(seed)
@@ -1566,6 +1619,41 @@ def run_training_loop(
         },
     }
 
+    training_config_payload = {
+        "prediction_horizon_sec": prediction_horizon_sec,
+        "min_total_spread_pct": float(min_total_spread_pct),
+        "labeling_method": str(dataset_summary.get("labeling_method", "legacy")),
+        "labeling_timeout_only": bool(dataset_summary.get("labeling_timeout_only", False)),
+        "batch_size": batch_size,
+        "max_epochs": max_epochs,
+        "patience": patience,
+        "learning_rate": learning_rate,
+        "weight_decay": weight_decay,
+        "focal_alpha": focal_alpha_effective,
+        "positive_rate_train": positive_rate_train,
+        "focal_alpha_requested": float(focal_alpha) if focal_alpha is not None else None,
+        "focal_alpha_effective": focal_alpha_effective,
+        "focal_gamma": focal_gamma,
+        "min_train_positive_samples": int(min_train_positive_samples),
+        "min_val_positive_samples": int(min_val_positive_samples),
+        "min_test_positive_samples": int(min_test_positive_samples),
+        "threshold_selection": threshold_selection["execute"]["objective"],
+        "validation_partition_mode": validation_partition["mode"],
+        "selected_session_ids": list(selected_session_ids or []),
+        "selected_block_ids": list(selected_block_ids or []),
+        "allow_cross_session_merge": bool(allow_cross_session_merge),
+        "max_session_gap_sec": None if max_session_gap_sec is None else float(max_session_gap_sec),
+        "regime_shift_score_threshold": None if regime_shift_score_threshold is None else float(regime_shift_score_threshold),
+        "psi_reference": feature_monitoring["psi_reference"],
+    }
+    if certification_context:
+        training_config_payload["certification_id"] = str(certification_context.get("certification_id") or "")
+        training_config_payload["certification_verdict"] = str(certification_context.get("verdict") or "")
+        training_config_payload["certification_failure_reasons"] = list(certification_context.get("failure_reasons") or [])
+        training_config_payload["certification_warnings"] = list(certification_context.get("warnings") or [])
+        training_config_payload["preflight_off_vs_on_summary"] = dict(certification_context.get("preflight_off_vs_on_summary") or {})
+        training_config_payload["runtime_audit_package_path"] = str(certification_context.get("runtime_audit_package_path") or "")
+
     metadata = ModelArtifactMetadata(
         version="arbml-lstm-v3-seed{}-t{}-d{}".format(
             seed,
@@ -1593,33 +1681,7 @@ def run_training_loop(
         baselines=baselines,
         dataset_summary=dataset_summary,
         split_summary=split_summary,
-        training_config={
-            "prediction_horizon_sec": prediction_horizon_sec,
-            "min_total_spread_pct": float(min_total_spread_pct),
-            "labeling_method": str(dataset_summary.get("labeling_method", "legacy")),
-            "labeling_timeout_only": bool(dataset_summary.get("labeling_timeout_only", False)),
-            "batch_size": batch_size,
-            "max_epochs": max_epochs,
-            "patience": patience,
-            "learning_rate": learning_rate,
-            "weight_decay": weight_decay,
-            "focal_alpha": focal_alpha_effective,
-            "positive_rate_train": positive_rate_train,
-            "focal_alpha_requested": float(focal_alpha) if focal_alpha is not None else None,
-            "focal_alpha_effective": focal_alpha_effective,
-            "focal_gamma": focal_gamma,
-            "min_train_positive_samples": int(min_train_positive_samples),
-            "min_val_positive_samples": int(min_val_positive_samples),
-            "min_test_positive_samples": int(min_test_positive_samples),
-            "threshold_selection": threshold_selection["execute"]["objective"],
-            "validation_partition_mode": validation_partition["mode"],
-            "selected_session_ids": list(selected_session_ids or []),
-            "selected_block_ids": list(selected_block_ids or []),
-            "allow_cross_session_merge": bool(allow_cross_session_merge),
-            "max_session_gap_sec": None if max_session_gap_sec is None else float(max_session_gap_sec),
-            "regime_shift_score_threshold": None if regime_shift_score_threshold is None else float(regime_shift_score_threshold),
-            "psi_reference": feature_monitoring["psi_reference"],
-        },
+        training_config=training_config_payload,
         use_attention=True,
         trained_at_utc=datetime.now(timezone.utc).isoformat(),
         dataset_fingerprint=_build_dataset_fingerprint(
@@ -1635,6 +1697,7 @@ def run_training_loop(
         feature_schema_hash=current_feature_schema_hash(),
     )
     report["artifact_metadata"] = metadata.to_dict()
+    report["training_config"] = dict(training_config_payload)
 
     model_path, meta_path = save_artifact_bundle(model.cpu(), metadata, artifact_root)
     report_path = artifact_root / f"{ARTIFACT_BASENAME}.report.json"
@@ -1679,15 +1742,49 @@ def run_clean_training_cycle(
     min_test_positive_samples: int = 50,
     seed: int = 42,
     audit_output: Path | None = None,
+    certification_mode: str = "full",
+    max_certification_duration_sec: int = 300,
+    allow_legacy_sessions: bool = False,
+    runtime_audit_dir: Path | None = None,
+    run_reconnection_stress: bool = False,
 ) -> dict[str, Any]:
     artifact_root = Path(artifact_dir) if artifact_dir is not None else get_default_artifact_dir()
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    certification = certify_data_for_training(
+        state_file=state_file,
+        artifact_dir=artifact_root,
+        sequence_length=sequence_length,
+        prediction_horizon_sec=prediction_horizon_sec,
+        thresholds=thresholds,
+        selected_session_ids=selected_session_ids,
+        selected_block_ids=selected_block_ids,
+        allow_cross_session_merge=allow_cross_session_merge,
+        max_session_gap_sec=max_session_gap_sec,
+        regime_shift_score_threshold=regime_shift_score_threshold,
+        certification_mode=certification_mode,
+        max_certification_duration_sec=max_certification_duration_sec,
+        allow_legacy_sessions=allow_legacy_sessions,
+        runtime_audit_dir=runtime_audit_dir,
+        run_reconnection_stress=run_reconnection_stress,
+    )
+    if not bool(certification.get("certified")):
+        raise ValueError(
+            "Training data certification failed: "
+            + ", ".join(certification.get("failure_reasons", []) or ["unknown_certification_failure"])
+        )
+    effective_scope = dict(certification.get("effective_session_scope") or {})
+    effective_session_ids = [
+        int(value)
+        for value in (effective_scope.get("session_ids") or effective_scope.get("effective_session_ids") or selected_session_ids or [])
+        if int(value) > 0
+    ]
     preflight_output = artifact_root / "threshold_preflight.json"
     preflight = run_threshold_preflight(
         state_file=state_file,
         sequence_length=sequence_length,
         prediction_horizon_sec=prediction_horizon_sec,
         thresholds=thresholds,
-        selected_session_ids=selected_session_ids,
+        selected_session_ids=effective_session_ids or selected_session_ids,
         selected_block_ids=selected_block_ids,
         allow_cross_session_merge=allow_cross_session_merge,
         max_session_gap_sec=max_session_gap_sec,
@@ -1707,7 +1804,7 @@ def run_clean_training_cycle(
         sequence_length=sequence_length,
         prediction_horizon_sec=prediction_horizon_sec,
         min_total_spread_pct=selected_threshold,
-        selected_session_ids=selected_session_ids,
+        selected_session_ids=effective_session_ids or selected_session_ids,
         selected_block_ids=selected_block_ids,
         allow_cross_session_merge=allow_cross_session_merge,
         max_session_gap_sec=max_session_gap_sec,
@@ -1727,10 +1824,19 @@ def run_clean_training_cycle(
         min_test_positive_samples=min_test_positive_samples,
         seed=seed,
         audit_output=audit_output,
+        certification_context=certification,
     )
+    report["data_certification"] = certification
+    report["certification_id"] = str(certification.get("certification_id") or "")
     report["preflight"] = preflight
     report["legacy_archive_dir"] = legacy_archive_dir
     report["training"]["selected_threshold"] = selected_threshold
+    report["training"]["certification_id"] = str(certification.get("certification_id") or "")
+    report.setdefault("training_config", {})
+    report["training_config"]["certification_id"] = str(certification.get("certification_id") or "")
+    report["training_config"]["certification_verdict"] = str(certification.get("verdict") or "")
+    report["training_config"]["runtime_audit_package_path"] = str(certification.get("runtime_audit_package_path") or "")
+    report["training_config"]["preflight_off_vs_on_summary"] = certification.get("preflight_off_vs_on_summary", {})
     report_path = artifact_root / f"{ARTIFACT_BASENAME}.report.json"
     _write_json(report_path, report)
 
@@ -1738,10 +1844,26 @@ def run_clean_training_cycle(
     if metadata_path.is_file():
         metadata_payload = json.loads(metadata_path.read_text(encoding="utf-8"))
         metadata_payload.setdefault("training_config", {})
+        metadata_payload["training_config"]["certification_id"] = certification.get("certification_id", "")
+        metadata_payload["training_config"]["certification_verdict"] = certification.get("verdict", "")
+        metadata_payload["training_config"]["certification_failure_reasons"] = certification.get("failure_reasons", [])
+        metadata_payload["training_config"]["certification_warnings"] = certification.get("warnings", [])
+        metadata_payload["training_config"]["runtime_audit_package_path"] = certification.get("runtime_audit_package_path", "")
+        metadata_payload["training_config"]["effective_session_scope"] = certification.get("effective_session_scope", {})
+        metadata_payload["training_config"]["preflight_off_vs_on_summary"] = certification.get("preflight_off_vs_on_summary", {})
         metadata_payload["training_config"]["preflight"] = preflight
         metadata_payload["training_config"]["selected_threshold"] = selected_threshold
         metadata_payload["training_config"]["legacy_archive_dir"] = legacy_archive_dir
         metadata_path.write_text(json.dumps(metadata_payload, indent=2, sort_keys=True), encoding="utf-8")
+    report.setdefault("artifact_metadata", {}).setdefault("training_config", {})
+    report["artifact_metadata"]["training_config"]["certification_id"] = certification.get("certification_id", "")
+    report["artifact_metadata"]["training_config"]["certification_verdict"] = certification.get("verdict", "")
+    report["artifact_metadata"]["training_config"]["certification_failure_reasons"] = certification.get("failure_reasons", [])
+    report["artifact_metadata"]["training_config"]["certification_warnings"] = certification.get("warnings", [])
+    report["artifact_metadata"]["training_config"]["runtime_audit_package_path"] = certification.get("runtime_audit_package_path", "")
+    report["artifact_metadata"]["training_config"]["effective_session_scope"] = certification.get("effective_session_scope", {})
+    report["artifact_metadata"]["training_config"]["preflight_off_vs_on_summary"] = certification.get("preflight_off_vs_on_summary", {})
+    _write_json(report_path, report)
     return report
 
 

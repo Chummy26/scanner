@@ -420,6 +420,36 @@ def test_tracker_record_spread_hot_path_does_not_touch_sqlite_until_flush(tmp_pa
     assert listing["sessions"][0]["blocks"][1]["boundary_reason"] == "auto_gap"
 
 
+def test_tracker_rejects_invalid_numeric_records_and_tracks_aggregates(tmp_path: Path):
+    db_path = tmp_path / "tracker_history.sqlite"
+    tracker = SpreadTracker(
+        window_sec=24 * 60 * 60,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=db_path,
+        gap_threshold_sec=45.0,
+    )
+
+    pair = ("BTC", "mexc", "spot", "gate", "futures")
+    tracker.record_spread(*pair, float("nan"), -0.20, now_ts=0.0)
+    tracker.record_spread(*pair, 0.42, float("inf"), now_ts=15.0)
+    assert tracker.flush_to_storage(now_ts=15.0, force=True)
+
+    storage = tracker.get_storage_stats()
+    pair_id = "BTC|mexc|spot|gate|futures"
+
+    assert storage["records_total"] == 0
+    assert storage["invalid_record_rejections_total"] == 2
+    assert storage["invalid_entry_rejections_total"] == 1
+    assert storage["invalid_exit_rejections_total"] == 1
+    assert storage["rejection_rate_by_pair"][pair_id] == pytest.approx(1.0)
+    assert storage["rejection_rate_by_exchange"]["mexc"] == pytest.approx(1.0)
+    assert storage["rejection_rate_by_exchange"]["gate"] == pytest.approx(1.0)
+
+
 def test_tracker_batch_record_flush_materializes_runtime_block_ids(tmp_path: Path):
     db_path = tmp_path / "tracker_history.sqlite"
     tracker = SpreadTracker(
@@ -530,3 +560,60 @@ def test_tracker_reset_training_cycle_archives_existing_db_and_reopens_runtime_s
     assert result["new_active_session_id"] > 0
     fresh_stats = tracker.get_storage_stats()
     assert fresh_stats["records_total"] == 0
+
+
+def test_tracker_rejects_invalid_numeric_records_before_persistence_and_tracks_aggregates(tmp_path: Path):
+    tracker = SpreadTracker(
+        window_sec=3600,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=tmp_path / "tracker.sqlite",
+    )
+    pair = ("BTC", "mexc", "spot", "gate", "futures")
+    captured_events: list[dict] = []
+    tracker.add_event_listener(captured_events.append)
+
+    tracker.record_spread(*pair, 0.25, float("nan"), now_ts=15.0)
+    tracker.record_spread(*pair, 0.30, -0.10, now_ts=30.0)
+    assert tracker.flush_to_storage(now_ts=30.0, force=True)
+
+    history = tracker.get_history(*pair, limit=10)
+    storage = tracker.get_storage_stats()
+
+    assert len(history) == 1
+    assert history[0]["entry_spread"] == pytest.approx(0.3)
+    assert history[0]["exit_spread"] == pytest.approx(-0.1)
+    assert storage["attempted_records_total"] == 2
+    assert storage["invalid_record_rejections_total"] == 1
+    assert storage["invalid_exit_rejections_total"] == 1
+    assert storage["invalid_entry_rejections_total"] == 0
+    assert storage["rejection_rate_by_pair"]["BTC|mexc|spot|gate|futures"] == pytest.approx(0.5)
+    assert storage["rejection_rate_by_exchange"]["mexc"] == pytest.approx(0.5)
+    assert storage["rejection_rate_by_exchange"]["gate"] == pytest.approx(0.5)
+    assert any(event.get("kind") == "tracker_rejection_stats" for event in captured_events)
+
+
+def test_tracker_rejects_invalid_numeric_records_before_persistence(tmp_path: Path):
+    db_path = tmp_path / "tracker_invalid.sqlite"
+    tracker = SpreadTracker(
+        window_sec=3600,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=db_path,
+    )
+
+    tracker.record_spread("BTC", "mexc", "spot", "gate", "futures", 0.25, float("nan"), now_ts=15.0)
+    assert tracker.flush_to_storage(now_ts=15.0, force=True)
+
+    storage = tracker.get_storage_stats()
+
+    assert storage["records_total"] == 0
+    assert storage["invalid_record_rejections_total"] == 1
+    assert storage["invalid_entry_rejections_total"] == 0
+    assert storage["invalid_exit_rejections_total"] == 1

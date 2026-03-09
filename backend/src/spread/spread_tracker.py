@@ -25,12 +25,15 @@ _EPISODE_BASELINE_WINDOW = 32
 _SHORT_RANGE_WINDOW_SEC = 2 * 60 * 60
 _LONG_RANGE_WINDOW_SEC = 24 * 60 * 60
 _DEFAULT_MIN_TOTAL_SPREAD_PCT = 0.0
+_HOT_PATH_REJECTION_META_KEY = "hot_path_rejection_stats"
 _TRACKER_META_KEYS = (
     "schema_version",
     "record_interval_sec",
     "tracking_window_sec",
     "gap_threshold_sec",
     "min_total_spread_pct",
+    "quality_fix_activated_at",
+    _HOT_PATH_REJECTION_META_KEY,
     "created_at",
     "last_flush_at",
 )
@@ -547,6 +550,9 @@ class SpreadTracker:
         self._ephemeral_session_id = 1
         self._ephemeral_block_id = 1
         self._event_listeners: list[Any] = []
+        self.quality_fix_activated_at: float = 0.0
+        self._hot_path_rejection_stats = self._empty_hot_path_rejection_stats()
+        self._hot_path_rejection_stats_dirty = False
         if self.db_path is not None:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             self._initialize_storage()
@@ -619,6 +625,179 @@ class SpreadTracker:
             return float(value)
         except (TypeError, ValueError):
             return float(default)
+
+    @staticmethod
+    def _empty_hot_path_rejection_stats() -> dict[str, Any]:
+        return {
+            "attempted_records_total": 0,
+            "invalid_record_rejections_total": 0,
+            "invalid_entry_rejections_total": 0,
+            "invalid_exit_rejections_total": 0,
+            "rejection_rate_total": 0.0,
+            "rejection_rate_by_pair": {},
+            "rejection_rate_by_exchange": {},
+            "pair_attempts": {},
+            "exchange_attempts": {},
+            "pair_rejections": {},
+            "exchange_rejections": {},
+        }
+
+    @staticmethod
+    def _ratio_map(rejections: dict[str, int], attempts: dict[str, int]) -> dict[str, float]:
+        ratios: dict[str, float] = {}
+        for key, attempted in attempts.items():
+            attempted_count = int(attempted or 0)
+            rejected_count = int(rejections.get(key, 0) or 0)
+            ratios[str(key)] = float(rejected_count / attempted_count) if attempted_count > 0 else 0.0
+        return dict(sorted(ratios.items()))
+
+    @classmethod
+    def _normalized_hot_path_rejection_stats(cls, payload: dict[str, Any] | None) -> dict[str, Any]:
+        stats = cls._empty_hot_path_rejection_stats()
+        if not isinstance(payload, dict):
+            return stats
+        stats["attempted_records_total"] = int(payload.get("attempted_records_total", 0) or 0)
+        stats["invalid_record_rejections_total"] = int(payload.get("invalid_record_rejections_total", 0) or 0)
+        stats["invalid_entry_rejections_total"] = int(payload.get("invalid_entry_rejections_total", 0) or 0)
+        stats["invalid_exit_rejections_total"] = int(payload.get("invalid_exit_rejections_total", 0) or 0)
+        stats["pair_attempts"] = {
+            str(key): int(value or 0)
+            for key, value in dict(payload.get("pair_attempts") or {}).items()
+            if str(key)
+        }
+        stats["exchange_attempts"] = {
+            str(key): int(value or 0)
+            for key, value in dict(payload.get("exchange_attempts") or {}).items()
+            if str(key)
+        }
+        stats["pair_rejections"] = {
+            str(key): int(value or 0)
+            for key, value in dict(payload.get("pair_rejections") or {}).items()
+            if str(key)
+        }
+        stats["exchange_rejections"] = {
+            str(key): int(value or 0)
+            for key, value in dict(payload.get("exchange_rejections") or {}).items()
+            if str(key)
+        }
+        stats["rejection_rate_by_pair"] = cls._ratio_map(
+            stats["pair_rejections"],
+            stats["pair_attempts"],
+        )
+        stats["rejection_rate_by_exchange"] = cls._ratio_map(
+            stats["exchange_rejections"],
+            stats["exchange_attempts"],
+        )
+        attempted_total = int(stats["attempted_records_total"])
+        rejected_total = int(stats["invalid_record_rejections_total"])
+        stats["rejection_rate_total"] = float(rejected_total / attempted_total) if attempted_total > 0 else 0.0
+        return stats
+
+    def _hot_path_rejection_snapshot_locked(self) -> dict[str, Any]:
+        stats = self._normalized_hot_path_rejection_stats(self._hot_path_rejection_stats)
+        return {
+            "attempted_records_total": int(stats["attempted_records_total"]),
+            "invalid_record_rejections_total": int(stats["invalid_record_rejections_total"]),
+            "invalid_entry_rejections_total": int(stats["invalid_entry_rejections_total"]),
+            "invalid_exit_rejections_total": int(stats["invalid_exit_rejections_total"]),
+            "rejection_rate_total": float(stats["rejection_rate_total"]),
+            "rejection_rate_by_pair": dict(stats["rejection_rate_by_pair"]),
+            "rejection_rate_by_exchange": dict(stats["rejection_rate_by_exchange"]),
+            "pair_attempts": dict(stats["pair_attempts"]),
+            "exchange_attempts": dict(stats["exchange_attempts"]),
+            "pair_rejections": dict(stats["pair_rejections"]),
+            "exchange_rejections": dict(stats["exchange_rejections"]),
+        }
+
+    def _record_hot_path_attempt_locked(self, key: PairKey) -> None:
+        pair_id = self._pair_id(key)
+        stats = dict(self._hot_path_rejection_stats)
+        stats["attempted_records_total"] = int(stats.get("attempted_records_total", 0) or 0) + 1
+        pair_attempts = dict(stats.get("pair_attempts") or {})
+        pair_attempts[pair_id] = int(pair_attempts.get(pair_id, 0) or 0) + 1
+        stats["pair_attempts"] = pair_attempts
+        exchange_attempts = dict(stats.get("exchange_attempts") or {})
+        for exchange in {str(key[1] or ""), str(key[3] or "")}:
+            if not exchange:
+                continue
+            exchange_attempts[exchange] = int(exchange_attempts.get(exchange, 0) or 0) + 1
+        stats["exchange_attempts"] = exchange_attempts
+        self._hot_path_rejection_stats = self._normalized_hot_path_rejection_stats(stats)
+        self._hot_path_rejection_stats_dirty = True
+
+    def _record_hot_path_rejection_locked(
+        self,
+        key: PairKey,
+        *,
+        invalid_fields: Iterable[str],
+    ) -> None:
+        stats = dict(self._hot_path_rejection_stats)
+        fields = {str(field) for field in invalid_fields}
+        pair_id = self._pair_id(key)
+        stats["invalid_record_rejections_total"] = int(stats.get("invalid_record_rejections_total", 0) or 0) + 1
+        if "entry" in fields:
+            stats["invalid_entry_rejections_total"] = int(stats.get("invalid_entry_rejections_total", 0) or 0) + 1
+        if "exit" in fields:
+            stats["invalid_exit_rejections_total"] = int(stats.get("invalid_exit_rejections_total", 0) or 0) + 1
+        pair_rejections = dict(stats.get("pair_rejections") or {})
+        pair_rejections[pair_id] = int(pair_rejections.get(pair_id, 0) or 0) + 1
+        stats["pair_rejections"] = pair_rejections
+        exchange_rejections = dict(stats.get("exchange_rejections") or {})
+        for exchange in {str(key[1] or ""), str(key[3] or "")}:
+            if not exchange:
+                continue
+            exchange_rejections[exchange] = int(exchange_rejections.get(exchange, 0) or 0) + 1
+        stats["exchange_rejections"] = exchange_rejections
+        self._hot_path_rejection_stats = self._normalized_hot_path_rejection_stats(stats)
+        self._hot_path_rejection_stats_dirty = True
+
+    def _load_hot_path_rejection_stats(self, meta_rows: dict[str, str]) -> None:
+        raw_payload = str(meta_rows.get(_HOT_PATH_REJECTION_META_KEY, "") or "").strip()
+        if not raw_payload:
+            self._hot_path_rejection_stats = self._empty_hot_path_rejection_stats()
+            return
+        try:
+            parsed = json.loads(raw_payload)
+        except json.JSONDecodeError:
+            logger.warning("[Tracker] Could not parse hot-path rejection stats from tracker_meta")
+            self._hot_path_rejection_stats = self._empty_hot_path_rejection_stats()
+            return
+        self._hot_path_rejection_stats = self._normalized_hot_path_rejection_stats(parsed if isinstance(parsed, dict) else {})
+
+    def record_hot_path_rejection(
+        self,
+        symbol: str,
+        buy_ex: str,
+        buy_mt: str,
+        sell_ex: str,
+        sell_mt: str,
+        *,
+        invalid_fields: list[str] | None = None,
+    ) -> None:
+        key = self._pair_key(symbol, buy_ex, buy_mt, sell_ex, sell_mt)
+        with self._lock:
+            self._record_hot_path_attempt_locked(key)
+            self._record_hot_path_rejection_locked(key, invalid_fields=list(invalid_fields or []))
+
+    def batch_record_rejections(self, rejections: list[dict[str, Any]]) -> None:
+        if not rejections:
+            return
+        with self._lock:
+            for payload in rejections:
+                if not isinstance(payload, dict):
+                    continue
+                key = self._pair_key(
+                    str(payload.get("symbol") or ""),
+                    str(payload.get("buy_ex") or ""),
+                    str(payload.get("buy_mt") or ""),
+                    str(payload.get("sell_ex") or ""),
+                    str(payload.get("sell_mt") or ""),
+                )
+                self._record_hot_path_attempt_locked(key)
+                self._record_hot_path_rejection_locked(
+                    key,
+                    invalid_fields=list(payload.get("invalid_fields") or []),
+                )
 
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str):
@@ -875,7 +1054,14 @@ class SpreadTracker:
                 "ON CONFLICT(key) DO NOTHING",
                 (str(now),),
             )
+            conn.execute(
+                "INSERT INTO tracker_meta(key, value) VALUES('quality_fix_activated_at', ?) "
+                "ON CONFLICT(key) DO NOTHING",
+                (str(now),),
+            )
             meta_rows = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM tracker_meta")}
+            self.quality_fix_activated_at = self._coerce_float(meta_rows.get("quality_fix_activated_at"), now)
+            self._load_hot_path_rejection_stats(meta_rows)
             if meta_rows.get("schema_version") != _SCHEMA_VERSION:
                 self._migrate_to_v2(conn, meta_rows)
             self._write_meta(
@@ -883,8 +1069,11 @@ class SpreadTracker:
                 {
                     "schema_version": _SCHEMA_VERSION,
                     "min_total_spread_pct": self.min_total_spread_pct,
+                    "quality_fix_activated_at": self.quality_fix_activated_at,
+                    _HOT_PATH_REJECTION_META_KEY: json.dumps(self._hot_path_rejection_snapshot_locked(), sort_keys=True),
                 },
             )
+            self._hot_path_rejection_stats_dirty = False
 
     def _migrate_to_v2(self, conn: sqlite3.Connection, meta_rows: dict[str, str]):
         records_exist = int(conn.execute("SELECT COUNT(*) FROM tracker_records").fetchone()[0]) > 0
@@ -1534,14 +1723,14 @@ class SpreadTracker:
         ts = float(now_ts) if now_ts is not None else time.time()
         key = self._pair_key(symbol, buy_ex, buy_mt, sell_ex, sell_mt)
         invalid_fields = self._invalid_numeric_fields(ts, entry_spread, exit_spread)
-        try:
-            entry_v = float(entry_spread)
-        except Exception:
-            entry_v = 0.0
-        try:
-            exit_v = float(exit_spread)
-        except Exception:
-            exit_v = 0.0
+        with self._lock:
+            if invalid_fields:
+                self._record_hot_path_attempt_locked(key)
+                self._record_hot_path_rejection_locked(key, invalid_fields=invalid_fields)
+        if invalid_fields:
+            return
+        entry_v = float(entry_spread)
+        exit_v = float(exit_spread)
 
         new_state = self._state(entry_v, exit_v)
         cutoff = ts - self.window_sec
@@ -1592,6 +1781,7 @@ class SpreadTracker:
                     or (ts - ps._last_record_ts) >= max(self.record_interval_sec, 0.0)
                 )
                 if should_record:
+                    self._record_hot_path_attempt_locked(key)
                     block_id = self._ensure_block_locked(key, ps, ts)
                     if ps._last_record_ts > 0.0 and ps.current_block_record_count > 0:
                         ps.current_block_max_gap_sec = max(ps.current_block_max_gap_sec, ts - ps._last_record_ts)
@@ -1814,7 +2004,9 @@ class SpreadTracker:
         ts = float(now_ts) if now_ts is not None else time.time()
         cutoff = ts - self.window_sec
         with self._lock:
-            if not force and not self._dirty_pairs and not self._deleted_pairs:
+            rejection_stats_payload = self._hot_path_rejection_snapshot_locked()
+            rejection_stats_dirty = bool(self._hot_path_rejection_stats_dirty)
+            if not force and not self._dirty_pairs and not self._deleted_pairs and not rejection_stats_dirty:
                 return True
             dirty_keys = list(self._pairs.keys()) if force else list(self._dirty_pairs)
             deleted_keys = list(self._deleted_pairs)
@@ -2063,7 +2255,9 @@ class SpreadTracker:
                         "tracking_window_sec": self.window_sec,
                         "gap_threshold_sec": self.gap_threshold_sec,
                         "min_total_spread_pct": self.min_total_spread_pct,
+                        "quality_fix_activated_at": self.quality_fix_activated_at,
                         "last_flush_at": self._last_flush_at,
+                        _HOT_PATH_REJECTION_META_KEY: json.dumps(rejection_stats_payload, sort_keys=True),
                     },
                 )
                 conn.commit()
@@ -2111,6 +2305,7 @@ class SpreadTracker:
                     self._dirty_pairs.discard(key)
             for key in deleted_keys:
                 self._deleted_pairs.discard(key)
+            self._hot_path_rejection_stats_dirty = False
         self._emit_event(
             {
                 "kind": "tracker_flush",
@@ -2118,6 +2313,13 @@ class SpreadTracker:
                 "storage_stats": self.get_storage_stats(),
             }
         )
+        if rejection_stats_dirty or force:
+            self._emit_event(
+                {
+                    "kind": "tracker_rejection_stats",
+                    **rejection_stats_payload,
+                }
+            )
         return True
 
     def load_from_storage(self, *, now_ts: float | None = None) -> int:
@@ -2133,6 +2335,12 @@ class SpreadTracker:
                     if row["key"] in _TRACKER_META_KEYS
                 }
                 self._last_flush_at = float(meta.get("last_flush_at", 0.0) or 0.0)
+                self.quality_fix_activated_at = self._coerce_float(meta.get("quality_fix_activated_at"), self.quality_fix_activated_at)
+                meta_with_rejection_stats = {
+                    row["key"]: row["value"]
+                    for row in conn.execute("SELECT key, value FROM tracker_meta")
+                }
+                self._load_hot_path_rejection_stats(meta_with_rejection_stats)
                 for row in conn.execute(
                     """
                     SELECT id, symbol, buy_ex, buy_mt, sell_ex, sell_mt,
@@ -2255,6 +2463,8 @@ class SpreadTracker:
             "record_interval_sec": self.record_interval_sec,
             "window_sec": self.window_sec,
             "active_session_id": self._active_session_id,
+            "quality_fix_activated_at": self.quality_fix_activated_at,
+            "hot_path_rejection_stats": self._hot_path_rejection_snapshot_locked(),
         }
 
     @staticmethod
@@ -4086,6 +4296,7 @@ class SpreadTracker:
             "gap_threshold_sec": self.gap_threshold_sec,
             "min_total_spread_pct": self.min_total_spread_pct,
             "active_session_id": self._active_session_id,
+            "quality_fix_activated_at": self.quality_fix_activated_at,
             "last_flush_at": self._last_flush_at,
             "pairs_in_memory": len(self._pairs),
             "db_size_bytes": self.db_path.stat().st_size if self.db_path is not None and self.db_path.exists() else 0,
@@ -4098,6 +4309,7 @@ class SpreadTracker:
             "selected_training_blocks": 0,
             "open_blocks": 0,
         }
+        stats.update(self._hot_path_rejection_snapshot_locked())
         if self.db_path is None or not self.db_path.is_file():
             return stats
         try:
@@ -4268,17 +4480,15 @@ class SpreadTracker:
             pairs_at_cap = self.max_pairs > 0 and len(self._pairs) >= self.max_pairs
             for rec in records:
                 symbol, buy_ex, buy_mt, sell_ex, sell_mt, entry_v, exit_v = rec
-                invalid_fields = self._invalid_numeric_fields(ts, entry_v, exit_v)
-                try:
-                    entry_v = float(entry_v)
-                except Exception:
-                    entry_v = 0.0
-                try:
-                    exit_v = float(exit_v)
-                except Exception:
-                    exit_v = 0.0
-                new_state = self._state(entry_v, exit_v)
                 key = self._pair_key(symbol, buy_ex, buy_mt, sell_ex, sell_mt)
+                invalid_fields = self._invalid_numeric_fields(ts, entry_v, exit_v)
+                if invalid_fields:
+                    self._record_hot_path_attempt_locked(key)
+                    self._record_hot_path_rejection_locked(key, invalid_fields=invalid_fields)
+                    continue
+                entry_v = float(entry_v)
+                exit_v = float(exit_v)
+                new_state = self._state(entry_v, exit_v)
                 pair_dirty = False
                 if key not in self._pairs:
                     if pairs_at_cap:
@@ -4320,6 +4530,7 @@ class SpreadTracker:
                     monotonic = bool(ps._last_record_ts <= 0.0 or ts > ps._last_record_ts)
                     should_record = (not ps.records or (ts - ps._last_record_ts) >= rec_interval)
                     if should_record:
+                        self._record_hot_path_attempt_locked(key)
                         block_id = self._ensure_block_locked(key, ps, ts)
                         if ps._last_record_ts > 0.0 and ps.current_block_record_count > 0:
                             ps.current_block_max_gap_sec = max(ps.current_block_max_gap_sec, ts - ps._last_record_ts)
