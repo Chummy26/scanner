@@ -16,7 +16,7 @@ def _snapshot(*, exchange: str, market_type: str, bid: float, ask: float, timest
     )
 
 
-def test_spread_engine_keeps_connected_old_books_when_connection_is_healthy(monkeypatch):
+def test_spread_engine_filters_connected_old_books(monkeypatch):
     monkeypatch.setattr("src.spread.spread_engine.time.time", lambda: 1_000.0)
     engine = SpreadEngine(SpreadConfig(min_spread_pct=0.1))
     engine._snapshots = {
@@ -29,9 +29,7 @@ def test_spread_engine_keeps_connected_old_books_when_connection_is_healthy(monk
 
     opps = engine.calculate_all()
 
-    assert len(opps) == 1
-    assert opps[0].buy_book_age == 500.0
-    assert opps[0].sell_book_age == 500.0
+    assert opps == []
 
 
 def test_spread_engine_filters_disconnected_old_books(monkeypatch):
@@ -50,7 +48,7 @@ def test_spread_engine_filters_disconnected_old_books(monkeypatch):
     assert opps == []
 
 
-def test_spread_engine_incremental_aging_keeps_connected_cached_opportunities(monkeypatch):
+def test_spread_engine_incremental_aging_prunes_cached_opportunities_once_books_turn_stale(monkeypatch):
     now_ref = {"value": 100.0}
     monkeypatch.setattr("src.spread.spread_engine.time.time", lambda: now_ref["value"])
     engine = SpreadEngine(SpreadConfig(min_spread_pct=0.1))
@@ -68,9 +66,7 @@ def test_spread_engine_incremental_aging_keeps_connected_cached_opportunities(mo
     now_ref["value"] = 130.0
     second = engine.calculate_all()
 
-    assert len(second) == 1
-    assert second[0].buy_book_age >= 30.0
-    assert second[0].sell_book_age >= 30.0
+    assert second == []
 
 
 def test_spread_engine_collects_raw_records_separately_from_filtered_opportunities(monkeypatch):

@@ -37,6 +37,18 @@ def test_runtime_perf_monitor_snapshot_aggregates_routes_cycles_broadcasts_and_l
             "opportunities_after_filter": 80,
         }
     )
+    monitor.record_scanner_cycle(
+        {
+            "kind": "ml_inference",
+            "total_ms": 22.0,
+            "history_fetch_ms": 8.0,
+            "ml_analyze_ms": 6.0,
+            "ml_render_ms": 4.0,
+            "ml_predictions_drained": 3,
+            "ml_refresh_queue_size": 9,
+            "ml_cache_size": 12,
+        }
+    )
     monitor.record_broadcast(
         "scanner_lite",
         {
@@ -55,7 +67,9 @@ def test_runtime_perf_monitor_snapshot_aggregates_routes_cycles_broadcasts_and_l
     assert snapshot["routes"]["scanner_lite_list"]["source_counts"]["cached_lite"] == 2
     assert snapshot["scanner_cycle"]["count"] == 1
     assert snapshot["scanner_cycle_by_kind"]["ws_manager"]["count"] == 1
+    assert snapshot["scanner_cycle_by_kind"]["ml_inference"]["count"] == 1
     assert snapshot["scanner_cycle"]["total_ms"]["max"] == 85.0
+    assert snapshot["scanner_cycle_by_kind"]["ml_inference"]["ml_render_ms"]["max"] == 4.0
     assert snapshot["broadcasts"]["scanner_lite"]["payload_bytes"]["max"] == 8192.0
     assert snapshot["event_loop_lag_ms"]["max"] == 275.0
     assert snapshot["cache_state"]["scanner_lite_rows"] == 80

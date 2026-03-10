@@ -260,14 +260,6 @@ class SpreadEngine:
                         symbol_snapshots.get(opp.sell_exchange, {})
                         .get(opp.sell_market_type)
                     )
-                    if (
-                        buy_snap is not None
-                        and sell_snap is not None
-                        and buy_snap.connected
-                        and sell_snap.connected
-                    ):
-                        kept.append(opp)
-                        continue
                     if opp.buy_book_age < stale_threshold and opp.sell_book_age < stale_threshold:
                         kept.append(opp)
                 if kept:
@@ -358,10 +350,9 @@ class SpreadEngine:
                     continue
                 age = now - snap.timestamp
                 # Keep quiet books visible while the feed itself is still
-                # connected. Arbitrage opportunities should not disappear only
-                # because the market did not move for a while. Age-based
-                # pruning is only applied after connectivity is lost.
-                if not snap.connected and age >= stale_threshold:
+                # Do not surface opportunities backed by very old books even
+                # if the feed still appears logically connected.
+                if age >= stale_threshold:
                     stale_n += 1
                     continue
 
