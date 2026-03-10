@@ -12,13 +12,13 @@ import json
 import logging
 import math
 import time
-from collections import deque
 from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
 import torch
 
+from .feature_contracts import build_feature_rows
 from .ml_dataset import canonicalize_record
 from .ml_model import (
     ModelArtifactMetadata,
@@ -55,10 +55,18 @@ class SpreadMLAnalyzer:
         self.last_drifted_features: list[str] = []
         self.tracker: Any | None = None
 
+        self.reload_artifact()
+
+    def reload_artifact(self) -> str:
+        self.model = None
+        self.metadata = None
+        self.model_status = "missing_artifact"
+        self.model_version = "unavailable"
+        self.signal_reason = "trained artifact bundle not found"
         model_path, meta_path = get_artifact_paths(self.artifact_dir)
         if not model_path.is_file() or not meta_path.is_file():
             logger.warning("[ML] Artifact bundle missing at %s", model_path.parent)
-            return
+            return self.model_status
 
         try:
             model, metadata = load_artifact_bundle(
@@ -79,13 +87,13 @@ class SpreadMLAnalyzer:
                     self.model_status = "stale_artifact"
                     self.signal_reason = "; ".join(issues)
                     logger.warning("[ML] Rejected stale artifact bundle %s: %s", metadata.version, self.signal_reason)
-                    return
+                    return self.model_status
             except Exception:
                 pass
             self.model_status = "load_failed"
             self.signal_reason = f"artifact load failed: {exc}"
             logger.warning("[ML] Failed to load artifact bundle: %s", exc)
-            return
+            return self.model_status
 
         self.model = model.to(self.device)
         self.model.eval()
@@ -105,11 +113,12 @@ class SpreadMLAnalyzer:
                 f"differs from runtime config={float(self.min_total_spread_pct):.4f}"
             )
             logger.warning("[ML] Rejected artifact bundle due to threshold mismatch: %s", self.signal_reason)
-            return
+            return self.model_status
         self.model_status = "ready"
         self.model_version = metadata.version
         self.sequence_length = metadata.sequence_length
         self.signal_reason = "trained artifact ready"
+        return self.model_status
 
     def attach_tracker(self, tracker: Any | None):
         self.tracker = tracker
@@ -202,41 +211,60 @@ class SpreadMLAnalyzer:
             )
         )
 
-    @staticmethod
-    def _rolling_std_zscore(buffer: deque[float], current: float) -> tuple[float, float]:
-        if len(buffer) < 2:
-            return 0.0, 0.0
-        mean = sum(buffer) / len(buffer)
-        variance = sum((v - mean) ** 2 for v in buffer) / len(buffer)
-        std = math.sqrt(variance)
-        if std < 1e-6:
-            return 0.0, 0.0
-        return std, (current - mean) / std
-
-    def _build_feature_tensor(self, history: list[dict[str, float]]) -> torch.Tensor:
+    def _build_feature_rows(
+        self,
+        history: list[dict[str, float]],
+        *,
+        pair_key: Any = None,
+    ) -> np.ndarray:
         if self.metadata is None:
-            raise RuntimeError("Cannot build feature tensor: model metadata not loaded")
+            raise RuntimeError("Cannot build feature rows: model metadata not loaded")
+        expected_names = list(self.metadata.feature_names)
+        normalized_key = self._normalize_pair_key(pair_key)
+        if self.tracker is not None and normalized_key is not None and hasattr(self.tracker, "get_feature_history"):
+            try:
+                tracker_rows = self.tracker.get_feature_history(
+                    *normalized_key,
+                    limit=int(self.metadata.sequence_length),
+                    feature_names=expected_names,
+                )
+                if tracker_rows:
+                    return np.asarray(tracker_rows, dtype=np.float32)
+            except Exception as exc:
+                logger.debug("[ML] Falling back to local feature rows for %s: %s", normalized_key, exc)
         recent = history[-self.metadata.sequence_length :]
-        expected_names = self.metadata.feature_names
-        features = []
+        try:
+            return np.asarray(
+                build_feature_rows(recent, feature_names=expected_names),
+                dtype=np.float32,
+            )
+        except ValueError:
+            return np.asarray(
+                self._build_legacy_feature_rows(recent, expected_names),
+                dtype=np.float32,
+            )
+
+    @staticmethod
+    def _build_legacy_feature_rows(history: list[dict[str, float]], expected_names: list[str]) -> list[list[float]]:
+        rows: list[list[float]] = []
         previous_entry: Optional[float] = None
         previous_exit: Optional[float] = None
         previous_delta_entry: Optional[float] = None
         previous_delta_exit: Optional[float] = None
-        entry_buffer: deque[float] = deque(maxlen=5)
-        exit_buffer: deque[float] = deque(maxlen=5)
-        for record in recent:
-            entry_spread = record["entry_spread"]
-            exit_spread = record["exit_spread"]
+        entry_buffer: list[float] = []
+        exit_buffer: list[float] = []
+        for record in history:
+            entry_spread = float(record["entry_spread"])
+            exit_spread = float(record["exit_spread"])
             delta_entry = 0.0 if previous_entry is None else entry_spread - previous_entry
             delta_exit = 0.0 if previous_exit is None else exit_spread - previous_exit
             delta2_entry = 0.0 if previous_delta_entry is None else delta_entry - previous_delta_entry
             delta2_exit = 0.0 if previous_delta_exit is None else delta_exit - previous_delta_exit
-            entry_buffer.append(entry_spread)
-            exit_buffer.append(exit_spread)
-            rolling_std_entry, zscore_entry = self._rolling_std_zscore(entry_buffer, entry_spread)
-            rolling_std_exit, zscore_exit = self._rolling_std_zscore(exit_buffer, exit_spread)
-            all_features = {
+            entry_buffer = (entry_buffer + [entry_spread])[-5:]
+            exit_buffer = (exit_buffer + [exit_spread])[-5:]
+            rolling_std_entry, zscore_entry = SpreadMLAnalyzer._legacy_std_zscore(entry_buffer, entry_spread)
+            rolling_std_exit, zscore_exit = SpreadMLAnalyzer._legacy_std_zscore(exit_buffer, exit_spread)
+            feature_map = {
                 "entry_spread": entry_spread,
                 "exit_spread": exit_spread,
                 "delta_entry": delta_entry,
@@ -248,13 +276,31 @@ class SpreadMLAnalyzer:
                 "zscore_entry": zscore_entry,
                 "zscore_exit": zscore_exit,
             }
-            features.append([all_features[name] for name in expected_names])
+            rows.append([float(feature_map.get(name, 0.0) or 0.0) for name in expected_names])
             previous_entry = entry_spread
             previous_exit = exit_spread
             previous_delta_entry = delta_entry
             previous_delta_exit = delta_exit
+        return rows
 
-        feature_array = np.asarray(features, dtype=np.float32)
+    @staticmethod
+    def _legacy_std_zscore(values: list[float], current: float) -> tuple[float, float]:
+        if len(values) < 2:
+            return 0.0, 0.0
+        mean = sum(values) / len(values)
+        variance = sum((value - mean) ** 2 for value in values) / len(values)
+        std = math.sqrt(max(variance, 0.0))
+        if std < 1e-9:
+            return 0.0, 0.0
+        return float(std), float((current - mean) / std)
+
+    def _build_feature_tensor(
+        self,
+        history: list[dict[str, float]],
+        *,
+        pair_key: Any = None,
+    ) -> torch.Tensor:
+        feature_array = self._build_feature_rows(history, pair_key=pair_key)
         drift_status, drifted_features = self._check_drift(feature_array)
         self.last_drift_status = drift_status
         self.last_drifted_features = drifted_features
@@ -283,10 +329,10 @@ class SpreadMLAnalyzer:
             )
             return "drifted", drifted_features
         return "stable", []
-    def _predict(self, history: list[dict[str, float]]) -> tuple[float, int]:
+    def _predict(self, history: list[dict[str, float]], *, pair_key: Any = None) -> tuple[float, int]:
         if self.model is None or self.metadata is None:
             raise RuntimeError("Cannot predict: model or metadata not loaded")
-        tensor = self._build_feature_tensor(history)
+        tensor = self._build_feature_tensor(history, pair_key=pair_key)
         with torch.no_grad():
             logits, eta_raw = self.model(tensor)
         logit_value = float(logits.item())
@@ -385,7 +431,7 @@ class SpreadMLAnalyzer:
             "artifact_dataset_samples": int(self.metadata.dataset_summary.get("num_samples", 0)) if self.metadata is not None else 0,
         }
 
-    def predict_history(self, history: list[Any]) -> dict[str, Any]:
+    def predict_history(self, history: list[Any], *, pair_key: Any = None) -> dict[str, Any]:
         canonical_history = self._coerce_history(history)
         history_points = len(canonical_history)
         history_last_ts = float(canonical_history[-1]["timestamp"]) if canonical_history else 0.0
@@ -420,7 +466,7 @@ class SpreadMLAnalyzer:
             }
 
         start_time = time.perf_counter()
-        inversion_probability, eta_seconds = self._predict(canonical_history)
+        inversion_probability, eta_seconds = self._predict(canonical_history, pair_key=pair_key)
         inference_time_ms = (time.perf_counter() - start_time) * 1000.0
         if inference_time_ms > 50.0:
             logger.warning("[ML] Inference latency alert: %.2fms", inference_time_ms)
@@ -431,6 +477,7 @@ class SpreadMLAnalyzer:
             "history_points": history_points,
             "history_last_ts": history_last_ts,
             "canonical_history": canonical_history,
+            "pair_key": pair_key,
             "inversion_probability": float(inversion_probability),
             "model_eta_seconds": int(eta_seconds),
             "inference_latency_ms": float(inference_time_ms),

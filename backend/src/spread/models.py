@@ -265,6 +265,7 @@ class SpreadConfig:
     symbol_discovery_max_symbols: int = 0  # 0 = unlimited
     min_discovery_volume_usd: float = 100_000  # Filter coins below this 24h volume during discovery (0 = disabled)
     min_opportunity_volume_usd: float = 500  # Filter opportunities where BOTH sides < this volume (0 = disabled)
+    startup_warmup_sec: float = 20.0
 
     # Tracker settings (history + invertidas counting)
     tracker_record_interval_sec: float = 15.0

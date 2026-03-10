@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 from dataclasses import asdict, dataclass
@@ -10,7 +9,13 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from .ml_dataset import FEATURE_NAMES
+from .feature_contracts import (
+    DEFAULT_FEATURE_CONTRACT_VERSION,
+    FEATURE_NAMES,
+    feature_contract_version_for_names,
+    feature_schema_hash,
+    resolve_feature_contract,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +60,7 @@ class ModelArtifactMetadata:
     dataset_summary: dict[str, Any]
     split_summary: dict[str, Any]
     training_config: dict[str, Any]
+    feature_contract_version: str = DEFAULT_FEATURE_CONTRACT_VERSION
     use_attention: bool = True
     trained_at_utc: str = ""
     dataset_fingerprint: str = ""
@@ -66,24 +72,39 @@ class ModelArtifactMetadata:
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "ModelArtifactMetadata":
         payload.setdefault("use_attention", False)
+        payload.setdefault(
+            "feature_contract_version",
+            feature_contract_version_for_names(list(payload.get("feature_names") or [])) or DEFAULT_FEATURE_CONTRACT_VERSION,
+        )
         return cls(**payload)
 
 
 def current_feature_schema_hash() -> str:
-    return hashlib.sha1(",".join(FEATURE_NAMES).encode()).hexdigest()
+    return feature_schema_hash(list(FEATURE_NAMES))
 
 
 def validate_artifact_metadata(metadata: ModelArtifactMetadata) -> list[str]:
     issues: list[str] = []
-    expected_feature_names = list(FEATURE_NAMES)
+    try:
+        resolved_version, expected_feature_names = resolve_feature_contract(
+            list(metadata.feature_names),
+            version=str(metadata.feature_contract_version or "").strip() or None,
+        )
+    except ValueError:
+        issues.append("feature schema mismatch with supported contracts")
+        expected_feature_names = list(metadata.feature_names)
+        resolved_version = ""
     if metadata.input_size != len(expected_feature_names):
         issues.append(
-            f"input size mismatch: artifact={metadata.input_size}, code={len(expected_feature_names)}"
+            f"input size mismatch: artifact={metadata.input_size}, schema={len(expected_feature_names)}"
         )
-    if list(metadata.feature_names) != expected_feature_names:
+    if list(metadata.feature_names) != list(expected_feature_names):
         issues.append("feature schema mismatch with current code feature contract")
-    if metadata.feature_schema_hash != current_feature_schema_hash():
+    expected_hash = feature_schema_hash(list(expected_feature_names))
+    if metadata.feature_schema_hash and metadata.feature_schema_hash != expected_hash:
         issues.append("feature schema hash mismatch")
+    if resolved_version and str(metadata.feature_contract_version or "") != str(resolved_version):
+        issues.append("feature contract version mismatch")
     if not metadata.use_attention:
         issues.append("artifact disabled temporal attention")
     return issues
@@ -108,7 +129,7 @@ class TemporalAttention(nn.Module):
 class SpreadSequenceLSTM(nn.Module):
     def __init__(
         self,
-        input_sz: int = 10,
+        input_sz: int = len(FEATURE_NAMES),
         hidden_sz: int = 64,
         num_layers: int = 2,
         dropout: float = 0.3,

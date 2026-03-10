@@ -1535,6 +1535,36 @@ async def handle_ml_dashboard_detail_api(request):
             return _json_response_with_perf(request, "ml_dashboard_detail", {"data": opp}, source=source, rows=1)
     return _json_response_with_perf(request, "ml_dashboard_detail", {"error": "not_found"}, status=404, source=source, rows=0)
 
+
+async def handle_system_health_api(request):
+    ws_mgr = request.app.get("ws_manager")
+    if not ws_mgr:
+        return web.json_response(
+            {
+                "hour_verdict": "unknown",
+                "rejection_rate_pct": 0.0,
+                "circuit_breakers": {},
+                "next_snapshot_sec": 0,
+                "last_snapshot": "",
+                "last_snapshot_verdict": "unknown",
+            }
+        )
+    return web.json_response(ws_mgr.get_system_health())
+
+
+async def handle_ml_pipeline_status(request):
+    ws_mgr = request.app.get("ws_manager")
+    if not ws_mgr:
+        return web.json_response(
+            {
+                "snapshots": {"last": "", "last_verdict": "unknown", "next_in_sec": 0, "total_7d": 0, "pass_7d": 0, "fail_7d": 0, "recent": []},
+                "training": {"last_run": "", "last_auc": 0.0, "model_version": "unavailable", "deployed_at": "", "retrain_trigger": None, "auto_state": {}, "run_count": 0},
+                "hourly_health": {"last_24h": [], "healthy_count": 0, "degraded_count": 0, "unhealthy_count": 0},
+            }
+        )
+    return web.json_response(ws_mgr.get_pipeline_status())
+
+
 async def handle_ml_dashboard_page(request):
     path = SRC_DIR / "web" / "dashboard.html"
     if path.is_file():
@@ -2864,6 +2894,8 @@ async def on_startup(app):
                 config.min_total_spread_pct = float(os.environ["TEAM_OP_MIN_TOTAL_SPREAD_PCT"])
             if os.environ.get("TEAM_OP_TRACKER_DB_PATH"):
                 config.tracker_db_path = os.environ["TEAM_OP_TRACKER_DB_PATH"].strip()
+            if os.environ.get("TEAM_OP_STARTUP_WARMUP_SEC"):
+                config.startup_warmup_sec = float(os.environ["TEAM_OP_STARTUP_WARMUP_SEC"])
             for exchange_config in config.exchanges:
                 prefix = f"TEAM_OP_{str(exchange_config.name or '').upper()}"
                 if os.environ.get(f"{prefix}_SPOT_FEED_MODE"):
@@ -3075,6 +3107,8 @@ def create_app() -> web.Application:
     app.router.add_get("/api/v1/ml/dashboard/summary", handle_ml_dashboard_summary_api)
     app.router.add_get("/api/v1/ml/dashboard/list", handle_ml_dashboard_list_api)
     app.router.add_get("/api/v1/ml/dashboard/{pair_key}", handle_ml_dashboard_detail_api)
+    app.router.add_get("/api/v1/system/health", handle_system_health_api)
+    app.router.add_get("/api/v1/ml/pipeline/status", handle_ml_pipeline_status)
     app.router.add_get("/api/v1/ml/training/sessions", handle_ml_training_sessions_api)
     app.router.add_patch("/api/v1/ml/training/sessions/{session_id}", handle_ml_training_session_patch)
     app.router.add_get("/api/v1/ml/training/sessions/{session_id}/exceptions", handle_ml_training_session_exceptions)

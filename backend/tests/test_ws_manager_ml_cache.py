@@ -3,6 +3,7 @@ from pathlib import Path
 
 from src.spread.models import SpreadConfig, SpreadOpportunity
 from src.spread.ws_manager import WSManager
+from src.spread import market_data
 
 
 class _FakeTracker:
@@ -101,6 +102,12 @@ def _make_opportunity() -> SpreadOpportunity:
     )
 
 
+def _mark_post_warmup(ws_mgr: WSManager, monkeypatch, *, now_ts: float = 200.0) -> None:
+    ws_mgr._startup_started_at = now_ts - 30.0
+    monkeypatch.setattr("src.spread.ws_manager.time.time", lambda: now_ts)
+    market_data._market_data_ready = True
+
+
 def test_default_exchange_feed_modes_use_ticker_first_for_mexc_and_kucoin():
     config = SpreadConfig()
     feed_modes = {
@@ -129,109 +136,125 @@ def test_ws_manager_uses_smoothed_tracker_cadence(tmp_path: Path):
     assert ws_mgr._tracker_cycle_every() == 5
 
 
-def test_ws_manager_hot_path_enqueues_and_reuses_prediction_when_tracker_marker_is_unchanged(tmp_path: Path):
+def test_ws_manager_hot_path_enqueues_and_reuses_prediction_when_tracker_marker_is_unchanged(monkeypatch, tmp_path: Path):
     config = SpreadConfig(exchanges=[], symbols=[], tracker_db_path=str(tmp_path / "tracker.sqlite"))
     ws_mgr = WSManager(config)
     ws_mgr.tracker = _FakeTracker()
     ws_mgr.ml_analyzer = _FakeAnalyzer()
     ws_mgr.engine.calculate_all = lambda on_spread=None, record_sink=None, rejection_sink=None: [_make_opportunity()]
+    original_ready = market_data._market_data_ready
+    try:
+        _mark_post_warmup(ws_mgr, monkeypatch)
+        ws_mgr._enrich_tracker_cycle = 15
+        ws_mgr._do_calc_enrich(True)
+        assert ws_mgr.tracker.history_calls == 0
+        assert ws_mgr._ml_queue_size() == 1
 
-    ws_mgr._enrich_tracker_cycle = 15
-    ws_mgr._do_calc_enrich(True)
-    assert ws_mgr.tracker.history_calls == 0
-    assert ws_mgr._ml_queue_size() == 1
+        ws_mgr._drain_ml_inference_batch(now_ts=200.0)
+        assert ws_mgr.tracker.history_calls == 0
+        assert ws_mgr.ml_analyzer.predict_calls == 1
+        assert ws_mgr.ml_analyzer.render_calls == 1
 
-    ws_mgr._drain_ml_inference_batch(now_ts=200.0)
-    assert ws_mgr.tracker.history_calls == 0
-    assert ws_mgr.ml_analyzer.predict_calls == 1
-    assert ws_mgr.ml_analyzer.render_calls == 1
-
-    ws_mgr._enrich_tracker_cycle = 15
-    ws_mgr._do_calc_enrich(False)
-    assert ws_mgr.tracker.history_calls == 0
-    assert ws_mgr.ml_analyzer.predict_calls == 1
-    assert ws_mgr.ml_analyzer.render_calls == 1
+        ws_mgr._enrich_tracker_cycle = 15
+        ws_mgr._do_calc_enrich(False)
+        assert ws_mgr.tracker.history_calls == 0
+        assert ws_mgr.ml_analyzer.predict_calls == 1
+        assert ws_mgr.ml_analyzer.render_calls == 1
+    finally:
+        market_data._market_data_ready = original_ready
 
 
-def test_ws_manager_hot_path_enqueues_refresh_when_tracker_marker_changes(tmp_path: Path):
+def test_ws_manager_hot_path_enqueues_refresh_when_tracker_marker_changes(monkeypatch, tmp_path: Path):
     config = SpreadConfig(exchanges=[], symbols=[], tracker_db_path=str(tmp_path / "tracker.sqlite"))
     ws_mgr = WSManager(config)
     fake_tracker = _FakeTracker()
     ws_mgr.tracker = fake_tracker
     ws_mgr.ml_analyzer = _FakeAnalyzer()
     ws_mgr.engine.calculate_all = lambda on_spread=None, record_sink=None, rejection_sink=None: [_make_opportunity()]
+    original_ready = market_data._market_data_ready
+    try:
+        _mark_post_warmup(ws_mgr, monkeypatch)
+        ws_mgr._enrich_tracker_cycle = 15
+        ws_mgr._do_calc_enrich(True)
+        ws_mgr._drain_ml_inference_batch(now_ts=200.0)
+        assert ws_mgr.ml_analyzer.predict_calls == 1
 
-    ws_mgr._enrich_tracker_cycle = 15
-    ws_mgr._do_calc_enrich(True)
-    ws_mgr._drain_ml_inference_batch(now_ts=200.0)
-    assert ws_mgr.ml_analyzer.predict_calls == 1
+        fake_tracker.marker["last_record_ts"] = 315.0
+        fake_tracker.marker["history_points"] = 25
+        ws_mgr._enrich_tracker_cycle = 15
+        ws_mgr._do_calc_enrich(True)
 
-    fake_tracker.marker["last_record_ts"] = 315.0
-    fake_tracker.marker["history_points"] = 25
-    ws_mgr._enrich_tracker_cycle = 15
-    ws_mgr._do_calc_enrich(True)
+        assert ws_mgr.tracker.history_calls == 0
+        assert ws_mgr._ml_queue_size() == 1
 
-    assert ws_mgr.tracker.history_calls == 0
-    assert ws_mgr._ml_queue_size() == 1
-
-    ws_mgr._drain_ml_inference_batch(now_ts=215.0)
-    assert ws_mgr.tracker.history_calls == 0
-    assert ws_mgr.ml_analyzer.predict_calls == 2
+        ws_mgr._drain_ml_inference_batch(now_ts=215.0)
+        assert ws_mgr.tracker.history_calls == 0
+        assert ws_mgr.ml_analyzer.predict_calls == 2
+    finally:
+        market_data._market_data_ready = original_ready
 
 
-def test_ws_manager_skips_ml_work_when_model_is_not_ready(tmp_path: Path):
-    config = SpreadConfig(exchanges=[], symbols=[], tracker_db_path=str(tmp_path / "tracker.sqlite"))
+def test_ws_manager_skips_ml_work_when_model_is_not_ready(monkeypatch, tmp_path: Path):
+    config = SpreadConfig(exchanges=[], symbols=[], tracker_db_path=str(tmp_path / "tracker.sqlite"), min_opportunity_volume_usd=0)
     ws_mgr = WSManager(config)
     ws_mgr.tracker = _FakeTracker()
     analyzer = _FakeAnalyzer()
     analyzer.model_status = "missing_artifact"
     ws_mgr.ml_analyzer = analyzer
     ws_mgr.engine.calculate_all = lambda on_spread=None, record_sink=None, rejection_sink=None: [_make_opportunity()]
+    original_ready = market_data._market_data_ready
+    try:
+        _mark_post_warmup(ws_mgr, monkeypatch)
+        opportunities = ws_mgr._do_calc_enrich(False)
 
-    opportunities = ws_mgr._do_calc_enrich(None)
+        assert ws_mgr.tracker.history_calls == 0
+        assert analyzer.predict_calls == 0
+        assert analyzer.render_calls == 0
+        assert ws_mgr._ml_queue_size() == 0
+        assert opportunities[0].ml_context is None
+        assert opportunities[0].ml_score == 0
+    finally:
+        market_data._market_data_ready = original_ready
 
-    assert ws_mgr.tracker.history_calls == 0
-    assert analyzer.predict_calls == 0
-    assert analyzer.render_calls == 0
-    assert ws_mgr._ml_queue_size() == 0
-    assert opportunities[0].ml_context is None
-    assert opportunities[0].ml_score == 0
 
-
-def test_ws_manager_background_ml_drain_renders_with_latest_current_entry(tmp_path: Path):
+def test_ws_manager_background_ml_drain_renders_with_latest_current_entry(monkeypatch, tmp_path: Path):
     config = SpreadConfig(exchanges=[], symbols=[], tracker_db_path=str(tmp_path / "tracker.sqlite"))
     ws_mgr = WSManager(config)
     ws_mgr.tracker = _FakeTracker()
     analyzer = _FakeAnalyzer()
     ws_mgr.ml_analyzer = analyzer
+    original_ready = market_data._market_data_ready
+    try:
+        _mark_post_warmup(ws_mgr, monkeypatch)
+        key = ws_mgr.tracker._pair_key("BTC", "mexc", "spot", "gate", "futures")
+        ws_mgr._queue_tracker_records(
+            [("BTC", "mexc", "spot", "gate", "futures", 1.23, -0.4)],
+            now_ts=200.0,
+            capture_shard=0,
+            shard_count=1,
+        )
+        ws_mgr._queue_ml_refresh(
+            key,
+            {
+                "symbol": "BTC",
+                "buy_exchange": "mexc",
+                "buy_market_type": "spot",
+                "sell_exchange": "gate",
+                "sell_market_type": "futures",
+                "current_entry": 1.23,
+                "tracker_marker": ws_mgr._tracker_marker_from_cache(ws_mgr.tracker.marker),
+                "queued_at_perf": 100.0,
+            },
+        )
 
-    key = ws_mgr.tracker._pair_key("BTC", "mexc", "spot", "gate", "futures")
-    ws_mgr._queue_tracker_records(
-        [("BTC", "mexc", "spot", "gate", "futures", 1.23, -0.4)],
-        now_ts=200.0,
-        capture_shard=0,
-        shard_count=1,
-    )
-    ws_mgr._queue_ml_refresh(
-        key,
-        {
-            "symbol": "BTC",
-            "buy_exchange": "mexc",
-            "buy_market_type": "spot",
-            "sell_exchange": "gate",
-            "sell_market_type": "futures",
-            "current_entry": 1.23,
-            "tracker_marker": ws_mgr._tracker_marker_from_cache(ws_mgr.tracker.marker),
-            "queued_at_perf": 100.0,
-        },
-    )
+        ws_mgr._drain_ml_inference_batch(now_ts=200.0)
 
-    ws_mgr._drain_ml_inference_batch(now_ts=200.0)
-
-    cache_entry = ws_mgr._get_ml_cache_entry(key)
-    assert cache_entry is not None
-    assert cache_entry["rendered_entry_spread"] == 1.23
-    assert cache_entry["context"]["ml_score"] == 77
+        cache_entry = ws_mgr._get_ml_cache_entry(key)
+        assert cache_entry is not None
+        assert cache_entry["rendered_entry_spread"] == 1.23
+        assert cache_entry["context"]["ml_score"] == 77
+    finally:
+        market_data._market_data_ready = original_ready
 
 
 def test_ws_manager_persist_loop_offloads_flush_to_thread(monkeypatch, tmp_path: Path):
@@ -316,7 +339,7 @@ def test_ws_manager_prunes_stale_ml_runtime_state_when_active_keys_shrink(tmp_pa
     assert ws_mgr._ml_cache[active_key]["last_seen_at"] == old_ts + 1.0
 
 
-def test_ws_manager_continuous_capture_uses_raw_records_not_filtered_opportunities(tmp_path: Path):
+def test_ws_manager_continuous_capture_uses_raw_records_not_filtered_opportunities(monkeypatch, tmp_path: Path):
     config = SpreadConfig(exchanges=[], symbols=[], tracker_db_path=str(tmp_path / "tracker.sqlite"))
     ws_mgr = WSManager(config)
     captured_batches = []
@@ -334,34 +357,78 @@ def test_ws_manager_continuous_capture_uses_raw_records_not_filtered_opportuniti
         return []
 
     ws_mgr.engine.calculate_all = _fake_calculate_all
+    original_ready = market_data._market_data_ready
+    try:
+        _mark_post_warmup(ws_mgr, monkeypatch)
+        key = ws_mgr.tracker._pair_key("BTC", "mexc", "spot", "gate", "futures")
+        shard_count = ws_mgr._tracker_capture_shards()
+        capture_shard = next(
+            shard for shard in range(shard_count)
+            if ws_mgr._pair_in_capture_shard(key, capture_shard=shard, shard_count=shard_count)
+        )
 
-    key = ws_mgr.tracker._pair_key("BTC", "mexc", "spot", "gate", "futures")
-    shard_count = ws_mgr._tracker_capture_shards()
-    capture_shard = next(
-        shard for shard in range(shard_count)
-        if ws_mgr._pair_in_capture_shard(key, capture_shard=shard, shard_count=shard_count)
-    )
+        ws_mgr._do_calc_enrich(True, capture_shard=capture_shard)
+        ws_mgr._drain_tracker_ingest_batch(now_ts=200.0, drain_all=True)
 
-    ws_mgr._do_calc_enrich(True, capture_shard=capture_shard)
-    ws_mgr._drain_tracker_ingest_batch(now_ts=200.0, drain_all=True)
-
-    assert len(captured_batches) == 1
-    assert captured_batches[0][0] == [("BTC", "mexc", "spot", "gate", "futures", 0.4, -0.2)]
+        assert len(captured_batches) == 1
+        assert captured_batches[0][0] == [("BTC", "mexc", "spot", "gate", "futures", 0.4, -0.2)]
+    finally:
+        market_data._market_data_ready = original_ready
 
 
-def test_ws_manager_scanner_lite_refresh_requires_interest_or_clients(tmp_path: Path):
-    config = SpreadConfig(exchanges=[], symbols=[], tracker_db_path=str(tmp_path / "tracker.sqlite"))
+def test_ws_manager_scanner_lite_refresh_requires_interest_or_clients(monkeypatch, tmp_path: Path):
+    config = SpreadConfig(exchanges=[], symbols=[], tracker_db_path=str(tmp_path / "tracker.sqlite"), min_opportunity_volume_usd=0)
     ws_mgr = WSManager(config)
     ws_mgr.tracker = _FakeTracker()
     ws_mgr.ml_analyzer = _FakeAnalyzer()
-    ws_mgr.engine.calculate_all = lambda on_spread=None, record_sink=None: [_make_opportunity()]
+    ws_mgr.engine.calculate_all = lambda on_spread=None, record_sink=None, rejection_sink=None: [_make_opportunity()]
+    original_ready = market_data._market_data_ready
+    try:
+        _mark_post_warmup(ws_mgr, monkeypatch)
+        ws_mgr._do_calc_enrich(False)
+        assert ws_mgr.get_perf_state()["scanner_lite_rows"] == 0
 
-    ws_mgr._do_calc_enrich(None)
-    assert ws_mgr.get_perf_state()["scanner_lite_rows"] == 0
+        ws_mgr.mark_scanner_lite_interest()
+        ws_mgr._do_calc_enrich(False)
 
+        rows = ws_mgr.get_current_opportunities_lite()
+        assert len(rows) == 1
+        assert rows[0]["pairKey"] == "BTC|mexc|spot|gate|futures"
+    finally:
+        market_data._market_data_ready = original_ready
+
+
+def test_ws_manager_blocks_scanner_publication_during_startup_warmup(monkeypatch, tmp_path: Path):
+    config = SpreadConfig(
+        exchanges=[],
+        symbols=[],
+        tracker_db_path=str(tmp_path / "tracker.sqlite"),
+        startup_warmup_sec=20.0,
+        min_opportunity_volume_usd=0,
+    )
+    ws_mgr = WSManager(config)
+    ws_mgr.tracker = _FakeTracker()
+    ws_mgr.ml_analyzer = _FakeAnalyzer()
+    ws_mgr.engine.calculate_all = lambda on_spread=None, record_sink=None, rejection_sink=None: [_make_opportunity()]
     ws_mgr.mark_scanner_lite_interest()
-    ws_mgr._do_calc_enrich(None)
 
-    rows = ws_mgr.get_current_opportunities_lite()
-    assert len(rows) == 1
-    assert rows[0]["pairKey"] == "BTC|mexc|spot|gate|futures"
+    original_ready = market_data._market_data_ready
+    try:
+        market_data._market_data_ready = False
+        monkeypatch.setattr("src.spread.ws_manager.time.time", lambda: 110.0)
+        ws_mgr._startup_started_at = 100.0
+
+        published = ws_mgr._do_calc_enrich(False)
+
+        assert published == []
+        assert ws_mgr._startup_filtered_opportunities == 1
+        assert ws_mgr.get_current_opportunities_lite() == []
+
+        market_data._market_data_ready = True
+        monkeypatch.setattr("src.spread.ws_manager.time.time", lambda: 121.0)
+        published = ws_mgr._do_calc_enrich(False)
+
+        assert len(published) == 1
+        assert ws_mgr._startup_filtered_opportunities == 0
+    finally:
+        market_data._market_data_ready = original_ready

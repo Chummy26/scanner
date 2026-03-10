@@ -69,6 +69,7 @@
       </div>
       <div class="actions">
         <div id="model-badge" class="badge">Status desconhecido</div>
+        <div id="system-health-badge" class="badge info">Health desconhecido</div>
         <button id="refresh-btn" class="btn ghost">Atualizar</button>
       </div>
     </header>
@@ -127,10 +128,23 @@
         </div>
         <div id="table-shell" class="table-shell"></div>
       </section>
+
+      <section class="panel section" id="pipeline-section">
+        <div class="section-head">
+          <div>
+            <h2 class="title">Data Pipeline</h2>
+            <p class="note">Visibilidade operacional do snapshot scheduler, saúde da ingestão e ciclo de retrain automático.</p>
+          </div>
+          <div id="pipeline-updated-at" class="badge info">Sem status</div>
+        </div>
+        <div id="pipeline-shell" class="empty">Carregando status do pipeline...</div>
+      </section>
     </div>
   </div>
   <script>
     let dashboardPayload = {data: [], summary: {}};
+    let systemHealthPayload = {};
+    let pipelinePayload = {};
     let currentMode = "board";
     let fetchPromise = null;
     let fetchQueued = false;
@@ -165,6 +179,15 @@
       return `/api/v1/ml/dashboard/list?${params.toString()}`;
     }
 
+    async function fetchAuxiliary() {
+      const [healthResult, pipelineResult] = await Promise.allSettled([
+        fetch("/api/v1/system/health").then((response) => response.json()),
+        fetch("/api/v1/ml/pipeline/status").then((response) => response.json()),
+      ]);
+      systemHealthPayload = healthResult.status === "fulfilled" ? (healthResult.value || {}) : {};
+      pipelinePayload = pipelineResult.status === "fulfilled" ? (pipelineResult.value || {}) : {};
+    }
+
     async function fetchDashboard({force = false} = {}) {
       if (document.hidden && !force) return;
       if (fetchPromise) {
@@ -185,6 +208,7 @@
           data: listPayload.data || [],
           summary: summaryPayload.summary || listPayload.summary || {},
         };
+        await fetchAuxiliary();
         renderAll();
       }).finally(async () => {
         fetchPromise = null;
@@ -223,6 +247,29 @@
       badge.textContent = `Bundle degradado • ${bundleVersion}`;
     }
 
+    function setSystemHealthBadge(payload) {
+      const badge = document.getElementById("system-health-badge");
+      const verdict = String(payload.hour_verdict || "unknown").toLowerCase();
+      const rejection = Number(payload.rejection_rate_pct || 0).toFixed(1);
+      if (verdict === "healthy") {
+        badge.className = "badge good";
+        badge.textContent = `Health healthy • ${rejection}% rejeição`;
+        return;
+      }
+      if (verdict === "degraded") {
+        badge.className = "badge warn";
+        badge.textContent = `Health degraded • ${rejection}% rejeição`;
+        return;
+      }
+      if (verdict === "unhealthy") {
+        badge.className = "badge danger";
+        badge.textContent = `Health unhealthy • ${rejection}% rejeição`;
+        return;
+      }
+      badge.className = "badge info";
+      badge.textContent = "Health desconhecido";
+    }
+
     function renderSummary(summary) {
       const laneCounts = summary.lane_counts || {};
       document.getElementById("sum-total").textContent = summary.total || 0;
@@ -236,6 +283,47 @@
       document.getElementById("sum-latency").textContent = `${Number(summary.p99_inference_latency_ms_ready || 0).toFixed(1)}ms`;
       document.getElementById("updated-at").textContent = summary.updated_at ? `Atualizado em ${new Date(summary.updated_at).toLocaleTimeString("pt-BR", {hour12:false})}` : "Sem atualização";
       setModelBadge(summary);
+      setSystemHealthBadge(systemHealthPayload || {});
+    }
+
+    function renderPipelinePanel() {
+      const shell = document.getElementById("pipeline-shell");
+      const updated = document.getElementById("pipeline-updated-at");
+      const snapshots = pipelinePayload.snapshots || {};
+      const training = pipelinePayload.training || {};
+      const hourly = pipelinePayload.hourly_health || {};
+      const recent = Array.isArray(snapshots.recent) ? snapshots.recent : [];
+      updated.textContent = snapshots.last ? `Último snapshot ${snapshots.last}` : "Sem snapshots";
+      updated.className = `badge ${snapshots.last_verdict === "PASS" ? "good" : (snapshots.last_verdict === "FAIL" ? "danger" : "info")}`;
+      if (!snapshots.last && !training.last_run) {
+        shell.className = "empty";
+        shell.textContent = "Pipeline ainda sem snapshots ou retrains registrados.";
+        return;
+      }
+      shell.className = "";
+      shell.innerHTML = `
+        <div class="card-metrics" style="grid-template-columns:repeat(4,minmax(0,1fr))">
+          <div class="mini"><div class="k">Último snapshot</div><div class="v mono">${esc(snapshots.last || "--")}</div></div>
+          <div class="mini"><div class="k">Próximo snapshot</div><div class="v">${Math.round(Number(snapshots.next_in_sec || 0) / 60)}m</div></div>
+          <div class="mini"><div class="k">Último retrain</div><div class="v mono">${esc(training.last_run || "--")}</div></div>
+          <div class="mini"><div class="k">Modelo ativo</div><div class="v mono">${esc(training.model_version || "--")}</div></div>
+        </div>
+        <div class="chip-row" style="margin-top:14px">
+          <span class="chip good">${Number(snapshots.pass_7d || 0)} PASS / 7d</span>
+          <span class="chip ${Number(snapshots.fail_7d || 0) > 0 ? "danger" : ""}">${Number(snapshots.fail_7d || 0)} FAIL / 7d</span>
+          <span class="chip info">${Number(hourly.healthy_count || 0)} healthy / 24h</span>
+          <span class="chip warn">${Number(hourly.degraded_count || 0)} degraded / 24h</span>
+          <span class="chip ${Number(hourly.unhealthy_count || 0) > 0 ? "danger" : ""}">${Number(hourly.unhealthy_count || 0)} unhealthy / 24h</span>
+        </div>
+        <div class="muted" style="margin-top:14px;line-height:1.7">
+          Trigger atual: ${esc(training.retrain_trigger || "nenhum")}<br>
+          Último AUC challenger: ${Number(training.last_auc || 0).toFixed(3)}
+        </div>
+        <div style="margin-top:16px">
+          <strong style="display:block;margin-bottom:8px">Snapshots recentes</strong>
+          ${recent.length ? recent.slice(0, 4).map((item) => `<div class="inline-panel" style="padding:12px 14px;margin-top:8px"><strong>${esc(String(item.filename || "").replace("snapshot_", "").replace(".sqlite", ""))}</strong><div class="muted">Verdict ${esc(item.certification_verdict || "--")} • ${Number(item.record_count || 0).toLocaleString("pt-BR")} records • ${Number(item.episode_count || 0).toLocaleString("pt-BR")} episódios</div></div>`).join("") : '<div class="empty">Sem snapshots recentes.</div>'}
+        </div>
+      `;
     }
 
     function statusBadge(status) {
@@ -384,6 +472,7 @@
       } else {
         renderTable(data);
       }
+      renderPipelinePanel();
       renderMode();
     }
 

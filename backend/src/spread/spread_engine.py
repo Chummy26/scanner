@@ -323,6 +323,37 @@ class SpreadEngine:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _validate_cross_exchange_price(
+        symbol: str,
+        exchanges: Dict[str, Dict[str, OrderBookSnapshot]],
+        *,
+        max_divergence_pct: float = 30.0,
+    ) -> dict[str, set[str]]:
+        mids: dict[str, float] = {}
+        for exchange, markets in exchanges.items():
+            for market_type, snap in markets.items():
+                best_bid = float(getattr(snap, "best_bid", 0.0) or 0.0)
+                best_ask = float(getattr(snap, "best_ask", 0.0) or 0.0)
+                if best_bid > 0.0 and best_ask > 0.0:
+                    mids[f"{exchange}:{market_type}"] = (best_bid + best_ask) / 2.0
+        if len(mids) < 3:
+            return {"flagged_sources": set(), "flagged_exchanges": set()}
+        ordered = sorted(mids.values())
+        median_price = ordered[len(ordered) // 2]
+        if median_price <= 0.0:
+            return {"flagged_sources": set(), "flagged_exchanges": set()}
+        flagged_sources = {
+            key
+            for key, mid in mids.items()
+            if abs(float(mid) - float(median_price)) / float(median_price) * 100.0 > float(max_divergence_pct)
+        }
+        flagged_exchanges = {str(key.split(":", 1)[0]) for key in flagged_sources}
+        return {
+            "flagged_sources": flagged_sources,
+            "flagged_exchanges": flagged_exchanges,
+        }
+
+    @staticmethod
     def _calc_symbol(
         symbol: str,
         exchanges: Dict[str, Dict[str, OrderBookSnapshot]],
@@ -379,6 +410,8 @@ class SpreadEngine:
         opps: List[SpreadOpportunity] = []
         records: list = []
         rejections: list = []
+        cross_exchange_validation = SpreadEngine._validate_cross_exchange_price(symbol, exchanges)
+        flagged_sources = set(cross_exchange_validation.get("flagged_sources") or set())
 
         def _record_rejection(
             buy_ex: str,
@@ -388,6 +421,7 @@ class SpreadEngine:
             *,
             invalid_fields: list[str],
             reason: str,
+            affected_exchanges: list[str] | None = None,
         ) -> None:
             if not collect_records:
                 return
@@ -400,12 +434,28 @@ class SpreadEngine:
                     "sell_mt": sell_market_type,
                     "invalid_fields": list(invalid_fields),
                     "reason": str(reason),
+                    "affected_exchanges": list(affected_exchanges or []),
                 }
             )
 
         # ---------- spot_futures: buy spot, sell futures ----------
         for buy_ex, buy_snap, buy_bid, buy_ask in spot_src:
             for sell_ex, sell_snap, sell_bid, sell_ask in fut_src:
+                if f"{buy_ex}:spot" in flagged_sources or f"{sell_ex}:futures" in flagged_sources:
+                    _record_rejection(
+                        buy_ex,
+                        "spot",
+                        sell_ex,
+                        "futures",
+                        invalid_fields=[],
+                        reason="cross_exchange_price_divergence",
+                        affected_exchanges=[
+                            ex
+                            for ex in (buy_ex if f"{buy_ex}:spot" in flagged_sources else "", sell_ex if f"{sell_ex}:futures" in flagged_sources else "")
+                            if ex
+                        ],
+                    )
+                    continue
                 if buy_ask <= 0:
                     continue
                 entry_spread = (sell_bid / buy_ask - 1.0) * 100.0
@@ -475,6 +525,21 @@ class SpreadEngine:
                     continue
                 sell_ex, sell_snap, sell_bid, sell_ask = fut_src[j]
                 if buy_ex == sell_ex:
+                    continue
+                if f"{buy_ex}:futures" in flagged_sources or f"{sell_ex}:futures" in flagged_sources:
+                    _record_rejection(
+                        buy_ex,
+                        "futures",
+                        sell_ex,
+                        "futures",
+                        invalid_fields=[],
+                        reason="cross_exchange_price_divergence",
+                        affected_exchanges=[
+                            ex
+                            for ex in (buy_ex if f"{buy_ex}:futures" in flagged_sources else "", sell_ex if f"{sell_ex}:futures" in flagged_sources else "")
+                            if ex
+                        ],
+                    )
                     continue
 
                 entry_spread = (sell_bid / buy_ask - 1.0) * 100.0

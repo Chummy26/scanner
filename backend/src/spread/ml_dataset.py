@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -11,17 +11,9 @@ from typing import Any
 import numpy as np
 import torch
 
+from .feature_contracts import FEATURE_NAMES, build_feature_rows
 from .spread_tracker import SpreadRecord, compute_closed_episodes
 
-FEATURE_NAMES = [
-    "entry_spread", "exit_spread",
-    "delta_entry", "delta_exit",
-    "delta2_entry", "delta2_exit",
-    "rolling_std_entry", "rolling_std_exit",
-    "zscore_entry", "zscore_exit",
-]
-
-_ROLLING_WINDOW = 5
 _SQLITE_BLOCK_FETCH_CHUNK = 500
 _DEFAULT_REGIME_SHIFT_SCORE_THRESHOLD = 3.0
 _MIN_REGIME_WINDOW_RECORDS = 5
@@ -88,52 +80,6 @@ def canonicalize_record(record: dict[str, Any], fallback_ts: float) -> dict[str,
         "entry_spread": _coerce_float(record.get("entry", record.get("entry_spread_pct", 0.0)), 0.0),
         "exit_spread": _coerce_float(record.get("exit", record.get("exit_spread_pct", 0.0)), 0.0),
     }
-
-
-def _rolling_std_zscore(buffer: deque[float], current: float) -> tuple[float, float]:
-    if len(buffer) < 2:
-        return 0.0, 0.0
-    mean = sum(buffer) / len(buffer)
-    variance = sum((v - mean) ** 2 for v in buffer) / len(buffer)
-    std = math.sqrt(variance)
-    if std < 1e-6:
-        return 0.0, 0.0
-    zscore = (current - mean) / std
-    return std, zscore
-
-
-def _feature_window(window: list[dict[str, float]]) -> list[list[float]]:
-    features: list[list[float]] = []
-    previous_entry: float | None = None
-    previous_exit: float | None = None
-    previous_delta_entry: float | None = None
-    previous_delta_exit: float | None = None
-    entry_buffer: deque[float] = deque(maxlen=_ROLLING_WINDOW)
-    exit_buffer: deque[float] = deque(maxlen=_ROLLING_WINDOW)
-    for record in window:
-        entry_spread = record["entry_spread"]
-        exit_spread = record["exit_spread"]
-        delta_entry = 0.0 if previous_entry is None else entry_spread - previous_entry
-        delta_exit = 0.0 if previous_exit is None else exit_spread - previous_exit
-        delta2_entry = 0.0 if previous_delta_entry is None else delta_entry - previous_delta_entry
-        delta2_exit = 0.0 if previous_delta_exit is None else delta_exit - previous_delta_exit
-        entry_buffer.append(entry_spread)
-        exit_buffer.append(exit_spread)
-        rolling_std_entry, zscore_entry = _rolling_std_zscore(entry_buffer, entry_spread)
-        rolling_std_exit, zscore_exit = _rolling_std_zscore(exit_buffer, exit_spread)
-        features.append([
-            entry_spread, exit_spread,
-            delta_entry, delta_exit,
-            delta2_entry, delta2_exit,
-            rolling_std_entry, rolling_std_exit,
-            zscore_entry, zscore_exit,
-        ])
-        previous_entry = entry_spread
-        previous_exit = exit_spread
-        previous_delta_entry = delta_entry
-        previous_delta_exit = delta_exit
-    return features
-
 
 def _linear_percentile(values: list[float], percentile: float) -> float:
     if not values:
@@ -1124,6 +1070,11 @@ def build_dataset_bundle(
         if len(segment_records) < sequence_length:
             continue
         normalized_pair_id = str(segment.get("pair_id") or "")
+        segment_feature_rows = build_feature_rows(
+            segment_records,
+            feature_names=list(FEATURE_NAMES),
+            episodes=episodes,
+        )
         for start in range(len(segment_records) - sequence_length + 1):
             window = segment_records[start : start + sequence_length]
             unique_session_ids = {int(record.get("session_id") or 0) for record in window}
@@ -1145,7 +1096,7 @@ def build_dataset_bundle(
                 min_total_spread_pct=min_total_spread_pct,
             )
 
-            X_samples.append(_feature_window(window))
+            X_samples.append(segment_feature_rows[start : start + sequence_length])
             y_class.append(float(label["y_class"]))
             y_eta.append(float(label["y_eta"]))
             pair_ids.append(normalized_pair_id)

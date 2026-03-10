@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import time
 import threading
 import zlib
@@ -22,9 +23,30 @@ from .orderbook import OrderBook
 from .spread_engine import SpreadEngine
 from .spread_tracker import SpreadTracker
 from .ml_analyzer import SpreadMLAnalyzer
+from .ingest_health import ExchangeCircuitBreaker, HourlyHealthDigest
+from .auto_retrain import (
+    archive_expired_snapshots,
+    backend_out_root,
+    current_snapshot_slot,
+    latest_snapshot_entry,
+    latest_snapshot_timestamp,
+    latest_training_run,
+    launch_auto_retrain_worker,
+    load_snapshot_manifest,
+    load_training_manifest,
+    next_snapshot_slot,
+    seconds_until_next_snapshot_slot,
+    should_retrain,
+    snapshots_dir,
+    state_file_path,
+    training_dir,
+    update_snapshot_manifest,
+)
 from .exchanges import ALL_EXCHANGES
 from .exchanges.base import BaseExchangeWS
 from . import market_data
+from .runtime_audit import create_sqlite_snapshot
+from .train_model import certify_data_for_training
 
 logger = logging.getLogger(__name__)
 
@@ -91,9 +113,31 @@ class WSManager:
         self._SCANNER_LITE_INTEREST_TTL_SEC = 30.0
         self._last_scanner_lite_interest_perf = 0.0
         self._force_scanner_lite_refresh = False
+        self._startup_started_at = 0.0
+        self._startup_filtered_opportunities = 0
+        self._last_startup_gate_state: Dict[str, Any] = {
+            "warmup_elapsed_sec": 0.0,
+            "startup_warmup_sec": float(getattr(self.config, "startup_warmup_sec", 20.0) or 20.0),
+            "market_data_ready": False,
+            "allow_publication": False,
+            "warmup_remaining_sec": float(getattr(self.config, "startup_warmup_sec", 20.0) or 20.0),
+        }
 
         self._tracker_db_path = tracker_db_path
         self._tracker_db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._artifact_root = backend_out_root(self._tracker_db_path.parent.parent)
+        self._snapshots_dir = snapshots_dir(self._artifact_root)
+        self._training_dir = training_dir(self._artifact_root)
+        self._archive_dir = self._artifact_root / "archive"
+        self._auto_retrain_state_path = state_file_path(self._artifact_root)
+        self._circuit_breaker = ExchangeCircuitBreaker()
+        self._hourly_health_state: dict[str, Any] = {}
+        self._current_hour_bucket = int(time.time() // 3600)
+        self._last_health_digest: dict[str, Any] | None = None
+        self._latest_tracker_episode_total = 0
+        self._auto_retrain_process = None
+        self._last_reloaded_model_version = self.ml_analyzer.model_version
+        self.tracker.add_event_listener(self._on_tracker_event)
         restored = self.tracker.load_from_storage()
         if restored:
             logger.info("[WSManager] Restored tracker SQLite state (%s pairs)", restored)
@@ -128,6 +172,21 @@ class WSManager:
         # Smoothed cadence: a small fixed stride keeps tracker work spread
         # across time instead of creating 15s bursts that stall the scanner.
         return 5
+
+    def _startup_gate_state(self, *, now_ts: float | None = None) -> Dict[str, Any]:
+        current_ts = float(now_ts) if now_ts is not None else time.time()
+        started_at = float(self._startup_started_at or current_ts)
+        elapsed = max(0.0, current_ts - started_at)
+        warmup_sec = max(float(getattr(self.config, "startup_warmup_sec", 20.0) or 20.0), 0.0)
+        market_data_ready = bool(getattr(market_data, "_market_data_ready", False))
+        allow_publication = bool(market_data_ready and elapsed >= warmup_sec)
+        return {
+            "warmup_elapsed_sec": round(elapsed, 3),
+            "startup_warmup_sec": round(warmup_sec, 3),
+            "market_data_ready": market_data_ready,
+            "allow_publication": allow_publication,
+            "warmup_remaining_sec": round(max(warmup_sec - elapsed, 0.0), 3),
+        }
 
     def _tracker_capture_shards(self) -> int:
         capture_period_sec = self._tracker_cycle_every() * max(float(getattr(self.config, "broadcast_interval_sec", 0.15) or 0.15), 0.001)
@@ -280,6 +339,208 @@ class WSManager:
             )
         )
 
+    def _reset_hourly_health_state(self, bucket: int, *, now_ts: float) -> None:
+        tracker_stats = {}
+        if hasattr(self.tracker, "get_storage_stats"):
+            try:
+                tracker_stats = dict(self.tracker.get_storage_stats() or {})
+            except Exception:
+                tracker_stats = {}
+        self._current_hour_bucket = int(bucket)
+        self._hourly_health_state = {
+            "hour_start_ts": float(bucket * 3600),
+            "records_total": 0,
+            "records_rejected": 0,
+            "pairs_with_records": set(),
+            "pairs_with_gaps": set(),
+            "cross_exchange_flags": 0,
+            "book_age_sum": {},
+            "book_age_count": {},
+            "last_age_sample_ts": 0.0,
+            "episode_total_start": int(tracker_stats.get("episodes_total", 0) or 0),
+            "created_at": float(now_ts),
+        }
+
+    def _ensure_hourly_health_state(self, *, now_ts: float) -> None:
+        bucket = int(float(now_ts) // 3600)
+        if not self._hourly_health_state:
+            self._reset_hourly_health_state(bucket, now_ts=float(now_ts))
+            return
+        if bucket == self._current_hour_bucket:
+            return
+        digest = self._compute_hourly_digest((self._current_hour_bucket + 1) * 3600)
+        self._last_health_digest = digest.to_dict()
+        self.tracker.save_hourly_health_digest(self._last_health_digest)
+        if str(digest.quality_verdict) == "unhealthy":
+            self.tracker.disable_open_blocks(reason="unhealthy_ingest_period")
+        self._reset_hourly_health_state(bucket, now_ts=float(now_ts))
+
+    def _sample_book_ages(self, *, now_ts: float) -> None:
+        state = self._hourly_health_state
+        if (float(now_ts) - float(state.get("last_age_sample_ts", 0.0) or 0.0)) < 5.0:
+            return
+        for status in self._runtime_audit_exchange_statuses():
+            exchange = str(status.get("name") or "").strip().lower()
+            if not exchange:
+                continue
+            age = float(status.get("median_book_age_sec", 0.0) or 0.0)
+            sums = dict(state.get("book_age_sum") or {})
+            counts = dict(state.get("book_age_count") or {})
+            sums[exchange] = float(sums.get(exchange, 0.0) or 0.0) + age
+            counts[exchange] = int(counts.get(exchange, 0) or 0) + 1
+            state["book_age_sum"] = sums
+            state["book_age_count"] = counts
+        state["last_age_sample_ts"] = float(now_ts)
+
+    def _record_ingest_health(
+        self,
+        records: List[tuple],
+        rejections: List[dict[str, Any]],
+        *,
+        now_ts: float,
+    ) -> None:
+        self._ensure_hourly_health_state(now_ts=float(now_ts))
+        state = self._hourly_health_state
+        state["records_total"] = int(state.get("records_total", 0) or 0) + len(records) + len(rejections)
+        state["records_rejected"] = int(state.get("records_rejected", 0) or 0) + len(rejections)
+        pairs_with_records = state.get("pairs_with_records")
+        if isinstance(pairs_with_records, set):
+            for record in records:
+                pairs_with_records.add(self.tracker._pair_key(*record[:5]))
+        for rejection in rejections:
+            if str(rejection.get("reason") or "") == "cross_exchange_price_divergence":
+                state["cross_exchange_flags"] = int(state.get("cross_exchange_flags", 0) or 0) + 1
+        self._sample_book_ages(now_ts=float(now_ts))
+
+    def _compute_hourly_digest(self, hour_end_ts: float | None = None) -> HourlyHealthDigest:
+        state = dict(self._hourly_health_state)
+        end_ts = float(hour_end_ts if hour_end_ts is not None else ((self._current_hour_bucket + 1) * 3600))
+        records_total = int(state.get("records_total", 0) or 0)
+        records_rejected = int(state.get("records_rejected", 0) or 0)
+        rejection_rate_pct = (float(records_rejected) / float(records_total) * 100.0) if records_total > 0 else 0.0
+        breaker_snapshot = self._circuit_breaker.snapshot(now_ts=end_ts)
+        open_breakers = sorted(
+            exchange
+            for exchange, payload in breaker_snapshot.items()
+            if str(payload.get("state") or "") == "OPEN"
+        )
+        pairs_with_records = len(state.get("pairs_with_records") or set())
+        pairs_with_gaps = len(state.get("pairs_with_gaps") or set())
+        book_age_sum = dict(state.get("book_age_sum") or {})
+        book_age_count = dict(state.get("book_age_count") or {})
+        avg_book_age_sec = {
+            exchange: round(float(book_age_sum.get(exchange, 0.0) or 0.0) / max(int(book_age_count.get(exchange, 0) or 0), 1), 6)
+            for exchange in sorted(book_age_count)
+        }
+        exchanges_active = sum(
+            1
+            for status in self._runtime_audit_exchange_statuses()
+            if bool(status.get("ws_running", False)) and str(status.get("name") or "").strip().lower() not in set(open_breakers)
+        )
+        tracker_stats = {}
+        if hasattr(self.tracker, "get_storage_stats"):
+            try:
+                tracker_stats = dict(self.tracker.get_storage_stats() or {})
+            except Exception:
+                tracker_stats = {}
+        latest_episode_total = int(tracker_stats.get("episodes_total", 0) or 0)
+        episode_count = max(latest_episode_total - int(state.get("episode_total_start", 0) or 0), 0)
+        if rejection_rate_pct > 50.0 or len(open_breakers) >= 2 or pairs_with_records < max(1, int(len(self._last_filtered_opps) * 0.5)):
+            verdict = "unhealthy"
+        elif rejection_rate_pct >= 20.0 or len(open_breakers) == 1:
+            verdict = "degraded"
+        else:
+            verdict = "healthy"
+        return HourlyHealthDigest(
+            hour_start_ts=float(state.get("hour_start_ts", self._current_hour_bucket * 3600) or (self._current_hour_bucket * 3600)),
+            hour_end_ts=float(end_ts),
+            records_total=int(records_total),
+            records_rejected=int(records_rejected),
+            rejection_rate_pct=float(round(rejection_rate_pct, 6)),
+            exchanges_active=int(exchanges_active),
+            exchanges_circuit_open=open_breakers,
+            pairs_with_records=int(pairs_with_records),
+            pairs_with_gaps=int(pairs_with_gaps),
+            cross_exchange_flags=int(state.get("cross_exchange_flags", 0) or 0),
+            avg_book_age_sec=avg_book_age_sec,
+            episode_count=int(episode_count),
+            quality_verdict=str(verdict),
+        )
+
+    def _on_tracker_event(self, payload: dict[str, Any]) -> None:
+        if str(payload.get("kind") or "") != "tracker_record":
+            return
+        self._ensure_hourly_health_state(now_ts=float(payload.get("record_ts", time.time()) or time.time()))
+        if bool(payload.get("gap_detected")):
+            pairs_with_gaps = self._hourly_health_state.get("pairs_with_gaps")
+            if isinstance(pairs_with_gaps, set):
+                pairs_with_gaps.add(str(payload.get("pair_key") or ""))
+
+    def _apply_ingest_filters(
+        self,
+        opportunities: List[SpreadOpportunity],
+        records: List[tuple],
+        rejections: List[dict[str, Any]],
+        *,
+        now_ts: float,
+    ) -> tuple[List[SpreadOpportunity], List[tuple], List[dict[str, Any]]]:
+        if not records and not rejections:
+            self._record_ingest_health([], [], now_ts=float(now_ts))
+            return opportunities, records, rejections
+        filtered_records: List[tuple] = []
+        filtered_rejections = list(rejections)
+        allowed_keys: set[Any] = set()
+        for rejection in filtered_rejections:
+            affected = list(rejection.get("affected_exchanges") or [])
+            if not affected:
+                affected = [
+                    str(rejection.get("buy_ex") or "").strip().lower(),
+                    str(rejection.get("sell_ex") or "").strip().lower(),
+                ]
+            for exchange in {item for item in affected if item}:
+                self._circuit_breaker.record(exchange, accepted=False, now_ts=float(now_ts))
+        for record in records:
+            key = self.tracker._pair_key(*record[:5])
+            blocked = [
+                exchange
+                for exchange in {str(record[1] or "").strip().lower(), str(record[3] or "").strip().lower()}
+                if exchange and not self._circuit_breaker.is_active(exchange, now_ts=float(now_ts))
+            ]
+            if blocked:
+                filtered_rejections.append(
+                    {
+                        "symbol": str(record[0] or ""),
+                        "buy_ex": str(record[1] or ""),
+                        "buy_mt": str(record[2] or ""),
+                        "sell_ex": str(record[3] or ""),
+                        "sell_mt": str(record[4] or ""),
+                        "invalid_fields": [],
+                        "reason": "exchange_circuit_open",
+                        "affected_exchanges": blocked,
+                    }
+                )
+                for exchange in blocked:
+                    self._circuit_breaker.record(exchange, accepted=False, now_ts=float(now_ts))
+                continue
+            filtered_records.append(record)
+            allowed_keys.add(key)
+            for exchange in {str(record[1] or "").strip().lower(), str(record[3] or "").strip().lower()}:
+                if exchange:
+                    self._circuit_breaker.record(exchange, accepted=True, now_ts=float(now_ts))
+        filtered_opportunities = opportunities if not allowed_keys else [
+            opp
+            for opp in opportunities
+            if self.tracker._pair_key(
+                opp.asset,
+                opp.buy_exchange,
+                opp.buy_market_type,
+                opp.sell_exchange,
+                opp.sell_market_type,
+            ) in allowed_keys
+        ]
+        self._record_ingest_health(filtered_records, filtered_rejections, now_ts=float(now_ts))
+        return filtered_opportunities, filtered_records, filtered_rejections
+
     def _get_history_mirror(self, key: Any, *, limit: int = 100) -> List[Dict[str, float]]:
         with self._tracker_ingest_lock:
             history = self._tracker_history_mirror.get(key)
@@ -359,7 +620,10 @@ class WSManager:
             history = self._get_history_mirror(key, limit=100)
             history_fetch_ms += (time.perf_counter() - _history_started) * 1000.0
             _ml_started = time.perf_counter()
-            prediction = self.ml_analyzer.predict_history(history)
+            try:
+                prediction = self.ml_analyzer.predict_history(history, pair_key=key)
+            except TypeError:
+                prediction = self.ml_analyzer.predict_history(history)
             ml_analyze_ms += (time.perf_counter() - _ml_started) * 1000.0
             _render_started = time.perf_counter()
             rendered_ctx = self.ml_analyzer.render_prediction(
@@ -576,6 +840,9 @@ class WSManager:
         if self._running:
             return
         self._running = True
+        self._startup_started_at = time.time()
+        self._startup_filtered_opportunities = 0
+        self._last_startup_gate_state = self._startup_gate_state(now_ts=self._startup_started_at)
 
         # Auto-discover symbols (bounded) when config has a default/small list.
         exchange_symbols: Dict[str, Dict[str, set]] = {}
@@ -769,6 +1036,30 @@ class WSManager:
         )
         self._tasks.append(persist_task)
 
+        snapshot_task = asyncio.create_task(
+            self._snapshot_scheduler(),
+            name="snapshot_scheduler",
+        )
+        self._tasks.append(snapshot_task)
+
+        maintenance_task = asyncio.create_task(
+            self._db_maintenance(),
+            name="db_maintenance",
+        )
+        self._tasks.append(maintenance_task)
+
+        archive_task = asyncio.create_task(
+            self._archive_old_snapshots(),
+            name="archive_scheduler",
+        )
+        self._tasks.append(archive_task)
+
+        auto_retrain_task = asyncio.create_task(
+            self._auto_retrain_loop(),
+            name="auto_retrain",
+        )
+        self._tasks.append(auto_retrain_task)
+
         if self.runtime_audit is not None:
             audit_task = asyncio.create_task(
                 self._runtime_audit_loop(),
@@ -808,6 +1099,13 @@ class WSManager:
     async def stop(self):
         """Stop all connections and tasks."""
         self._running = False
+        try:
+            if self._hourly_health_state:
+                digest = self._compute_hourly_digest(time.time())
+                self._last_health_digest = digest.to_dict()
+                self.tracker.save_hourly_health_digest(self._last_health_digest)
+        except Exception:
+            pass
         for instance in self._exchange_instances.values():
             instance.stop()  # sets shutdown + cancels tasks in exchange loop
         for t in self._threads:
@@ -816,6 +1114,9 @@ class WSManager:
         for task in self._tasks:
             task.cancel()
         self._tasks.clear()
+        if self._auto_retrain_process is not None and self._auto_retrain_process.poll() is None:
+            self._auto_retrain_process.terminate()
+            self._auto_retrain_process = None
 
         await asyncio.to_thread(
             self._drain_tracker_ingest_batch,
@@ -856,6 +1157,8 @@ class WSManager:
             "tracker_cycle_every": self._tracker_cycle_every(),
             "tracker_cycle_offset": 2,
             "tracker_capture_shards": self._tracker_capture_shards(),
+            "startup_gate": dict(self._last_startup_gate_state),
+            "startup_filtered_opportunities": int(self._startup_filtered_opportunities),
             "scanner_lite_interest_age_sec": round(
                 max(0.0, time.perf_counter() - self._last_scanner_lite_interest_perf),
                 3,
@@ -876,6 +1179,66 @@ class WSManager:
             "tracker_db_size_bytes": int(tracker_stats.get("db_size_bytes", 0) or 0),
             "process_rss_mb": process_rss_mb,
             "process_threads": process_threads,
+        }
+
+    def get_system_health(self) -> dict[str, Any]:
+        latest_hour = self.tracker.get_latest_hourly_health() or self._last_health_digest or (
+            self._compute_hourly_digest(time.time()).to_dict() if self._hourly_health_state else {}
+        )
+        circuit_snapshot = self._circuit_breaker.snapshot()
+        latest_snapshot = latest_snapshot_entry(base_path=self._artifact_root) or {}
+        return {
+            "hour_verdict": str(latest_hour.get("quality_verdict") or "unknown"),
+            "rejection_rate_pct": float(latest_hour.get("rejection_rate_pct", 0.0) or 0.0),
+            "circuit_breakers": {
+                exchange: str(payload.get("state") or "CLOSED")
+                for exchange, payload in circuit_snapshot.items()
+                if str(payload.get("state") or "CLOSED") != "CLOSED"
+            },
+            "next_snapshot_sec": int(round(seconds_until_next_snapshot_slot())),
+            "last_snapshot": str(latest_snapshot.get("filename") or "").replace("snapshot_", "").replace(".sqlite", ""),
+            "last_snapshot_verdict": str(latest_snapshot.get("certification_verdict") or "unknown"),
+        }
+
+    def get_pipeline_status(self) -> dict[str, Any]:
+        snapshot_manifest = load_snapshot_manifest(base_path=self._artifact_root)
+        training_manifest = load_training_manifest(base_path=self._artifact_root)
+        now_ts = time.time()
+        recent_snapshots = list(snapshot_manifest.get("snapshots") or [])
+        last_7d = [
+            item
+            for item in recent_snapshots
+            if float(item.get("created_at_utc_ts", 0.0) or 0.0) >= (now_ts - (7 * 86400))
+        ]
+        latest_snapshot = latest_snapshot_entry(base_path=self._artifact_root) or {}
+        latest_run = latest_training_run(base_path=self._artifact_root) or {}
+        hourly = self.tracker.list_hourly_health(limit=24)
+        auto_state = self._read_auto_retrain_state()
+        return {
+            "snapshots": {
+                "last": str(latest_snapshot.get("filename") or "").replace("snapshot_", "").replace(".sqlite", ""),
+                "last_verdict": str(latest_snapshot.get("certification_verdict") or "unknown"),
+                "next_in_sec": int(round(seconds_until_next_snapshot_slot())),
+                "total_7d": len(last_7d),
+                "pass_7d": sum(1 for item in last_7d if str(item.get("certification_verdict") or "") == "PASS"),
+                "fail_7d": sum(1 for item in last_7d if str(item.get("certification_verdict") or "") == "FAIL"),
+                "recent": list(reversed(recent_snapshots[-10:])),
+            },
+            "training": {
+                "last_run": str(latest_run.get("run_id") or ""),
+                "last_auc": float(latest_run.get("challenger_auc", 0.0) or 0.0) if latest_run else 0.0,
+                "model_version": self.ml_analyzer.model_version,
+                "deployed_at": str(auto_state.get("updated_at_utc") or ""),
+                "retrain_trigger": str(auto_state.get("reason") or "") if str(auto_state.get("status") or "") in {"queued", "running", "failed"} else None,
+                "auto_state": auto_state,
+                "run_count": len(list(training_manifest.get("runs") or [])),
+            },
+            "hourly_health": {
+                "last_24h": [str(item.get("quality_verdict") or "unknown") for item in reversed(hourly)],
+                "healthy_count": sum(1 for item in hourly if str(item.get("quality_verdict") or "") == "healthy"),
+                "degraded_count": sum(1 for item in hourly if str(item.get("quality_verdict") or "") == "degraded"),
+                "unhealthy_count": sum(1 for item in hourly if str(item.get("quality_verdict") or "") == "unhealthy"),
+            },
         }
 
     async def _market_data_loop(self):
@@ -961,8 +1324,8 @@ class WSManager:
         capture_mode = str(getattr(self.config, "tracker_capture_mode", "continuous_all_pairs") or "continuous_all_pairs").strip().lower()
         capture_tracker_records = bool(capture_tracker and capture_mode == "continuous_all_pairs")
         tracker_shard_count = self._tracker_capture_shards()
-        raw_capture_records = [] if capture_tracker_records else None
-        raw_capture_rejections = [] if capture_tracker_records else None
+        raw_capture_records: List[tuple] = []
+        raw_capture_rejections: List[dict[str, Any]] = []
         try:
             opportunities = self.engine.calculate_all(
                 on_spread=None,
@@ -981,6 +1344,12 @@ class WSManager:
         _perf_after_calc = time.perf_counter()
 
         now_ts = time.time()
+        opportunities, raw_capture_records, raw_capture_rejections = self._apply_ingest_filters(
+            opportunities,
+            list(raw_capture_records or []),
+            list(raw_capture_rejections or []),
+            now_ts=float(now_ts),
+        )
 
         # --- 2. Volume / funding / futures-meta / deposit-withdraw enrichment -----
         _get_vol = market_data.get_volume
@@ -1115,6 +1484,15 @@ class WSManager:
                 and _vol_ok(getattr(opp, "_raw_sell_vol", -1.0))
             ]
         _perf_after_filter = time.perf_counter()
+        record_source_opportunities = list(opportunities)
+        startup_gate = self._startup_gate_state(now_ts=now_ts)
+        self._last_startup_gate_state = dict(startup_gate)
+        published_opportunities = opportunities
+        if not bool(startup_gate.get("allow_publication")):
+            self._startup_filtered_opportunities = len(opportunities)
+            published_opportunities = []
+        else:
+            self._startup_filtered_opportunities = 0
 
         _records_batch = []
         queued_records = 0
@@ -1122,7 +1500,7 @@ class WSManager:
         if capture_tracker_records:
             _records_batch = list(raw_capture_records or [])
         elif capture_tracker:
-            for opp in opportunities:
+            for opp in record_source_opportunities:
                 record = (
                     opp.asset,
                     opp.buy_exchange,
@@ -1140,7 +1518,7 @@ class WSManager:
                 capture_shard=int(capture_shard),
                 shard_count=tracker_shard_count,
             )
-        if raw_capture_rejections:
+        if raw_capture_rejections and capture_tracker_records:
             queued_rejections = self._queue_tracker_rejections(
                 list(raw_capture_rejections),
                 capture_shard=int(capture_shard),
@@ -1149,7 +1527,7 @@ class WSManager:
         _perf_after_batch_record = time.perf_counter()
 
         if self._should_refresh_scanner_lite_state():
-            self._refresh_scanner_lite_state(opportunities)
+            self._refresh_scanner_lite_state(published_opportunities)
         _perf_after_lite_refresh = time.perf_counter()
 
         _t_end = time.time()
@@ -1173,7 +1551,7 @@ class WSManager:
                     "ml_render_ms": round(_ml_render_ms, 6),
                     "lite_refresh_ms": round((_perf_after_lite_refresh - _perf_after_batch_record) * 1000.0, 6),
                     "opportunities_before_filter": len(self.engine._opportunities),
-                    "opportunities_after_filter": len(opportunities),
+                    "opportunities_after_filter": len(published_opportunities),
                     "refresh_tracker": bool(refresh_tracker),
                     "tracker_cache_size": len(tracker_cache or {}),
                     "ml_cache_size": self._ml_cache_size(),
@@ -1184,9 +1562,12 @@ class WSManager:
                     "tracker_pending_records": self._tracker_pending_record_count(),
                     "tracker_pending_rejections": self._tracker_pending_rejection_count(),
                     "tracker_capture_shards": tracker_shard_count,
+                    "startup_gate_open": 1 if startup_gate.get("allow_publication") else 0,
+                    "startup_filtered_opportunities": int(self._startup_filtered_opportunities),
+                    "market_data_ready": 1 if startup_gate.get("market_data_ready") else 0,
                 }
             )
-        return opportunities
+        return published_opportunities
 
     async def _calc_and_broadcast_loop(self):
         """Periodically calculate spreads and broadcast to scanner clients."""
@@ -1481,6 +1862,147 @@ class WSManager:
                 if self.runtime_audit is not None:
                     self.runtime_audit.record_error("tracker_persist", str(e))
 
+    def _snapshot_path_for_slot(self, slot_time: datetime) -> Path:
+        label = slot_time.astimezone(timezone.utc).strftime("%Y-%m-%d_%Hh")
+        self._snapshots_dir.mkdir(parents=True, exist_ok=True)
+        return self._snapshots_dir / f"snapshot_{label}.sqlite"
+
+    async def _create_snapshot_for_slot(self, slot_time: datetime) -> Path | None:
+        target = self._snapshot_path_for_slot(slot_time)
+        if target.exists():
+            return target
+        await asyncio.to_thread(self._drain_tracker_ingest_batch, now_ts=time.time(), drain_all=True)
+        await asyncio.to_thread(self.tracker.flush_to_storage, force=True)
+        await asyncio.to_thread(create_sqlite_snapshot, self.tracker.db_path, target)
+        certification = await asyncio.to_thread(
+            certify_data_for_training,
+            state_file=target,
+            certification_mode="quick",
+        )
+        cert_path = target.with_suffix(".cert.json")
+        cert_path.write_text(json.dumps(certification, indent=2, sort_keys=True), encoding="utf-8")
+        update_snapshot_manifest(target, certification, base_path=self._artifact_root)
+        return target
+
+    async def _snapshot_scheduler(self):
+        while self._running:
+            try:
+                await asyncio.sleep(seconds_until_next_snapshot_slot())
+                slot_time = current_snapshot_slot(datetime.now(timezone.utc))
+                snapshot_path = await self._create_snapshot_for_slot(slot_time)
+                if snapshot_path is not None:
+                    logger.info("[Snapshot] Created %s", snapshot_path.name)
+                await self._evaluate_auto_retrain(force_check=True)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("[Snapshot] Failed: %s", exc)
+                if self.runtime_audit is not None:
+                    self.runtime_audit.record_error("snapshot_scheduler", str(exc))
+                await asyncio.sleep(30.0)
+
+    def _run_db_cleanup(self, cutoff: float) -> None:
+        with self.tracker._connect() as conn:
+            conn.execute("DELETE FROM tracker_records WHERE ts < ?", (float(cutoff),))
+            conn.execute("DELETE FROM tracker_events WHERE ts < ?", (float(cutoff),))
+            conn.execute("DELETE FROM tracker_pair_episodes WHERE end_ts < ?", (float(cutoff),))
+            conn.execute(
+                """
+                DELETE FROM tracker_pair_blocks
+                WHERE end_ts < ? AND is_open = 0
+                """,
+                (float(cutoff),),
+            )
+            if self.tracker.db_path is not None:
+                conn.execute("DELETE FROM tracker_hourly_health WHERE hour_end_ts < ?", (float(cutoff),))
+        with sqlite3.connect(self.tracker.db_path, timeout=30.0) as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.execute("VACUUM")
+
+    async def _db_maintenance(self):
+        while self._running:
+            try:
+                await asyncio.sleep(24 * 60 * 60)
+                latest_snapshot = latest_snapshot_entry(base_path=self._artifact_root)
+                if latest_snapshot is None:
+                    continue
+                cutoff = time.time() - (8 * 86400)
+                snapshot_range = list(latest_snapshot.get("record_time_range") or [0.0, 0.0])
+                if float(snapshot_range[0] or 0.0) > cutoff:
+                    continue
+                await asyncio.to_thread(self._run_db_cleanup, cutoff)
+                logger.info("[Maintenance] DB cleanup completed")
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("[Maintenance] Failed: %s", exc)
+                if self.runtime_audit is not None:
+                    self.runtime_audit.record_error("db_maintenance", str(exc))
+
+    async def _archive_old_snapshots(self):
+        while self._running:
+            try:
+                await asyncio.sleep(7 * 24 * 60 * 60)
+                moved = await asyncio.to_thread(archive_expired_snapshots, base_path=self._artifact_root)
+                if moved:
+                    logger.info("[Archive] Moved %s snapshots", len(moved))
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("[Archive] Failed: %s", exc)
+                if self.runtime_audit is not None:
+                    self.runtime_audit.record_error("archive_scheduler", str(exc))
+
+    def _read_auto_retrain_state(self) -> dict[str, Any]:
+        if not self._auto_retrain_state_path.is_file():
+            return {}
+        try:
+            return json.loads(self._auto_retrain_state_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _maybe_reload_deployed_model(self) -> None:
+        deployed_version = ""
+        metadata_path = self._artifact_root / "config" / "best_lstm_model.meta.json"
+        if metadata_path.is_file():
+            try:
+                deployed_version = str(json.loads(metadata_path.read_text(encoding="utf-8")).get("version") or "")
+            except Exception:
+                deployed_version = ""
+        if deployed_version and deployed_version != self._last_reloaded_model_version:
+            self.ml_analyzer.reload_artifact()
+            self._last_reloaded_model_version = self.ml_analyzer.model_version
+
+    async def _evaluate_auto_retrain(self, *, force_check: bool = False) -> None:
+        if self._auto_retrain_process is not None and self._auto_retrain_process.poll() is None:
+            return
+        if self._auto_retrain_process is not None and self._auto_retrain_process.poll() is not None:
+            self._auto_retrain_process = None
+            self._maybe_reload_deployed_model()
+        reason = should_retrain(base_path=self._artifact_root, model_dir=self._artifact_root / "config")
+        if reason is None and not force_check:
+            return
+        if reason is None:
+            return
+        self._auto_retrain_process = launch_auto_retrain_worker(
+            reason=reason,
+            tracker_db_path=self._tracker_db_path,
+            base_path=self._artifact_root,
+        )
+        logger.info("[Retrain] Launched auto retrain worker (%s)", reason)
+
+    async def _auto_retrain_loop(self):
+        while self._running:
+            try:
+                await asyncio.sleep(60 * 60)
+                await self._evaluate_auto_retrain()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("[Retrain] Scheduler failed: %s", exc)
+                if self.runtime_audit is not None:
+                    self.runtime_audit.record_error("auto_retrain_loop", str(exc))
+
     def _runtime_audit_exchange_statuses(self) -> list[dict]:
         statuses: list[dict] = []
         for ex_name, instance in self._exchange_instances.items():
@@ -1644,6 +2166,8 @@ class WSManager:
             "exchanges": self.engine.get_connected_exchanges(),
             "summary": self.engine.get_snapshot_summary(),
             "scanner_clients": len(self._scanner_clients),
+            "startup_gate": dict(self._last_startup_gate_state),
+            "startup_filtered_opportunities": int(self._startup_filtered_opportunities),
             "feed_modes": {
                 name: {
                     "spot": instance.get_feed_mode("spot"),

@@ -8,6 +8,8 @@ from src.server import (
     handle_ml_dashboard_detail_api,
     handle_ml_dashboard_list_api,
     handle_ml_dashboard_summary_api,
+    handle_ml_pipeline_status,
+    handle_system_health_api,
 )
 from src.spread.perf_monitor import RuntimePerfMonitor
 
@@ -45,6 +47,16 @@ class _FakeWSManager:
 
     def get_perf_state(self):
         return {"ml_cache_size": 3, "scanner_lite_rows": len(self._lite_rows)}
+
+    def get_system_health(self):
+        return {"hour_verdict": "healthy", "rejection_rate_pct": 1.5, "circuit_breakers": {}, "next_snapshot_sec": 600, "last_snapshot": "2026-03-10_08h", "last_snapshot_verdict": "PASS"}
+
+    def get_pipeline_status(self):
+        return {
+            "snapshots": {"last": "2026-03-10_08h", "last_verdict": "PASS", "next_in_sec": 600, "total_7d": 3, "pass_7d": 3, "fail_7d": 0, "recent": []},
+            "training": {"last_run": "run_1", "last_auc": 0.71, "model_version": "bundle-v2", "deployed_at": "2026-03-10T08:00:00Z", "retrain_trigger": None, "auto_state": {}, "run_count": 1},
+            "hourly_health": {"last_24h": ["healthy"], "healthy_count": 1, "degraded_count": 0, "unhealthy_count": 0},
+        }
 
 
 def test_ml_dashboard_api_sorts_ready_rows_by_probability_and_returns_summary():
@@ -478,3 +490,24 @@ def test_ml_dashboard_prefers_runtime_signal_reason_code_for_low_total_spread_bl
     assert payload["data"][0]["signal_reason_code"] == "median_total_spread_below_threshold"
     assert payload["data"][0]["action_lane"] == "blocked"
     assert "mínimo operacional" in payload["data"][0]["operator_message"]
+
+
+def test_system_health_api_returns_runtime_health_payload():
+    request = _FakeRequest({"ws_manager": _FakeWSManager([])})
+
+    response = asyncio.run(handle_system_health_api(request))
+    payload = json.loads(response.text)
+
+    assert payload["hour_verdict"] == "healthy"
+    assert payload["last_snapshot_verdict"] == "PASS"
+
+
+def test_ml_pipeline_status_api_returns_pipeline_summary():
+    request = _FakeRequest({"ws_manager": _FakeWSManager([])})
+
+    response = asyncio.run(handle_ml_pipeline_status(request))
+    payload = json.loads(response.text)
+
+    assert payload["snapshots"]["last"] == "2026-03-10_08h"
+    assert payload["training"]["model_version"] == "bundle-v2"
+    assert payload["hourly_health"]["healthy_count"] == 1

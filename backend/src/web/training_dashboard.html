@@ -67,6 +67,7 @@
         <p class="subtitle">Fluxo padrão: sessões contínuas e sem anomalia entram automaticamente na coorte. O operador só intervém nas exceções, bloqueios e rupturas reais antes de treinar.</p>
       </div>
       <div class="actions">
+        <div id="system-health-badge" class="badge info">Health desconhecido</div>
         <button id="refresh-btn" class="btn ghost">Atualizar</button>
         <button id="preview-btn" class="btn ghost">Refazer preview</button>
         <button id="resegment-btn" class="btn warn">Resegmentar fechadas</button>
@@ -150,12 +151,25 @@
             <strong>Regra operacional:</strong> se uma sessão cair na inbox de exceções, ela precisa de decisão humana antes de entrar no preview. O operador não precisa varrer bloco a bloco em sessões normais.
           </div>
         </section>
+
+        <section class="panel aside-card">
+          <div class="section-head">
+            <div>
+              <h2 class="title">Data Pipeline</h2>
+              <p class="note">Snapshots, saúde da ingestão e estado do retrain automático.</p>
+            </div>
+            <div id="pipeline-status" class="badge">Sem status</div>
+          </div>
+          <div id="pipeline-shell"></div>
+        </section>
       </aside>
     </div>
   </div>
   <script>
     let sessionsPayload = {sessions: [], summary: {}, config: {}};
     let previewPayload = {sessions: [], folds: [], summary: {}};
+    let systemHealthPayload = {};
+    let pipelinePayload = {};
     let currentRunId = null;
     const exceptionCache = new Map();
     const expanded = new Set();
@@ -168,6 +182,15 @@
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
       return payload;
+    }
+    async function refreshPipeline() {
+      const [healthResult, pipelineResult] = await Promise.allSettled([
+        fetchJson("/api/v1/system/health"),
+        fetchJson("/api/v1/ml/pipeline/status"),
+      ]);
+      systemHealthPayload = healthResult.status === "fulfilled" ? (healthResult.value || {}) : {};
+      pipelinePayload = pipelineResult.status === "fulfilled" ? (pipelineResult.value || {}) : {};
+      renderPipeline();
     }
     function approvedSessionIds() { return (previewPayload.sessions || []).map((session) => Number(session.id)); }
     function setBadge(id, text, kind = "") { const node = document.getElementById(id); node.className = `badge ${kind}`.trim(); node.textContent = text; }
@@ -205,6 +228,37 @@
       document.getElementById("sum-folds").textContent = previewSummary.fold_count || 0;
       document.getElementById("sum-folds-detail").textContent = `${previewSummary.eligible_blocks || 0} blocos elegíveis`;
       document.getElementById("gap-input").value = Number((sessionsPayload.config || {}).gap_threshold_sec || 0).toFixed(0);
+      const healthVerdict = String((systemHealthPayload || {}).hour_verdict || "unknown").toLowerCase();
+      setBadge(
+        "system-health-badge",
+        healthVerdict === "unknown" ? "Health desconhecido" : `Health ${healthVerdict}`,
+        healthVerdict === "healthy" ? "good" : (healthVerdict === "degraded" ? "warn" : (healthVerdict === "unhealthy" ? "danger" : "info")),
+      );
+    }
+    function renderPipeline() {
+      const root = document.getElementById("pipeline-shell");
+      const status = document.getElementById("pipeline-status");
+      const snapshots = pipelinePayload.snapshots || {};
+      const training = pipelinePayload.training || {};
+      const hourly = pipelinePayload.hourly_health || {};
+      status.textContent = snapshots.last ? `Snapshot ${snapshots.last}` : "Sem snapshots";
+      status.className = `badge ${snapshots.last_verdict === "PASS" ? "good" : (snapshots.last_verdict === "FAIL" ? "danger" : "info")}`;
+      root.innerHTML = `
+        <div class="inline-panel">
+          <div><strong>Último snapshot:</strong> ${esc(snapshots.last || "--")} (${esc(snapshots.last_verdict || "--")})</div>
+          <div class="muted" style="margin-top:6px">Próximo em ${Math.round(Number(snapshots.next_in_sec || 0) / 60)}m • ${Number(snapshots.pass_7d || 0)} PASS / 7d • ${Number(snapshots.fail_7d || 0)} FAIL / 7d</div>
+        </div>
+        <div class="inline-panel" style="margin-top:12px">
+          <div><strong>Modelo ativo:</strong> ${esc(training.model_version || "--")}</div>
+          <div class="muted" style="margin-top:6px">Último retrain ${esc(training.last_run || "--")} • AUC ${Number(training.last_auc || 0).toFixed(3)}</div>
+          <div class="muted" style="margin-top:6px">Trigger atual: ${esc(training.retrain_trigger || "nenhum")}</div>
+        </div>
+        <div class="chip-row" style="margin-top:12px">
+          <span class="chip good">${Number(hourly.healthy_count || 0)} healthy</span>
+          <span class="chip warn">${Number(hourly.degraded_count || 0)} degraded</span>
+          <span class="chip ${Number(hourly.unhealthy_count || 0) > 0 ? "danger" : ""}">${Number(hourly.unhealthy_count || 0)} unhealthy</span>
+        </div>
+      `;
     }
     function metricGrid(session) {
       return `<div class="session-meta"><div class="stat"><div class="k">Captura</div><div class="v">${fmtTs(session.started_at)}</div><div class="muted">${fmtDuration(session.capture_duration_sec)}</div></div><div class="stat"><div class="k">Dados</div><div class="v">${fmtTs(session.data_start_ts)}</div><div class="muted">${fmtTs(session.data_end_ts)} • ${fmtDuration(session.data_duration_sec)}</div></div><div class="stat"><div class="k">Cobertura</div><div class="v">${session.symbol_count} símbolos</div><div class="muted">${session.pair_count} pares</div></div><div class="stat"><div class="k">Blocos</div><div class="v">${session.block_count}</div><div class="muted">${session.trainable_block_count} treináveis</div></div></div>`;
@@ -262,7 +316,7 @@
         document.getElementById("sum-run-detail").textContent = "Sem treino em andamento";
       }
     }
-    async function refreshAll() { setBadge("session-status", "Atualizando"); try { await Promise.all([refreshSessions(), refreshPreview(), refreshLatestRun()]); setBadge("session-status", "Fluxo coerente", "good"); } catch (error) { setBadge("session-status", error.message, "danger"); } }
+    async function refreshAll() { setBadge("session-status", "Atualizando"); try { await Promise.all([refreshSessions(), refreshPreview(), refreshLatestRun(), refreshPipeline()]); setBadge("session-status", "Fluxo coerente", "good"); } catch (error) { setBadge("session-status", error.message, "danger"); } }
     async function toggleSessionApproval(sessionId, approved) {
       const payload = {approved_for_training: approved};
       if (!approved) { const reason = window.prompt("Motivo curto para excluir a sessão do treino:", "continuidade ruim"); if (reason === null) return; payload.excluded_reason = reason; }

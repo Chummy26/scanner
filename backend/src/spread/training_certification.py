@@ -66,6 +66,47 @@ def _iter_ndjson(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _load_hourly_health_samples(state_path: Path) -> list[dict[str, Any]]:
+    if not Path(state_path).is_file():
+        return []
+    try:
+        with sqlite3.connect(state_path, timeout=30.0) as conn:
+            rows = list(
+                conn.execute(
+                    """
+                    SELECT hour_start_ts, hour_end_ts, records_total, records_rejected, rejection_rate_pct,
+                           exchanges_active, exchanges_circuit_open_json, pairs_with_records, pairs_with_gaps,
+                           cross_exchange_flags, avg_book_age_json, episode_count, quality_verdict, created_at
+                    FROM tracker_hourly_health
+                    ORDER BY hour_start_ts ASC
+                    """
+                )
+            )
+    except sqlite3.Error:
+        return []
+    payload: list[dict[str, Any]] = []
+    for row in rows:
+        payload.append(
+            {
+                "hour_start_ts": float(row[0] or 0.0),
+                "hour_end_ts": float(row[1] or 0.0),
+                "records_total": int(row[2] or 0),
+                "records_rejected": int(row[3] or 0),
+                "rejection_rate_pct": float(row[4] or 0.0),
+                "exchanges_active": int(row[5] or 0),
+                "exchanges_circuit_open": list(json.loads(str(row[6] or "[]"))),
+                "pairs_with_records": int(row[7] or 0),
+                "pairs_with_gaps": int(row[8] or 0),
+                "cross_exchange_flags": int(row[9] or 0),
+                "avg_book_age_sec": dict(json.loads(str(row[10] or "{}"))),
+                "episode_count": int(row[11] or 0),
+                "quality_verdict": str(row[12] or "healthy"),
+                "created_at": float(row[13] or 0.0),
+            }
+        )
+    return payload
+
+
 def _percentile(values: list[float], percentile: float) -> float:
     if not values:
         return 0.0
@@ -674,13 +715,14 @@ def run_training_certification(
                 midpoint = feature_view.shape[0] // 2
                 first_half = feature_view[:midpoint]
                 second_half = feature_view[midpoint:]
+                feature_names = list(getattr(bundle, "feature_names", FEATURE_NAMES[: feature_view.shape[1]]))
                 if first_half.size and second_half.size:
-                    for index, feature_name in enumerate(FEATURE_NAMES):
+                    for index, feature_name in enumerate(feature_names):
                         metrics = _score_shift(first_half[:, index].tolist(), second_half[:, index].tolist())
                         if float(metrics["score"]) > 3.0:
                             drifted_features.append({"feature": feature_name, **metrics})
             gate05_status = "FAIL" if len(drifted_features) > 3 else ("WARNING" if drifted_features else "PASS")
-            _persist_gate(_build_gate("gate_05_intra_soak_feature_drift", "Intra-soak feature drift", status=gate05_status, failure_reasons=["intra_soak_feature_drift"] if len(drifted_features) > 3 else [], warnings=["intra_soak_feature_drift"] if 0 < len(drifted_features) <= 3 else [], details={"drifted_features": drifted_features, "feature_count": len(FEATURE_NAMES)}))
+            _persist_gate(_build_gate("gate_05_intra_soak_feature_drift", "Intra-soak feature drift", status=gate05_status, failure_reasons=["intra_soak_feature_drift"] if len(drifted_features) > 3 else [], warnings=["intra_soak_feature_drift"] if 0 < len(drifted_features) <= 3 else [], details={"drifted_features": drifted_features, "feature_count": len(getattr(bundle, "feature_names", FEATURE_NAMES)) if bundle is not None else len(FEATURE_NAMES)}))
 
         _check_timeout()
         total_spreads = [float(getattr(item, "total_spread", 0.0) or 0.0) for item in episodes]
@@ -700,7 +742,33 @@ def run_training_certification(
 
         _check_timeout()
         if certification_mode == "quick":
-            _skip_gate("gate_07_book_health", "Book health", "quick_mode_skipped")
+            hourly_health = _load_hourly_health_samples(state_path)
+            if not hourly_health:
+                _skip_gate("gate_07_book_health", "Book health", "quick_mode_skipped")
+            else:
+                gate07_failures = []
+                unhealthy_count = sum(1 for item in hourly_health if str(item.get("quality_verdict") or "") == "unhealthy")
+                degraded_count = sum(1 for item in hourly_health if str(item.get("quality_verdict") or "") == "degraded")
+                rejection_rates = [float(item.get("rejection_rate_pct", 0.0) or 0.0) for item in hourly_health]
+                if unhealthy_count > 0:
+                    gate07_failures.append("hourly_health_unhealthy")
+                if _percentile(rejection_rates, 95.0) > 50.0:
+                    gate07_failures.append("hourly_rejection_rate_failed")
+                _persist_gate(
+                    _build_gate(
+                        "gate_07_book_health",
+                        "Book health",
+                        status="FAIL" if gate07_failures else ("WARNING" if degraded_count > 0 else "PASS"),
+                        failure_reasons=gate07_failures,
+                        warnings=["hourly_health_degraded"] if degraded_count > 0 and not gate07_failures else [],
+                        details={
+                            "hourly_health_sample_count": len(hourly_health),
+                            "unhealthy_hours": unhealthy_count,
+                            "degraded_hours": degraded_count,
+                            "rejection_rate_pct_p95": _percentile(rejection_rates, 95.0),
+                        },
+                    )
+                )
             _skip_gate("gate_09_runtime_audit_sqlite_consistency", "Runtime audit to SQLite consistency", "quick_mode_skipped")
             _skip_gate("gate_11_runtime_audit_health", "Runtime audit health", "quick_mode_skipped")
         else:

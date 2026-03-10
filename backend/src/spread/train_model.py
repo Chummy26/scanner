@@ -28,6 +28,10 @@ from sklearn.metrics import (
 )
 from torch.utils.data import DataLoader, TensorDataset
 
+from .feature_contracts import (
+    DEFAULT_FEATURE_CONTRACT_VERSION,
+    feature_contract_version_for_names,
+)
 from .ml_dataset import (
     DatasetBundle,
     build_dataset_bundle,
@@ -1645,6 +1649,7 @@ def run_training_loop(
         "max_session_gap_sec": None if max_session_gap_sec is None else float(max_session_gap_sec),
         "regime_shift_score_threshold": None if regime_shift_score_threshold is None else float(regime_shift_score_threshold),
         "psi_reference": feature_monitoring["psi_reference"],
+        "feature_contract_version": feature_contract_version_for_names(list(bundle.feature_names)) or DEFAULT_FEATURE_CONTRACT_VERSION,
     }
     if certification_context:
         training_config_payload["certification_id"] = str(certification_context.get("certification_id") or "")
@@ -1682,6 +1687,7 @@ def run_training_loop(
         dataset_summary=dataset_summary,
         split_summary=split_summary,
         training_config=training_config_payload,
+        feature_contract_version=feature_contract_version_for_names(list(bundle.feature_names)) or DEFAULT_FEATURE_CONTRACT_VERSION,
         use_attention=True,
         trained_at_utc=datetime.now(timezone.utc).isoformat(),
         dataset_fingerprint=_build_dataset_fingerprint(

@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 
+from .feature_contracts import build_feature_rows
+
 logger = logging.getLogger(__name__)
 
 PairKey = Tuple[str, str, str, str, str]
@@ -553,6 +555,7 @@ class SpreadTracker:
         self.quality_fix_activated_at: float = 0.0
         self._hot_path_rejection_stats = self._empty_hot_path_rejection_stats()
         self._hot_path_rejection_stats_dirty = False
+        self._feature_history_cache: dict[tuple[PairKey, tuple[str, ...], int], dict[str, Any]] = {}
         if self.db_path is not None:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             self._initialize_storage()
@@ -957,6 +960,22 @@ class SpreadTracker:
                     FOREIGN KEY(session_id) REFERENCES tracker_capture_sessions(id) ON DELETE CASCADE,
                     FOREIGN KEY(block_id) REFERENCES tracker_pair_blocks(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS tracker_hourly_health (
+                    hour_start_ts REAL PRIMARY KEY,
+                    hour_end_ts REAL NOT NULL,
+                    records_total INTEGER NOT NULL DEFAULT 0,
+                    records_rejected INTEGER NOT NULL DEFAULT 0,
+                    rejection_rate_pct REAL NOT NULL DEFAULT 0.0,
+                    exchanges_active INTEGER NOT NULL DEFAULT 0,
+                    exchanges_circuit_open_json TEXT NOT NULL DEFAULT '[]',
+                    pairs_with_records INTEGER NOT NULL DEFAULT 0,
+                    pairs_with_gaps INTEGER NOT NULL DEFAULT 0,
+                    cross_exchange_flags INTEGER NOT NULL DEFAULT 0,
+                    avg_book_age_json TEXT NOT NULL DEFAULT '{}',
+                    episode_count INTEGER NOT NULL DEFAULT 0,
+                    quality_verdict TEXT NOT NULL DEFAULT 'healthy',
+                    created_at REAL NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS ml_training_runs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     created_at REAL NOT NULL,
@@ -1017,6 +1036,8 @@ class SpreadTracker:
                     ON tracker_pair_episodes(pair_id, end_ts);
                 CREATE INDEX IF NOT EXISTS idx_tracker_episodes_block
                     ON tracker_pair_episodes(block_id, end_ts);
+                CREATE INDEX IF NOT EXISTS idx_tracker_hourly_health_verdict
+                    ON tracker_hourly_health(quality_verdict, hour_start_ts);
                 CREATE INDEX IF NOT EXISTS idx_ml_training_runs_status_created
                     ON ml_training_runs(status, created_at);
                 CREATE INDEX IF NOT EXISTS idx_ml_training_run_sessions_run
@@ -1884,6 +1905,162 @@ class SpreadTracker:
             }
             for record in records
         ]
+
+    def get_feature_history(
+        self,
+        symbol: str,
+        buy_ex: str,
+        buy_mt: str,
+        sell_ex: str,
+        sell_mt: str,
+        *,
+        limit: int = 15,
+        feature_names: list[str] | None = None,
+    ) -> list[list[float]]:
+        key = self._pair_key(symbol, buy_ex, buy_mt, sell_ex, sell_mt)
+        normalized_names = tuple(str(name) for name in (feature_names or []))
+        cache_key = (key, normalized_names, int(limit))
+        with self._lock:
+            ps = self._pairs.get(key)
+            if ps is None or not ps.records:
+                return []
+            last_record_ts = float(ps._last_record_ts or 0.0)
+            cached = self._feature_history_cache.get(cache_key)
+            if cached and float(cached.get("last_record_ts", 0.0) or 0.0) == last_record_ts:
+                return [list(row) for row in list(cached.get("rows") or [])]
+            self._ensure_episode_cache_locked(ps)
+            records = list(ps.records)
+            episodes = list(ps.episodes)
+        if not records:
+            return []
+        lookback_sec = max(self._WINDOWS.get("8h", 8 * 60 * 60), int(limit) * max(int(self.record_interval_sec), 1))
+        cutoff = float(records[-1].timestamp) - float(lookback_sec)
+        recent_records = [
+            {
+                "timestamp": float(record.timestamp),
+                "entry_spread": float(record.entry_spread_pct),
+                "exit_spread": float(record.exit_spread_pct),
+                "session_id": int(record.session_id or 0),
+                "block_id": int(record.block_id or 0),
+            }
+            for record in records
+            if float(record.timestamp) >= cutoff
+        ]
+        rows = build_feature_rows(recent_records, feature_names=list(feature_names or []), episodes=episodes)
+        rows = rows[-max(int(limit), 0) :]
+        with self._lock:
+            self._feature_history_cache[cache_key] = {
+                "last_record_ts": float(last_record_ts),
+                "rows": [list(row) for row in rows],
+            }
+        return [list(row) for row in rows]
+
+    def save_hourly_health_digest(self, digest: dict[str, Any]) -> dict[str, Any]:
+        if self.db_path is None:
+            return dict(digest)
+        payload = dict(digest)
+        hour_start_ts = float(payload.get("hour_start_ts", 0.0) or 0.0)
+        if hour_start_ts <= 0.0:
+            raise ValueError("hour_start_ts is required")
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO tracker_hourly_health(
+                    hour_start_ts, hour_end_ts, records_total, records_rejected, rejection_rate_pct,
+                    exchanges_active, exchanges_circuit_open_json, pairs_with_records, pairs_with_gaps,
+                    cross_exchange_flags, avg_book_age_json, episode_count, quality_verdict, created_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(hour_start_ts) DO UPDATE SET
+                    hour_end_ts = excluded.hour_end_ts,
+                    records_total = excluded.records_total,
+                    records_rejected = excluded.records_rejected,
+                    rejection_rate_pct = excluded.rejection_rate_pct,
+                    exchanges_active = excluded.exchanges_active,
+                    exchanges_circuit_open_json = excluded.exchanges_circuit_open_json,
+                    pairs_with_records = excluded.pairs_with_records,
+                    pairs_with_gaps = excluded.pairs_with_gaps,
+                    cross_exchange_flags = excluded.cross_exchange_flags,
+                    avg_book_age_json = excluded.avg_book_age_json,
+                    episode_count = excluded.episode_count,
+                    quality_verdict = excluded.quality_verdict,
+                    created_at = excluded.created_at
+                """,
+                (
+                    hour_start_ts,
+                    float(payload.get("hour_end_ts", 0.0) or 0.0),
+                    int(payload.get("records_total", 0) or 0),
+                    int(payload.get("records_rejected", 0) or 0),
+                    float(payload.get("rejection_rate_pct", 0.0) or 0.0),
+                    int(payload.get("exchanges_active", 0) or 0),
+                    json.dumps(list(payload.get("exchanges_circuit_open") or []), sort_keys=True),
+                    int(payload.get("pairs_with_records", 0) or 0),
+                    int(payload.get("pairs_with_gaps", 0) or 0),
+                    int(payload.get("cross_exchange_flags", 0) or 0),
+                    json.dumps(dict(payload.get("avg_book_age_sec") or {}), sort_keys=True),
+                    int(payload.get("episode_count", 0) or 0),
+                    str(payload.get("quality_verdict") or "healthy"),
+                    float(payload.get("created_at", time.time()) or time.time()),
+                ),
+            )
+        return payload
+
+    def list_hourly_health(self, *, limit: int = 24) -> list[dict[str, Any]]:
+        if self.db_path is None or not self.db_path.is_file():
+            return []
+        with self._connect() as conn:
+            rows = list(
+                conn.execute(
+                    """
+                    SELECT hour_start_ts, hour_end_ts, records_total, records_rejected, rejection_rate_pct,
+                           exchanges_active, exchanges_circuit_open_json, pairs_with_records, pairs_with_gaps,
+                           cross_exchange_flags, avg_book_age_json, episode_count, quality_verdict, created_at
+                    FROM tracker_hourly_health
+                    ORDER BY hour_start_ts DESC
+                    LIMIT ?
+                    """,
+                    (max(int(limit), 1),),
+                )
+            )
+        payload: list[dict[str, Any]] = []
+        for row in rows:
+            payload.append(
+                {
+                    "hour_start_ts": float(row["hour_start_ts"]),
+                    "hour_end_ts": float(row["hour_end_ts"]),
+                    "records_total": int(row["records_total"]),
+                    "records_rejected": int(row["records_rejected"]),
+                    "rejection_rate_pct": float(row["rejection_rate_pct"]),
+                    "exchanges_active": int(row["exchanges_active"]),
+                    "exchanges_circuit_open": list(json.loads(str(row["exchanges_circuit_open_json"] or "[]"))),
+                    "pairs_with_records": int(row["pairs_with_records"]),
+                    "pairs_with_gaps": int(row["pairs_with_gaps"]),
+                    "cross_exchange_flags": int(row["cross_exchange_flags"]),
+                    "avg_book_age_sec": dict(json.loads(str(row["avg_book_age_json"] or "{}"))),
+                    "episode_count": int(row["episode_count"]),
+                    "quality_verdict": str(row["quality_verdict"] or "healthy"),
+                    "created_at": float(row["created_at"]),
+                }
+            )
+        return payload
+
+    def get_latest_hourly_health(self) -> dict[str, Any] | None:
+        rows = self.list_hourly_health(limit=1)
+        return rows[0] if rows else None
+
+    def disable_open_blocks(self, *, reason: str) -> int:
+        if self.db_path is None:
+            return 0
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE tracker_pair_blocks
+                SET disabled_reason = ?, updated_at = ?
+                WHERE is_open = 1 AND COALESCE(disabled_reason, '') = ''
+                """,
+                (str(reason), time.time()),
+            )
+        return int(cursor.rowcount or 0)
 
     def get_pair_episodes(
         self,

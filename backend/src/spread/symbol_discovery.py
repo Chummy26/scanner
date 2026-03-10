@@ -200,7 +200,10 @@ async def _xt_symbols(session: aiohttp.ClientSession) -> Dict[str, Set[str]]:
     if data and isinstance(data.get("result"), list):
         for s in data["result"]:
             sym = s.get("symbol", "")
-            if "_usdt" in sym.lower():
+            is_tradeable = bool(s.get("tradeSwitch")) and bool(s.get("openSwitch"))
+            is_visible = bool(s.get("isDisplay")) or bool(s.get("displaySwitch"))
+            is_open_api = bool(s.get("isOpenApi"))
+            if "_usdt" in sym.lower() and is_tradeable and is_visible and is_open_api:
                 base = normalize_base(sym.split("_")[0])
                 if base:
                     futures.add(base)
