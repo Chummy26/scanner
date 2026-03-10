@@ -26,6 +26,7 @@ def test_runtime_perf_monitor_snapshot_aggregates_routes_cycles_broadcasts_and_l
         {
             "total_ms": 85.0,
             "calculate_ms": 30.0,
+            "ingest_filter_ms": 11.0,
             "batch_record_ms": 5.0,
             "market_enrich_ms": 10.0,
             "tracker_enrich_ms": 20.0,
@@ -69,6 +70,7 @@ def test_runtime_perf_monitor_snapshot_aggregates_routes_cycles_broadcasts_and_l
     assert snapshot["scanner_cycle_by_kind"]["ws_manager"]["count"] == 1
     assert snapshot["scanner_cycle_by_kind"]["ml_inference"]["count"] == 1
     assert snapshot["scanner_cycle"]["total_ms"]["max"] == 85.0
+    assert snapshot["scanner_cycle"]["ingest_filter_ms"]["max"] == 11.0
     assert snapshot["scanner_cycle_by_kind"]["ml_inference"]["ml_render_ms"]["max"] == 4.0
     assert snapshot["broadcasts"]["scanner_lite"]["payload_bytes"]["max"] == 8192.0
     assert snapshot["event_loop_lag_ms"]["max"] == 275.0

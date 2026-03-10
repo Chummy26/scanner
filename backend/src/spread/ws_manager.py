@@ -484,12 +484,32 @@ class WSManager:
         *,
         now_ts: float,
     ) -> tuple[List[SpreadOpportunity], List[tuple], List[dict[str, Any]]]:
+        def _filter_opportunities_for_breakers(rows: List[SpreadOpportunity]) -> List[SpreadOpportunity]:
+            if not rows:
+                return rows
+            active_cache: dict[str, bool] = {}
+
+            def _is_active(exchange: str) -> bool:
+                key = str(exchange or "").strip().lower()
+                if not key:
+                    return True
+                cached = active_cache.get(key)
+                if cached is None:
+                    cached = self._circuit_breaker.is_active(key, now_ts=float(now_ts))
+                    active_cache[key] = cached
+                return bool(cached)
+
+            return [
+                opp
+                for opp in rows
+                if _is_active(opp.buy_exchange) and _is_active(opp.sell_exchange)
+            ]
+
         if not records and not rejections:
             self._record_ingest_health([], [], now_ts=float(now_ts))
-            return opportunities, records, rejections
+            return _filter_opportunities_for_breakers(opportunities), records, rejections
         filtered_records: List[tuple] = []
         filtered_rejections = list(rejections)
-        allowed_keys: set[Any] = set()
         for rejection in filtered_rejections:
             affected = list(rejection.get("affected_exchanges") or [])
             if not affected:
@@ -523,21 +543,10 @@ class WSManager:
                     self._circuit_breaker.record(exchange, accepted=False, now_ts=float(now_ts))
                 continue
             filtered_records.append(record)
-            allowed_keys.add(key)
             for exchange in {str(record[1] or "").strip().lower(), str(record[3] or "").strip().lower()}:
                 if exchange:
                     self._circuit_breaker.record(exchange, accepted=True, now_ts=float(now_ts))
-        filtered_opportunities = opportunities if not allowed_keys else [
-            opp
-            for opp in opportunities
-            if self.tracker._pair_key(
-                opp.asset,
-                opp.buy_exchange,
-                opp.buy_market_type,
-                opp.sell_exchange,
-                opp.sell_market_type,
-            ) in allowed_keys
-        ]
+        filtered_opportunities = _filter_opportunities_for_breakers(opportunities)
         self._record_ingest_health(filtered_records, filtered_rejections, now_ts=float(now_ts))
         return filtered_opportunities, filtered_records, filtered_rejections
 
@@ -735,37 +744,41 @@ class WSManager:
             str(row.get("pairKey") or row.get("code") or f"row:{index}"): row
             for index, row in enumerate(rows)
         }
-        previous_by_key = self._last_scanner_lite_rows_by_key
+        with self._lock:
+            previous_by_key = dict(self._last_scanner_lite_rows_by_key)
         removes = [key for key in previous_by_key if key not in rows_by_key]
         upserts = [
             row for key, row in rows_by_key.items()
             if previous_by_key.get(key) != row
         ]
         now_iso = datetime.now(timezone.utc).isoformat()
-        self._last_scanner_lite_rows = rows
-        self._last_scanner_lite_rows_by_key = rows_by_key
-        self._last_scanner_lite_summary = self._build_scanner_lite_summary(rows)
-        self._last_scanner_lite_snapshot = {
+        summary = self._build_scanner_lite_summary(rows)
+        snapshot = {
             "timestamp": now_iso,
             "type": "arbitrage_data_lite_snapshot",
             "source": "spread_engine",
             "count": len(rows),
             "total_count": len(opportunities),
-            "summary": self._last_scanner_lite_summary,
+            "summary": summary,
             "data": rows,
         }
-        self._last_scanner_lite_delta = {
+        delta = {
             "timestamp": now_iso,
             "type": "arbitrage_data_lite_delta",
             "source": "spread_engine",
             "count": len(upserts),
             "remove_count": len(removes),
             "total_count": len(opportunities),
-            "summary": self._last_scanner_lite_summary,
+            "summary": summary,
             "upserts": upserts,
             "removes": removes,
         }
         with self._lock:
+            self._last_scanner_lite_rows = rows
+            self._last_scanner_lite_rows_by_key = rows_by_key
+            self._last_scanner_lite_summary = summary
+            self._last_scanner_lite_snapshot = snapshot
+            self._last_scanner_lite_delta = delta
             self._force_scanner_lite_refresh = False
 
     async def _ml_inference_loop(self):
@@ -1350,6 +1363,7 @@ class WSManager:
             list(raw_capture_rejections or []),
             now_ts=float(now_ts),
         )
+        _perf_after_ingest_filters = time.perf_counter()
 
         # --- 2. Volume / funding / futures-meta / deposit-withdraw enrichment -----
         _get_vol = market_data.get_volume
@@ -1542,7 +1556,8 @@ class WSManager:
                 {
                     "total_ms": round((_perf_after_lite_refresh - _perf_started) * 1000.0, 6),
                     "calculate_ms": round((_perf_after_calc - _perf_started) * 1000.0, 6),
-                    "market_enrich_ms": round((_perf_after_market_enrich - _perf_after_calc) * 1000.0, 6),
+                    "ingest_filter_ms": round((_perf_after_ingest_filters - _perf_after_calc) * 1000.0, 6),
+                    "market_enrich_ms": round((_perf_after_market_enrich - _perf_after_ingest_filters) * 1000.0, 6),
                     "tracker_enrich_ms": round((_perf_after_tracker_enrich - _perf_after_market_enrich) * 1000.0, 6),
                     "filter_ms": round((_perf_after_filter - _perf_after_ml) * 1000.0, 6),
                     "batch_record_ms": round((_perf_after_batch_record - _perf_after_filter) * 1000.0, 6),
@@ -1766,12 +1781,12 @@ class WSManager:
     async def _broadcast_scanner_lite_inner(self):
         with self._lock:
             clients = list(self._scanner_lite_clients)
+            delta = dict(self._last_scanner_lite_delta)
+            snapshot = dict(self._last_scanner_lite_snapshot)
 
         if not clients:
             return
 
-        delta = self._last_scanner_lite_delta
-        snapshot = self._last_scanner_lite_snapshot
         if not snapshot.get("data"):
             ping_payload = '{"type":"ping"}'
 
@@ -2140,15 +2155,18 @@ class WSManager:
     def get_current_opportunities_lite(self) -> List[Dict]:
         """Get cached compact opportunity rows for the scanner list."""
         self.mark_scanner_lite_interest()
-        return list(self._last_scanner_lite_rows)
+        with self._lock:
+            return list(self._last_scanner_lite_rows)
 
     def get_current_opportunities_lite_summary(self) -> Dict[str, Any]:
         self.mark_scanner_lite_interest()
-        return dict(self._last_scanner_lite_summary)
+        with self._lock:
+            return dict(self._last_scanner_lite_summary)
 
     def get_current_scanner_lite_snapshot(self) -> Dict[str, Any]:
         self.mark_scanner_lite_interest()
-        return dict(self._last_scanner_lite_snapshot)
+        with self._lock:
+            return dict(self._last_scanner_lite_snapshot)
 
     def get_scanner_opportunity_detail(self, pair_key: str) -> Optional[Dict]:
         target = str(pair_key or "").strip()

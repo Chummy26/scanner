@@ -217,6 +217,87 @@ def test_ws_manager_skips_ml_work_when_model_is_not_ready(monkeypatch, tmp_path:
         market_data._market_data_ready = original_ready
 
 
+def test_apply_ingest_filters_keeps_opportunities_outside_current_record_subset(tmp_path: Path):
+    config = SpreadConfig(exchanges=[], symbols=[], tracker_db_path=str(tmp_path / "tracker.sqlite"))
+    ws_mgr = WSManager(config)
+    primary = SpreadOpportunity(
+        asset="BTC",
+        arb_type="spot_futures",
+        buy_exchange="mexc",
+        sell_exchange="gate",
+        buy_market_type="spot",
+        sell_market_type="futures",
+        buy_price=100.0,
+        sell_price=101.0,
+        entry_spread_pct=1.0,
+        exit_spread_pct=-0.4,
+    )
+    untouched = SpreadOpportunity(
+        asset="ETH",
+        arb_type="futures_futures",
+        buy_exchange="bingx",
+        sell_exchange="bitget",
+        buy_market_type="futures",
+        sell_market_type="futures",
+        buy_price=200.0,
+        sell_price=202.0,
+        entry_spread_pct=1.0,
+        exit_spread_pct=-0.5,
+    )
+
+    filtered_opps, filtered_records, filtered_rejections = ws_mgr._apply_ingest_filters(
+        [primary, untouched],
+        [("BTC", "mexc", "spot", "gate", "futures", 1.0, -0.4)],
+        [],
+        now_ts=100.0,
+    )
+
+    assert {opp.asset for opp in filtered_opps} == {"BTC", "ETH"}
+    assert len(filtered_records) == 1
+    assert filtered_rejections == []
+
+
+def test_apply_ingest_filters_suppresses_opportunities_for_open_circuit_exchange(tmp_path: Path):
+    config = SpreadConfig(exchanges=[], symbols=[], tracker_db_path=str(tmp_path / "tracker.sqlite"))
+    ws_mgr = WSManager(config)
+    blocked = SpreadOpportunity(
+        asset="BTC",
+        arb_type="spot_futures",
+        buy_exchange="mexc",
+        sell_exchange="gate",
+        buy_market_type="spot",
+        sell_market_type="futures",
+        buy_price=100.0,
+        sell_price=101.0,
+        entry_spread_pct=1.0,
+        exit_spread_pct=-0.4,
+    )
+    healthy = SpreadOpportunity(
+        asset="ETH",
+        arb_type="futures_futures",
+        buy_exchange="bingx",
+        sell_exchange="bitget",
+        buy_market_type="futures",
+        sell_market_type="futures",
+        buy_price=200.0,
+        sell_price=202.0,
+        entry_spread_pct=1.0,
+        exit_spread_pct=-0.5,
+    )
+
+    for ts in (0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0):
+        ws_mgr._circuit_breaker.record("mexc", accepted=False, now_ts=ts)
+
+    filtered_opps, _, _ = ws_mgr._apply_ingest_filters(
+        [blocked, healthy],
+        [],
+        [],
+        now_ts=10.0,
+    )
+
+    assert {opp.asset for opp in filtered_opps} == {"ETH"}
+
+
 def test_ws_manager_background_ml_drain_renders_with_latest_current_entry(monkeypatch, tmp_path: Path):
     config = SpreadConfig(exchanges=[], symbols=[], tracker_db_path=str(tmp_path / "tracker.sqlite"))
     ws_mgr = WSManager(config)

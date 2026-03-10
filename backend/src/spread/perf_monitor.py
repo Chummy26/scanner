@@ -146,6 +146,7 @@ class RuntimePerfMonitor:
                 "count": len(samples),
                 "total_ms": _metric("total_ms"),
                 "calculate_ms": _metric("calculate_ms"),
+                "ingest_filter_ms": _metric("ingest_filter_ms"),
                 "batch_record_ms": _metric("batch_record_ms"),
                 "market_enrich_ms": _metric("market_enrich_ms"),
                 "tracker_enrich_ms": _metric("tracker_enrich_ms"),

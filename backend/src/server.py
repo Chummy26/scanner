@@ -880,6 +880,9 @@ async def handle_debug_status(request):
         total_books += spot_books + futures_books
 
     summary = ws_mgr.engine.get_snapshot_summary()
+    published_opportunities = len(getattr(ws_mgr, "_last_filtered_opps", []) or [])
+    scanner_lite_rows = len(getattr(ws_mgr, "_last_scanner_lite_rows", []) or [])
+    raw_opportunities = int(summary.get("opportunities", 0) or 0)
 
     # Extra engine stats
     engine_extra = {}
@@ -887,6 +890,9 @@ async def handle_debug_status(request):
         engine_extra["dirty_count"] = len(getattr(ws_mgr.engine, "_dirty_symbols", set()))
         engine_extra["last_stale_count"] = getattr(ws_mgr.engine, "_last_stale_count", 0)
         engine_extra["calc_cycle_ms"] = round(getattr(ws_mgr.engine, "_last_calc_ms", 0), 1)
+        engine_extra["opportunities_raw"] = raw_opportunities
+        engine_extra["opportunities_published"] = published_opportunities
+        engine_extra["scanner_lite_rows"] = scanner_lite_rows
     except Exception:
         pass
 
@@ -920,12 +926,17 @@ async def handle_debug_status(request):
         "totals": {
             "symbols": len(total_symbols_set),
             "books": total_books,
-            "opportunities": summary.get("opportunities", 0),
+            "opportunities": scanner_lite_rows,
+            "opportunities_published": published_opportunities,
+            "opportunities_raw": raw_opportunities,
+            "opportunities_cache_gap": max(published_opportunities - scanner_lite_rows, 0),
             "ws_clients": len(ws_mgr._scanner_clients),
             "symbols_tracked": summary.get("symbols_tracked", 0),
             "last_calc": summary.get("last_calc", 0),
         },
         "engine": engine_extra,
+        "startup_gate": dict(manager_status.get("startup_gate") or {}),
+        "startup_filtered_opportunities": int(manager_status.get("startup_filtered_opportunities", 0) or 0),
         "stale_outliers": {
             "global_top": global_stale_outliers[:20],
             "by_exchange": per_exchange_stale_outliers,
@@ -940,6 +951,7 @@ async def handle_debug_status(request):
             "min_spread_pct": ws_mgr.config.min_spread_pct,
             "max_spread_pct": ws_mgr.config.max_spread_pct,
             "min_volume_usd": ws_mgr.config.min_volume_usd,
+            "min_opportunity_volume_usd": getattr(ws_mgr.config, "min_opportunity_volume_usd", 0.0),
             "max_symbols": ws_mgr.config.max_symbols,
             "symbol_discovery_enabled": ws_mgr.config.symbol_discovery_enabled,
             "tracking_window_sec": ws_mgr.config.tracking_window_sec,

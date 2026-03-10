@@ -41,18 +41,23 @@ class ExchangeCircuitBreaker:
         self._states: dict[str, str] = {}
         self._events: dict[str, deque[tuple[float, bool]]] = {}
         self._opened_at: dict[str, float] = {}
+        self._attempt_counts: dict[str, int] = {}
+        self._rejection_counts: dict[str, int] = {}
 
     def _prune(self, exchange: str, now_ts: float) -> deque[tuple[float, bool]]:
         history = self._events.setdefault(str(exchange), deque())
         cutoff = float(now_ts) - self.window_sec
         while history and history[0][0] < cutoff:
-            history.popleft()
+            _, accepted = history.popleft()
+            self._attempt_counts[exchange] = max(int(self._attempt_counts.get(exchange, 0) or 0) - 1, 0)
+            if not accepted:
+                self._rejection_counts[exchange] = max(int(self._rejection_counts.get(exchange, 0) or 0) - 1, 0)
         return history
 
     def _metrics(self, exchange: str, now_ts: float) -> tuple[int, int, float]:
-        history = self._prune(exchange, now_ts)
-        attempts = len(history)
-        rejections = sum(1 for _, accepted in history if not accepted)
+        self._prune(exchange, now_ts)
+        attempts = int(self._attempt_counts.get(exchange, 0) or 0)
+        rejections = int(self._rejection_counts.get(exchange, 0) or 0)
         rejection_rate_pct = (float(rejections) / float(attempts) * 100.0) if attempts > 0 else 0.0
         return attempts, rejections, rejection_rate_pct
 
@@ -62,6 +67,11 @@ class ExchangeCircuitBreaker:
             return "CLOSED"
         history = self._prune(exchange, now_ts)
         history.append((float(now_ts), bool(accepted)))
+        self._attempt_counts[exchange] = int(self._attempt_counts.get(exchange, 0) or 0) + 1
+        if not accepted:
+            self._rejection_counts[exchange] = int(self._rejection_counts.get(exchange, 0) or 0) + 1
+        else:
+            self._rejection_counts.setdefault(exchange, int(self._rejection_counts.get(exchange, 0) or 0))
         state = self._states.get(exchange, "CLOSED")
         attempts, _, rejection_rate_pct = self._metrics(exchange, now_ts)
         if state == "OPEN":

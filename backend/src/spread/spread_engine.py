@@ -65,6 +65,7 @@ class SpreadEngine:
         # Current calculated opportunities (sorted, final output)
         self._opportunities: List[SpreadOpportunity] = []
         self._last_calc_time: float = 0.0
+        self._last_calc_ms: float = 0.0
         # Update counting for health monitoring
         self._update_counts: Dict[str, int] = {}
         # --- Incremental calc state ---
@@ -297,6 +298,7 @@ class SpreadEngine:
         sort_finished = time.perf_counter()
 
         self._opportunities = all_opps
+        self._last_calc_ms = round((sort_finished - perf_started) * 1000.0, 6)
         self._last_calc_time = now
         self._last_stale_count = _stale_count
         self._last_dirty_count = len(symbols_to_calc)
