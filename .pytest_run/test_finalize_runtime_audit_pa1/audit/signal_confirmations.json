@@ -1,0 +1,12 @@
+{
+  "by_action": {},
+  "by_eta_alignment": {},
+  "signals": [],
+  "summary": {
+    "awaiting_confirmation": 0,
+    "confirmable_now": 0,
+    "confirmed": 0,
+    "not_confirmed": 0,
+    "total": 0
+  }
+}

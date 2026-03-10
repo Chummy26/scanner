@@ -1,0 +1,367 @@
+{
+  "certification_duration_sec": 0.007599,
+  "certification_id": "950637530ea5c5ee3ae0d1017cf4ef6f3d21b61b",
+  "certification_mode": "full",
+  "certified": false,
+  "dataset_fingerprints": {
+    "seq15_h14400_merge_off": "fp-0-0.8",
+    "seq15_h14400_merge_on": "fp-1-0.8",
+    "seq4_h240_merge_off": "fp-0-0.8",
+    "seq4_h240_merge_on": "fp-1-0.8",
+    "seq8_h600_merge_off": "fp-0-0.8",
+    "seq8_h600_merge_on": "fp-1-0.8"
+  },
+  "effective_session_scope": {
+    "block_ids": [],
+    "mode": "post_quality_fix",
+    "session_ids": [
+      101
+    ]
+  },
+  "failure_reasons": [
+    "pair_completeness_degraded",
+    "insufficient_record_density"
+  ],
+  "gate_results": {
+    "gate_01_sqlite_integrity": {
+      "details": {
+        "anomalies": {
+          "missing_event_blocks": 0,
+          "open_blocks_after_close": 0,
+          "range_mismatches": 0,
+          "record_count_mismatches": 0,
+          "zero_record_blocks": 0
+        },
+        "db_exists": true,
+        "db_path": "C:\\Users\\nicoolas\\Pictures\\scanner\\scanner\\.pytest_run\\test_certification_gate3_repor0\\tracker.sqlite",
+        "db_size_bytes": 0,
+        "scope": {
+          "block_ids": [],
+          "session_ids": [
+            101
+          ]
+        },
+        "table_counts": {
+          "tracker_pairs": 2,
+          "tracker_records": 16
+        }
+      },
+      "failure_reasons": [],
+      "gate_id": "gate_01_sqlite_integrity",
+      "recommendations": [],
+      "status": "PASS",
+      "title": "SQLite integrity",
+      "warnings": []
+    },
+    "gate_02_intra_block_temporal_regularity": {
+      "details": {
+        "block_diagnostics": {
+          "inter_record_interval_sec_quantiles": {
+            "p50": 15.0
+          },
+          "irregular_block_count": 0,
+          "max_to_median_interval_ratio_quantiles": {
+            "p90": 1.2
+          }
+        },
+        "irregular_block_rate": 0.0,
+        "max_to_median_ratio_p90": 1.2,
+        "median_interval_p50_sec": 15.0,
+        "total_blocks": 1
+      },
+      "failure_reasons": [],
+      "gate_id": "gate_02_intra_block_temporal_regularity",
+      "recommendations": [],
+      "status": "PASS",
+      "title": "Intra-block temporal regularity",
+      "warnings": []
+    },
+    "gate_03_completeness": {
+      "details": {
+        "active_pair_count": 2,
+        "checkpoint_count": 4,
+        "disappeared_pair_rate": 0.5,
+        "disappeared_pairs": [
+          "PAIR_A"
+        ],
+        "hot_path_rejection_stats": {
+          "rejection_rate_by_exchange": {
+            "gate": 0.35
+          },
+          "rejection_rate_by_pair": {
+            "PAIR_A": 0.42
+          }
+        },
+        "intermittent_pair_rate": 0.0,
+        "intermittent_pairs": [],
+        "records_per_pair_per_hour": 4.0
+      },
+      "failure_reasons": [
+        "pair_completeness_degraded",
+        "insufficient_record_density"
+      ],
+      "gate_id": "gate_03_completeness",
+      "recommendations": [
+        "hot_path_rejections dominate completeness pressure: top_pair=('PAIR_A', 0.42) top_exchange=('gate', 0.35)"
+      ],
+      "status": "FAIL",
+      "title": "Completeness",
+      "warnings": []
+    },
+    "gate_04_checkpoint_stationarity": {
+      "details": {
+        "shifted_checkpoint_pairs": []
+      },
+      "failure_reasons": [],
+      "gate_id": "gate_04_checkpoint_stationarity",
+      "recommendations": [],
+      "status": "PASS",
+      "title": "Checkpoint stationarity",
+      "warnings": []
+    },
+    "gate_05_intra_soak_feature_drift": {
+      "details": {
+        "drifted_features": [],
+        "feature_count": 25
+      },
+      "failure_reasons": [],
+      "gate_id": "gate_05_intra_soak_feature_drift",
+      "recommendations": [],
+      "status": "PASS",
+      "title": "Intra-soak feature drift",
+      "warnings": []
+    },
+    "gate_06_episode_yield": {
+      "details": {
+        "duration_sec_quantiles": {
+          "p50": 120.0,
+          "p90": 120.0
+        },
+        "episode_count": 2,
+        "episodes_per_hour": 1.0,
+        "total_spread_quantiles": {
+          "p50": 1.315,
+          "p90": 1.327
+        }
+      },
+      "failure_reasons": [],
+      "gate_id": "gate_06_episode_yield",
+      "recommendations": [],
+      "status": "PASS",
+      "title": "Episode yield",
+      "warnings": []
+    },
+    "gate_07_book_health": {
+      "details": {
+        "reason": "runtime_audit_unavailable"
+      },
+      "failure_reasons": [],
+      "gate_id": "gate_07_book_health",
+      "recommendations": [],
+      "status": "SKIPPED",
+      "title": "Book health",
+      "warnings": [
+        "runtime_audit_unavailable"
+      ]
+    },
+    "gate_08_reconnection_stress": {
+      "details": {
+        "executed": false,
+        "reason": "manual_gate_skipped"
+      },
+      "failure_reasons": [],
+      "gate_id": "gate_08_reconnection_stress",
+      "recommendations": [],
+      "status": "SKIPPED",
+      "title": "Reconnection stress",
+      "warnings": []
+    },
+    "gate_09_runtime_audit_sqlite_consistency": {
+      "details": {
+        "reason": "runtime_audit_unavailable"
+      },
+      "failure_reasons": [],
+      "gate_id": "gate_09_runtime_audit_sqlite_consistency",
+      "recommendations": [],
+      "status": "SKIPPED",
+      "title": "Runtime audit to SQLite consistency",
+      "warnings": [
+        "runtime_audit_unavailable"
+      ]
+    },
+    "gate_10_dual_mode_preflight": {
+      "details": {
+        "configs": [
+          {
+            "merge_off": {
+              "dataset_fingerprint": "fp-0-0.8",
+              "failure_reasons": [],
+              "qualifies_for_training": true,
+              "selected_label_config": {
+                "cost_floor_pct": 0.0,
+                "label_episode_window_days": null,
+                "label_percentile": null,
+                "label_threshold_mode": "fixed_threshold",
+                "threshold": 0.0
+              },
+              "selected_threshold": 0.8,
+              "selection_mode": "primary"
+            },
+            "merge_on": {
+              "dataset_fingerprint": "fp-1-0.8",
+              "failure_reasons": [],
+              "qualifies_for_training": true,
+              "selected_label_config": {
+                "cost_floor_pct": 0.0,
+                "label_episode_window_days": null,
+                "label_percentile": null,
+                "label_threshold_mode": "fixed_threshold",
+                "threshold": 0.0
+              },
+              "selected_threshold": 0.8,
+              "selection_mode": "primary"
+            },
+            "prediction_horizon_sec": 240,
+            "sequence_length": 4
+          },
+          {
+            "merge_off": {
+              "dataset_fingerprint": "fp-0-0.8",
+              "failure_reasons": [],
+              "qualifies_for_training": true,
+              "selected_label_config": {
+                "cost_floor_pct": 0.0,
+                "label_episode_window_days": null,
+                "label_percentile": null,
+                "label_threshold_mode": "fixed_threshold",
+                "threshold": 0.0
+              },
+              "selected_threshold": 0.8,
+              "selection_mode": "primary"
+            },
+            "merge_on": {
+              "dataset_fingerprint": "fp-1-0.8",
+              "failure_reasons": [],
+              "qualifies_for_training": true,
+              "selected_label_config": {
+                "cost_floor_pct": 0.0,
+                "label_episode_window_days": null,
+                "label_percentile": null,
+                "label_threshold_mode": "fixed_threshold",
+                "threshold": 0.0
+              },
+              "selected_threshold": 0.8,
+              "selection_mode": "primary"
+            },
+            "prediction_horizon_sec": 600,
+            "sequence_length": 8
+          },
+          {
+            "merge_off": {
+              "dataset_fingerprint": "fp-0-0.8",
+              "failure_reasons": [],
+              "qualifies_for_training": true,
+              "selected_label_config": {
+                "cost_floor_pct": 0.0,
+                "label_episode_window_days": null,
+                "label_percentile": null,
+                "label_threshold_mode": "fixed_threshold",
+                "threshold": 0.0
+              },
+              "selected_threshold": 0.8,
+              "selection_mode": "primary"
+            },
+            "merge_on": {
+              "dataset_fingerprint": "fp-1-0.8",
+              "failure_reasons": [],
+              "qualifies_for_training": true,
+              "selected_label_config": {
+                "cost_floor_pct": 0.0,
+                "label_episode_window_days": null,
+                "label_percentile": null,
+                "label_threshold_mode": "fixed_threshold",
+                "threshold": 0.0
+              },
+              "selected_threshold": 0.8,
+              "selection_mode": "primary"
+            },
+            "prediction_horizon_sec": 14400,
+            "sequence_length": 15
+          }
+        ],
+        "dataset_fingerprints": {
+          "seq15_h14400_merge_off": "fp-0-0.8",
+          "seq15_h14400_merge_on": "fp-1-0.8",
+          "seq4_h240_merge_off": "fp-0-0.8",
+          "seq4_h240_merge_on": "fp-1-0.8",
+          "seq8_h600_merge_off": "fp-0-0.8",
+          "seq8_h600_merge_on": "fp-1-0.8"
+        },
+        "qualifying_configs": [
+          "seq4_h240_merge_off:0.8",
+          "seq4_h240_merge_on:0.8",
+          "seq8_h600_merge_off:0.8",
+          "seq8_h600_merge_on:0.8",
+          "seq15_h14400_merge_off:0.8",
+          "seq15_h14400_merge_on:0.8"
+        ]
+      },
+      "failure_reasons": [],
+      "gate_id": "gate_10_dual_mode_preflight",
+      "recommendations": [],
+      "status": "PASS",
+      "title": "Dual-mode preflight",
+      "warnings": []
+    },
+    "gate_11_runtime_audit_health": {
+      "details": {
+        "runtime_audit_package_path": ""
+      },
+      "failure_reasons": [],
+      "gate_id": "gate_11_runtime_audit_health",
+      "recommendations": [],
+      "status": "WARNING",
+      "title": "Runtime audit health",
+      "warnings": [
+        "runtime_audit_unavailable"
+      ]
+    },
+    "gate_12_entry_exit_quality": {
+      "details": {
+        "bilateral_zero_rate": 0.0,
+        "eligible_pairs_for_responsiveness": 2,
+        "entry_outlier_pairs": [],
+        "episode_count": 2,
+        "exit_outlier_pairs": [],
+        "frozen_entry_pairs": [],
+        "frozen_exit_pairs": [],
+        "pair_count": 2,
+        "pearson_correlation_by_pair": {
+          "PAIR_A": 0.9999999999999998,
+          "PAIR_B": 0.9615239476408232
+        },
+        "unresponsive_exit_pairs": []
+      },
+      "failure_reasons": [],
+      "gate_id": "gate_12_entry_exit_quality",
+      "recommendations": [],
+      "status": "PASS",
+      "title": "Entry and exit quality",
+      "warnings": []
+    }
+  },
+  "generated_at_utc": "2026-03-10T22:26:41.188921+00:00",
+  "legacy_session_ids": [
+    1
+  ],
+  "legacy_sessions_excluded": 1,
+  "quality_fix_activated_at": 100.0,
+  "recommendations": [
+    "hot_path_rejections dominate completeness pressure: top_pair=('PAIR_A', 0.42) top_exchange=('gate', 0.35)"
+  ],
+  "runtime_audit_package_path": "",
+  "verdict": "FAILED",
+  "warnings": [
+    "runtime_audit_unavailable"
+  ]
+}

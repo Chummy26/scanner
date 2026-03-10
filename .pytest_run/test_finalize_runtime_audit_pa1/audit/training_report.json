@@ -1,0 +1,15 @@
+{
+  "artifacts": {},
+  "auxiliary_short_block_smoke": {
+    "all_negative_expected": true,
+    "auxiliary_short_block_smoke": true,
+    "dataset_status": "unavailable",
+    "not_for_model_quality_decision": true,
+    "reason": "unable to inspect closed blocks: no such table: tracker_pair_blocks",
+    "status": "unavailable"
+  },
+  "error": "file is not a database",
+  "metrics": {},
+  "model_status": "dataset_failed",
+  "thresholds": {}
+}

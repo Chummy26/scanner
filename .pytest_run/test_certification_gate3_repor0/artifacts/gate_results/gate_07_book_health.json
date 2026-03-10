@@ -1,0 +1,13 @@
+{
+  "details": {
+    "reason": "runtime_audit_unavailable"
+  },
+  "failure_reasons": [],
+  "gate_id": "gate_07_book_health",
+  "recommendations": [],
+  "status": "SKIPPED",
+  "title": "Book health",
+  "warnings": [
+    "runtime_audit_unavailable"
+  ]
+}

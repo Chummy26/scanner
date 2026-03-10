@@ -862,6 +862,106 @@ def test_label_window_uses_time_until_episode_close_as_eta():
     assert result["qualified_episode_total_spread"] >= 1.0
 
 
+def test_label_window_adaptive_threshold_falls_back_to_cost_floor_without_prior_support():
+    result = _label_window_from_episodes(
+        150.0,
+        episodes=[
+            _episode(
+                start_ts=200.0,
+                end_ts=240.0,
+                peak_entry_spread=0.90,
+                exit_spread_at_close=0.20,
+            )
+        ],
+        prediction_horizon_sec=120,
+        min_total_spread_pct=1.0,
+        adaptive_threshold_enabled=True,
+        pair_key="BTC|mexc|spot|gate|futures",
+        label_cost_floor_pct=1.0,
+        label_percentile=70.0,
+        label_episode_window_days=5,
+    )
+
+    assert result["y_class"] == 1.0
+    assert result["label_threshold"] == pytest.approx(1.0)
+    assert result["label_threshold_support"] == 0
+
+
+def test_label_window_adaptive_threshold_uses_only_prior_episodes_without_future_leakage():
+    result = _label_window_from_episodes(
+        150.0,
+        episodes=[
+            _episode(
+                start_ts=60.0,
+                end_ts=120.0,
+                peak_entry_spread=0.90,
+                exit_spread_at_close=0.20,
+            ),
+            _episode(
+                start_ts=200.0,
+                end_ts=260.0,
+                peak_entry_spread=3.80,
+                exit_spread_at_close=0.40,
+            ),
+        ],
+        prediction_horizon_sec=120,
+        min_total_spread_pct=0.8,
+        adaptive_threshold_enabled=True,
+        pair_key="DOGE|mexc|spot|gate|futures",
+        label_cost_floor_pct=0.8,
+        label_percentile=70.0,
+        label_episode_window_days=5,
+    )
+
+    assert result["y_class"] == 1.0
+    assert result["label_threshold"] == pytest.approx(1.1)
+    assert result["label_threshold_support"] == 1
+
+
+def test_label_window_adaptive_threshold_raises_bar_for_high_spread_pairs():
+    result = _label_window_from_episodes(
+        500.0,
+        episodes=[
+            _episode(start_ts=100.0, end_ts=150.0, peak_entry_spread=1.0, exit_spread_at_close=0.2),
+            _episode(start_ts=180.0, end_ts=220.0, peak_entry_spread=2.0, exit_spread_at_close=0.2),
+            _episode(start_ts=260.0, end_ts=300.0, peak_entry_spread=3.0, exit_spread_at_close=0.2),
+            _episode(start_ts=540.0, end_ts=580.0, peak_entry_spread=2.1, exit_spread_at_close=0.1),
+        ],
+        prediction_horizon_sec=120,
+        min_total_spread_pct=1.0,
+        adaptive_threshold_enabled=True,
+        pair_key="SHIB|mexc|spot|gate|futures",
+        label_cost_floor_pct=1.0,
+        label_percentile=70.0,
+        label_episode_window_days=5,
+    )
+
+    assert result["y_class"] == 0.0
+    assert result["timeout_reason"] == "sub_threshold_only"
+    assert result["label_threshold_support"] == 3
+    assert result["label_threshold"] > 2.2
+
+
+def test_build_dataset_bundle_reports_adaptive_label_threshold_metadata(tmp_path: Path):
+    state_path = _write_tracker_state(tmp_path / "tracker_state_adaptive.json")
+
+    bundle = build_dataset_bundle(
+        state_path=state_path,
+        sequence_length=3,
+        prediction_horizon_sec=240,
+        label_cost_floor_pct=0.8,
+        label_percentile=70,
+        label_episode_window_days=5,
+    )
+
+    assert bundle.summary["label_threshold_mode"] == "rolling_pair_percentile"
+    assert bundle.summary["label_cost_floor_pct"] == pytest.approx(0.8)
+    assert bundle.summary["label_percentile"] == pytest.approx(70.0)
+    assert bundle.summary["label_episode_window_days"] == 5
+    assert len(bundle.label_thresholds) == bundle.summary["num_samples"]
+    assert bundle.summary["label_thresholds"]
+
+
 def test_focal_loss_alpha_high_weights_positive_class_more_than_negative():
     positive_loss = FocalLoss(alpha=0.9, gamma=0.0)(
         torch.tensor([0.0], dtype=torch.float32),

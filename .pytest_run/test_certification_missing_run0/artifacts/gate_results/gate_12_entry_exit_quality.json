@@ -1,0 +1,23 @@
+{
+  "details": {
+    "bilateral_zero_rate": 0.0,
+    "eligible_pairs_for_responsiveness": 2,
+    "entry_outlier_pairs": [],
+    "episode_count": 3,
+    "exit_outlier_pairs": [],
+    "frozen_entry_pairs": [],
+    "frozen_exit_pairs": [],
+    "pair_count": 2,
+    "pearson_correlation_by_pair": {
+      "PAIR_A": 0.017587671376891108,
+      "PAIR_B": 0.017587671376891108
+    },
+    "unresponsive_exit_pairs": []
+  },
+  "failure_reasons": [],
+  "gate_id": "gate_12_entry_exit_quality",
+  "recommendations": [],
+  "status": "PASS",
+  "title": "Entry and exit quality",
+  "warnings": []
+}

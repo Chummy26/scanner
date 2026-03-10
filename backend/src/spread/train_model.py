@@ -51,7 +51,8 @@ from .ml_model import (
 )
 
 logger = logging.getLogger("ml_trainer")
-_DEFAULT_PRELIGHT_THRESHOLDS = [1.0, 0.8, 0.7]
+_DEFAULT_PRELIGHT_THRESHOLDS = [0.8, 1.0, 1.2]
+_DEFAULT_LABEL_PERCENTILES = [60, 70, 80]
 
 
 def _make_loader(bundle: DatasetBundle, batch_size: int, shuffle: bool) -> DataLoader:
@@ -91,6 +92,114 @@ class FocalLoss(nn.Module):
 
 def _derive_focal_alpha(positive_rate_train: float) -> float:
     return float(min(0.95, max(0.25, 1.0 - float(positive_rate_train))))
+
+
+def _normalize_threshold_values(thresholds: list[float] | None) -> list[float]:
+    values = [float(value) for value in (thresholds or _DEFAULT_PRELIGHT_THRESHOLDS)]
+    normalized: list[float] = []
+    seen: set[float] = set()
+    for value in values:
+        if not math.isfinite(value):
+            continue
+        numeric = float(value)
+        if numeric in seen:
+            continue
+        seen.add(numeric)
+        normalized.append(numeric)
+    return normalized or [float(value) for value in _DEFAULT_PRELIGHT_THRESHOLDS]
+
+
+def _normalize_label_percentiles(label_percentiles: list[int] | None) -> list[int]:
+    values = [int(value) for value in (label_percentiles or _DEFAULT_LABEL_PERCENTILES)]
+    normalized: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        numeric = max(0, min(100, int(value)))
+        if numeric in seen:
+            continue
+        seen.add(numeric)
+        normalized.append(numeric)
+    return normalized or [int(value) for value in _DEFAULT_LABEL_PERCENTILES]
+
+
+def _adaptive_label_requested(
+    *,
+    thresholds: list[float] | None,
+    label_percentiles: list[int] | None,
+) -> bool:
+    return label_percentiles is not None or thresholds is None
+
+
+def _iter_label_configs(
+    *,
+    thresholds: list[float] | None,
+    label_percentiles: list[int] | None,
+    label_episode_window_days: int,
+) -> list[dict[str, Any]]:
+    threshold_values = _normalize_threshold_values(thresholds)
+    if not _adaptive_label_requested(thresholds=thresholds, label_percentiles=label_percentiles):
+        return [
+            {
+                "key": f"{float(threshold):.1f}",
+                "threshold": float(threshold),
+                "cost_floor_pct": float(threshold),
+                "label_percentile": None,
+                "label_episode_window_days": None,
+                "label_threshold_mode": "fixed_threshold",
+            }
+            for threshold in threshold_values
+        ]
+    percentile_values = _normalize_label_percentiles(label_percentiles)
+    return [
+        {
+            "key": f"{float(threshold):.1f}_p{int(percentile)}",
+            "threshold": float(threshold),
+            "cost_floor_pct": float(threshold),
+            "label_percentile": int(percentile),
+            "label_episode_window_days": int(max(label_episode_window_days, 1)),
+            "label_threshold_mode": "rolling_pair_percentile",
+        }
+        for threshold in threshold_values
+        for percentile in percentile_values
+    ]
+
+
+def _label_config_payload(label_config: dict[str, Any] | None) -> dict[str, Any]:
+    config = dict(label_config or {})
+    percentile_raw = config.get("label_percentile")
+    percentile = None if percentile_raw is None else int(percentile_raw)
+    window_days_raw = config.get("label_episode_window_days")
+    window_days = None if window_days_raw is None else int(window_days_raw)
+    return {
+        "threshold": float(config.get("threshold", config.get("cost_floor_pct", 0.0)) or 0.0),
+        "cost_floor_pct": float(config.get("cost_floor_pct", config.get("threshold", 0.0)) or 0.0),
+        "label_percentile": percentile,
+        "label_episode_window_days": window_days,
+        "label_threshold_mode": str(config.get("label_threshold_mode") or "fixed_threshold"),
+    }
+
+
+def _label_config_rank(label_config: dict[str, Any] | None) -> tuple[float, int]:
+    payload = _label_config_payload(label_config)
+    percentile = payload["label_percentile"]
+    return (
+        float(payload["cost_floor_pct"]),
+        int(percentile) if percentile is not None else -1,
+    )
+
+
+def _dataset_build_kwargs_for_label_config(label_config: dict[str, Any] | None) -> dict[str, Any]:
+    payload = _label_config_payload(label_config)
+    kwargs: dict[str, Any] = {"min_total_spread_pct": float(payload["cost_floor_pct"])}
+    if payload["label_threshold_mode"] == "rolling_pair_percentile":
+        kwargs.update(
+            {
+                "label_cost_floor_pct": float(payload["cost_floor_pct"]),
+                "label_percentile": int(payload["label_percentile"]) if payload["label_percentile"] is not None else 70,
+                "label_episode_window_days": int(payload["label_episode_window_days"]) if payload["label_episode_window_days"] is not None else 5,
+            }
+        )
+    return kwargs
 
 
 def _apply_platt_scaling(logits: np.ndarray, scale: float, bias: float) -> np.ndarray:
@@ -766,6 +875,7 @@ def _stability_summary(split_positive_rates: dict[str, float]) -> dict[str, Any]
 def _preflight_entry(
     *,
     threshold: float,
+    label_config: dict[str, Any] | None,
     bundle: DatasetBundle | None,
     splits: dict[str, DatasetBundle] | None,
     error: str | None = None,
@@ -773,6 +883,8 @@ def _preflight_entry(
     min_val_positive_samples: int,
     min_test_positive_samples: int,
 ) -> dict[str, Any]:
+    label_payload = _label_config_payload(label_config)
+
     def _failure_reasons(
         *,
         bundle_obj: DatasetBundle,
@@ -825,6 +937,7 @@ def _preflight_entry(
     if bundle is None or splits is None:
         return {
             "threshold": float(threshold),
+            **label_payload,
             "build_ok": False,
             "guardrail_ok": False,
             "purging_ok": False,
@@ -850,6 +963,7 @@ def _preflight_entry(
     qualifies_relaxed = bool(guardrail_ok and purging_ok and stability["stability_ok_relaxed"])
     return {
         "threshold": float(threshold),
+        **label_payload,
         "build_ok": True,
         "guardrail_ok": guardrail_ok,
         "purging_ok": purging_ok,
@@ -869,6 +983,7 @@ def _preflight_entry(
         "min_to_max_positive_rate_ratio": float(stability["min_to_max_positive_rate_ratio"]),
         "split_summary": split_summary,
         "label_audit": dict(bundle.summary.get("label_audit", {})),
+        "label_thresholds": dict(bundle.summary.get("label_thresholds", {})),
         "block_diagnostics": dict(bundle.summary.get("block_diagnostics", {})),
         "episode_diagnostics": dict(bundle.summary.get("episode_diagnostics", {})),
         "cross_session_merge_enabled": bool(bundle.summary.get("cross_session_merge_enabled", False)),
@@ -891,6 +1006,8 @@ def run_threshold_preflight(
     sequence_length: int = 15,
     prediction_horizon_sec: int = 14_400,
     thresholds: list[float] | None = None,
+    label_percentiles: list[int] | None = None,
+    label_episode_window_days: int = 5,
     selected_session_ids: list[int] | None = None,
     selected_block_ids: list[int] | None = None,
     allow_cross_session_merge: bool = False,
@@ -903,38 +1020,52 @@ def run_threshold_preflight(
 ) -> dict[str, Any]:
     default_state = Path(__file__).resolve().parent.parent.parent / "out" / "config" / "tracker_history.sqlite"
     state_path = Path(state_file) if state_file is not None else default_state
-    threshold_values = [float(value) for value in (thresholds or _DEFAULT_PRELIGHT_THRESHOLDS)]
+    threshold_values = _normalize_threshold_values(thresholds)
+    adaptive_mode = _adaptive_label_requested(thresholds=thresholds, label_percentiles=label_percentiles)
+    effective_label_percentiles = _normalize_label_percentiles(label_percentiles) if adaptive_mode else []
+    label_configs = _iter_label_configs(
+        thresholds=threshold_values,
+        label_percentiles=label_percentiles,
+        label_episode_window_days=label_episode_window_days,
+    )
     preflight: dict[str, Any] = {
         "state_path": str(state_path),
         "sequence_length": int(sequence_length),
         "prediction_horizon_sec": int(prediction_horizon_sec),
         "thresholds": {},
+        "cost_floors": [float(value) for value in threshold_values],
+        "label_percentiles": [int(value) for value in effective_label_percentiles],
+        "label_episode_window_days": int(max(label_episode_window_days, 1)),
+        "label_threshold_mode": "rolling_pair_percentile" if adaptive_mode else "fixed_threshold",
         "block_diagnostics": {},
         "cross_session_merge_enabled": bool(allow_cross_session_merge),
         "max_session_gap_sec": None if max_session_gap_sec is None else float(max_session_gap_sec),
         "regime_shift_score_threshold": None if regime_shift_score_threshold is None else float(regime_shift_score_threshold),
         "selected_threshold": None,
+        "selected_label_config": None,
         "selection_mode": "none",
         "qualifies_for_training": False,
     }
-    primary_candidates: list[float] = []
-    relaxed_candidates: list[float] = []
-    for threshold in threshold_values:
+    primary_candidates: list[dict[str, Any]] = []
+    relaxed_candidates: list[dict[str, Any]] = []
+    for label_config in label_configs:
+        threshold = float(label_config["threshold"])
         try:
             bundle = build_dataset_bundle(
                 state_path=state_path,
                 sequence_length=sequence_length,
                 prediction_horizon_sec=prediction_horizon_sec,
-                min_total_spread_pct=threshold,
                 selected_session_ids=selected_session_ids,
                 selected_block_ids=selected_block_ids,
                 allow_cross_session_merge=allow_cross_session_merge,
                 max_session_gap_sec=max_session_gap_sec,
                 regime_shift_score_threshold=regime_shift_score_threshold,
+                **_dataset_build_kwargs_for_label_config(label_config),
             )
             splits = build_group_splits(bundle, prediction_horizon_sec=prediction_horizon_sec)
             entry = _preflight_entry(
                 threshold=threshold,
+                label_config=label_config,
                 bundle=bundle,
                 splits=splits,
                 min_train_positive_samples=min_train_positive_samples,
@@ -944,6 +1075,7 @@ def run_threshold_preflight(
         except Exception as exc:
             entry = _preflight_entry(
                 threshold=threshold,
+                label_config=label_config,
                 bundle=None,
                 splits=None,
                 error=str(exc),
@@ -951,21 +1083,25 @@ def run_threshold_preflight(
                 min_val_positive_samples=min_val_positive_samples,
                 min_test_positive_samples=min_test_positive_samples,
             )
-        key = f"{threshold:.1f}"
+        key = str(label_config["key"])
         preflight["thresholds"][key] = entry
         if (not preflight["block_diagnostics"]) and entry.get("block_diagnostics"):
             preflight["block_diagnostics"] = dict(entry["block_diagnostics"])
         if entry.get("qualifies_for_training"):
-            primary_candidates.append(float(threshold))
+            primary_candidates.append(_label_config_payload(label_config))
         if entry.get("qualifies_for_training_relaxed"):
-            relaxed_candidates.append(float(threshold))
+            relaxed_candidates.append(_label_config_payload(label_config))
 
     if primary_candidates:
-        preflight["selected_threshold"] = max(primary_candidates)
+        selected_label_config = max(primary_candidates, key=_label_config_rank)
+        preflight["selected_threshold"] = float(selected_label_config["cost_floor_pct"])
+        preflight["selected_label_config"] = dict(selected_label_config)
         preflight["selection_mode"] = "primary"
         preflight["qualifies_for_training"] = True
     elif relaxed_candidates:
-        preflight["selected_threshold"] = max(relaxed_candidates)
+        selected_label_config = max(relaxed_candidates, key=_label_config_rank)
+        preflight["selected_threshold"] = float(selected_label_config["cost_floor_pct"])
+        preflight["selected_label_config"] = dict(selected_label_config)
         preflight["selection_mode"] = "relaxed"
         preflight["qualifies_for_training"] = True
 
@@ -1014,6 +1150,10 @@ def _build_dataset_fingerprint(
     state_path: Path,
     bundle: DatasetBundle,
     min_total_spread_pct: float,
+    label_cost_floor_pct: float | None,
+    label_percentile: int | None,
+    label_episode_window_days: int | None,
+    label_threshold_mode: str | None,
     selected_session_ids: list[int] | None,
     selected_block_ids: list[int] | None,
     allow_cross_session_merge: bool,
@@ -1029,6 +1169,18 @@ def _build_dataset_fingerprint(
         "blocks_used": int(bundle.summary.get("blocks_used", 0)),
         "sessions_used": int(bundle.summary.get("sessions_used", 0)),
         "min_total_spread_pct": float(min_total_spread_pct),
+        "label_cost_floor_pct": float(bundle.summary.get("label_cost_floor_pct", label_cost_floor_pct if label_cost_floor_pct is not None else min_total_spread_pct)),
+        "label_percentile": (
+            None
+            if bundle.summary.get("label_percentile", label_percentile) is None
+            else float(bundle.summary.get("label_percentile", label_percentile))
+        ),
+        "label_episode_window_days": (
+            None
+            if bundle.summary.get("label_episode_window_days", label_episode_window_days) is None
+            else int(bundle.summary.get("label_episode_window_days", label_episode_window_days))
+        ),
+        "label_threshold_mode": str(bundle.summary.get("label_threshold_mode", label_threshold_mode or "fixed_threshold")),
         "selected_session_ids": [int(value) for value in selected_session_ids or []],
         "selected_block_ids": [int(value) for value in selected_block_ids or []],
         "allow_cross_session_merge": bool(allow_cross_session_merge),
@@ -1037,7 +1189,7 @@ def _build_dataset_fingerprint(
         "feature_names": list(bundle.feature_names),
     }
     digest.update(json.dumps(header, sort_keys=True, separators=(",", ":")).encode())
-    for pair_id, session_id, block_id, ts_value, label_end_ts, y_class_value, y_eta_value in zip(
+    for pair_id, session_id, block_id, ts_value, label_end_ts, y_class_value, y_eta_value, label_threshold_value in zip(
         bundle.pair_ids,
         bundle.session_ids,
         bundle.block_ids,
@@ -1045,12 +1197,14 @@ def _build_dataset_fingerprint(
         bundle.label_end_timestamps,
         bundle.y_class.tolist(),
         bundle.y_eta.tolist(),
+        bundle.label_thresholds,
     ):
         digest.update(
             (
                 f"{pair_id}|{int(session_id)}|{int(block_id)}|"
                 f"{float(ts_value):.6f}|{float(label_end_ts):.6f}|"
-                f"{float(y_class_value):.6f}|{float(y_eta_value):.6f}"
+                f"{float(y_class_value):.6f}|{float(y_eta_value):.6f}|"
+                f"{float(label_threshold_value):.6f}"
             ).encode()
         )
     return digest.hexdigest()
@@ -1063,6 +1217,7 @@ def certify_data_for_training(
     selected_session_ids: list[int] | None = None,
     selected_block_ids: list[int] | None = None,
     thresholds: list[float] | None = None,
+    label_percentiles: list[int] | None = None,
     sequence_length: int = 15,
     prediction_horizon_sec: int = 14_400,
     allow_cross_session_merge: bool = False,
@@ -1070,6 +1225,7 @@ def certify_data_for_training(
     regime_shift_score_threshold: float | None = 3.0,
     certification_mode: str = "full",
     max_certification_duration_sec: int = 300,
+    label_episode_window_days: int = 5,
     allow_legacy_sessions: bool = False,
     runtime_audit_dir: Path | None = None,
     run_reconnection_stress: bool = False,
@@ -1084,6 +1240,7 @@ def certify_data_for_training(
         selected_session_ids=selected_session_ids,
         selected_block_ids=selected_block_ids,
         thresholds=thresholds,
+        label_percentiles=label_percentiles,
         sequence_length=sequence_length,
         prediction_horizon_sec=prediction_horizon_sec,
         allow_cross_session_merge=allow_cross_session_merge,
@@ -1091,6 +1248,7 @@ def certify_data_for_training(
         regime_shift_score_threshold=regime_shift_score_threshold,
         certification_mode=certification_mode,
         max_certification_duration_sec=max_certification_duration_sec,
+        label_episode_window_days=label_episode_window_days,
         allow_legacy_sessions=allow_legacy_sessions,
         runtime_audit_dir=runtime_audit_dir,
         run_reconnection_stress=run_reconnection_stress,
@@ -1326,6 +1484,9 @@ def run_training_loop(
     sequence_length: int = 15,
     prediction_horizon_sec: int = 14_400,
     min_total_spread_pct: float = 1.0,
+    label_cost_floor_pct: float | None = None,
+    label_percentile: int | None = None,
+    label_episode_window_days: int | None = None,
     selected_session_ids: list[int] | None = None,
     selected_block_ids: list[int] | None = None,
     allow_cross_session_merge: bool = False,
@@ -1373,6 +1534,9 @@ def run_training_loop(
         sequence_length=sequence_length,
         prediction_horizon_sec=prediction_horizon_sec,
         min_total_spread_pct=min_total_spread_pct,
+        label_cost_floor_pct=label_cost_floor_pct,
+        label_percentile=label_percentile,
+        label_episode_window_days=label_episode_window_days,
         selected_session_ids=selected_session_ids,
         selected_block_ids=selected_block_ids,
         allow_cross_session_merge=allow_cross_session_merge,
@@ -1626,6 +1790,29 @@ def run_training_loop(
     training_config_payload = {
         "prediction_horizon_sec": prediction_horizon_sec,
         "min_total_spread_pct": float(min_total_spread_pct),
+        "selected_threshold": float(min_total_spread_pct),
+        "label_threshold_mode": str(dataset_summary.get("label_threshold_mode", "fixed_threshold")),
+        "label_cost_floor_pct": float(
+            dataset_summary.get(
+                "label_cost_floor_pct",
+                label_cost_floor_pct if label_cost_floor_pct is not None else min_total_spread_pct,
+            )
+        ),
+        "label_percentile": dataset_summary.get("label_percentile"),
+        "label_episode_window_days": dataset_summary.get("label_episode_window_days"),
+        "selected_label_config": {
+            "threshold": float(min_total_spread_pct),
+            "cost_floor_pct": float(
+                dataset_summary.get(
+                    "label_cost_floor_pct",
+                    label_cost_floor_pct if label_cost_floor_pct is not None else min_total_spread_pct,
+                )
+            ),
+            "label_percentile": dataset_summary.get("label_percentile"),
+            "label_episode_window_days": dataset_summary.get("label_episode_window_days"),
+            "label_threshold_mode": str(dataset_summary.get("label_threshold_mode", "fixed_threshold")),
+        },
+        "label_thresholds": dict(dataset_summary.get("label_thresholds", {})),
         "labeling_method": str(dataset_summary.get("labeling_method", "legacy")),
         "labeling_timeout_only": bool(dataset_summary.get("labeling_timeout_only", False)),
         "batch_size": batch_size,
@@ -1694,6 +1881,10 @@ def run_training_loop(
             state_path=state_path,
             bundle=bundle,
             min_total_spread_pct=min_total_spread_pct,
+            label_cost_floor_pct=label_cost_floor_pct,
+            label_percentile=label_percentile,
+            label_episode_window_days=label_episode_window_days,
+            label_threshold_mode=str(dataset_summary.get("label_threshold_mode", "fixed_threshold")),
             selected_session_ids=selected_session_ids,
             selected_block_ids=selected_block_ids,
             allow_cross_session_merge=allow_cross_session_merge,
@@ -1728,6 +1919,7 @@ def run_clean_training_cycle(
     sequence_length: int = 15,
     prediction_horizon_sec: int = 14_400,
     thresholds: list[float] | None = None,
+    label_percentiles: list[int] | None = None,
     selected_session_ids: list[int] | None = None,
     selected_block_ids: list[int] | None = None,
     allow_cross_session_merge: bool = False,
@@ -1750,6 +1942,7 @@ def run_clean_training_cycle(
     audit_output: Path | None = None,
     certification_mode: str = "full",
     max_certification_duration_sec: int = 300,
+    label_episode_window_days: int = 5,
     allow_legacy_sessions: bool = False,
     runtime_audit_dir: Path | None = None,
     run_reconnection_stress: bool = False,
@@ -1762,6 +1955,7 @@ def run_clean_training_cycle(
         sequence_length=sequence_length,
         prediction_horizon_sec=prediction_horizon_sec,
         thresholds=thresholds,
+        label_percentiles=label_percentiles,
         selected_session_ids=selected_session_ids,
         selected_block_ids=selected_block_ids,
         allow_cross_session_merge=allow_cross_session_merge,
@@ -1769,6 +1963,7 @@ def run_clean_training_cycle(
         regime_shift_score_threshold=regime_shift_score_threshold,
         certification_mode=certification_mode,
         max_certification_duration_sec=max_certification_duration_sec,
+        label_episode_window_days=label_episode_window_days,
         allow_legacy_sessions=allow_legacy_sessions,
         runtime_audit_dir=runtime_audit_dir,
         run_reconnection_stress=run_reconnection_stress,
@@ -1790,6 +1985,8 @@ def run_clean_training_cycle(
         sequence_length=sequence_length,
         prediction_horizon_sec=prediction_horizon_sec,
         thresholds=thresholds,
+        label_percentiles=label_percentiles,
+        label_episode_window_days=label_episode_window_days,
         selected_session_ids=effective_session_ids or selected_session_ids,
         selected_block_ids=selected_block_ids,
         allow_cross_session_merge=allow_cross_session_merge,
@@ -1803,6 +2000,7 @@ def run_clean_training_cycle(
     if not preflight.get("qualifies_for_training"):
         raise ValueError("No threshold qualified for clean training in preflight.")
     selected_threshold = float(preflight["selected_threshold"])
+    selected_label_config = _label_config_payload(preflight.get("selected_label_config"))
     legacy_archive_dir = _archive_existing_artifacts(artifact_root)
     report = run_training_loop(
         state_file=state_file,
@@ -1810,6 +2008,23 @@ def run_clean_training_cycle(
         sequence_length=sequence_length,
         prediction_horizon_sec=prediction_horizon_sec,
         min_total_spread_pct=selected_threshold,
+        label_cost_floor_pct=(
+            float(selected_label_config["cost_floor_pct"])
+            if selected_label_config.get("label_threshold_mode") == "rolling_pair_percentile"
+            else None
+        ),
+        label_percentile=(
+            int(selected_label_config["label_percentile"])
+            if selected_label_config.get("label_threshold_mode") == "rolling_pair_percentile"
+            and selected_label_config.get("label_percentile") is not None
+            else None
+        ),
+        label_episode_window_days=(
+            int(selected_label_config["label_episode_window_days"])
+            if selected_label_config.get("label_threshold_mode") == "rolling_pair_percentile"
+            and selected_label_config.get("label_episode_window_days") is not None
+            else None
+        ),
         selected_session_ids=effective_session_ids or selected_session_ids,
         selected_block_ids=selected_block_ids,
         allow_cross_session_merge=allow_cross_session_merge,
@@ -1837,8 +2052,11 @@ def run_clean_training_cycle(
     report["preflight"] = preflight
     report["legacy_archive_dir"] = legacy_archive_dir
     report["training"]["selected_threshold"] = selected_threshold
+    report["training"]["selected_label_config"] = dict(selected_label_config)
     report["training"]["certification_id"] = str(certification.get("certification_id") or "")
     report.setdefault("training_config", {})
+    report["training_config"]["selected_threshold"] = selected_threshold
+    report["training_config"]["selected_label_config"] = dict(selected_label_config)
     report["training_config"]["certification_id"] = str(certification.get("certification_id") or "")
     report["training_config"]["certification_verdict"] = str(certification.get("verdict") or "")
     report["training_config"]["runtime_audit_package_path"] = str(certification.get("runtime_audit_package_path") or "")
@@ -1859,9 +2077,12 @@ def run_clean_training_cycle(
         metadata_payload["training_config"]["preflight_off_vs_on_summary"] = certification.get("preflight_off_vs_on_summary", {})
         metadata_payload["training_config"]["preflight"] = preflight
         metadata_payload["training_config"]["selected_threshold"] = selected_threshold
+        metadata_payload["training_config"]["selected_label_config"] = dict(selected_label_config)
         metadata_payload["training_config"]["legacy_archive_dir"] = legacy_archive_dir
         metadata_path.write_text(json.dumps(metadata_payload, indent=2, sort_keys=True), encoding="utf-8")
     report.setdefault("artifact_metadata", {}).setdefault("training_config", {})
+    report["artifact_metadata"]["training_config"]["selected_threshold"] = selected_threshold
+    report["artifact_metadata"]["training_config"]["selected_label_config"] = dict(selected_label_config)
     report["artifact_metadata"]["training_config"]["certification_id"] = certification.get("certification_id", "")
     report["artifact_metadata"]["training_config"]["certification_verdict"] = certification.get("verdict", "")
     report["artifact_metadata"]["training_config"]["certification_failure_reasons"] = certification.get("failure_reasons", [])

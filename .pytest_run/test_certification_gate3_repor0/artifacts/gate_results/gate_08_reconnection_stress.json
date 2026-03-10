@@ -1,0 +1,12 @@
+{
+  "details": {
+    "executed": false,
+    "reason": "manual_gate_skipped"
+  },
+  "failure_reasons": [],
+  "gate_id": "gate_08_reconnection_stress",
+  "recommendations": [],
+  "status": "SKIPPED",
+  "title": "Reconnection stress",
+  "warnings": []
+}

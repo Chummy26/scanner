@@ -1,0 +1,29 @@
+{
+  "training_config": {
+    "certification_failure_reasons": [],
+    "certification_id": "cert-123",
+    "certification_verdict": "CERTIFIED",
+    "certification_warnings": [],
+    "effective_session_scope": {
+      "block_ids": [],
+      "session_ids": [
+        101
+      ]
+    },
+    "legacy_archive_dir": "",
+    "preflight": {
+      "qualifies_for_training": true,
+      "selected_threshold": 0.8
+    },
+    "preflight_off_vs_on_summary": {},
+    "runtime_audit_package_path": "",
+    "selected_label_config": {
+      "cost_floor_pct": 0.0,
+      "label_episode_window_days": null,
+      "label_percentile": null,
+      "label_threshold_mode": "fixed_threshold",
+      "threshold": 0.0
+    },
+    "selected_threshold": 0.8
+  }
+}

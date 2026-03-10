@@ -252,10 +252,12 @@ class ExchangeConfig:
 class SpreadConfig:
     """Global spread engine configuration."""
     min_spread_pct: float = 0.2
+    tracker_min_spread_pct: float = 0.05
     max_spread_pct: float = 50.0  # Cap to filter symbol name collisions
     min_volume_usd: float = 0.0  # 0 = top-of-book pricing (matches ArbMaster); L2 depth still available via /_export/v1/orderbook
     min_inverted: int = 0
     tracking_window_sec: int = 604800  # 7d
+    tracker_memory_window_sec: int = 43_200  # 12h
     broadcast_interval_sec: float = 0.15  # Real-time updates (~6.6x per second)
     depth_limit: int = 5  # Minimum depth supported by MEXC/Gate/XT (they accept 5,10,20)
     # Use all discovered symbols (no cap). The per-exchange filtering ensures
@@ -270,10 +272,13 @@ class SpreadConfig:
     # Tracker settings (history + invertidas counting)
     tracker_record_interval_sec: float = 15.0
     tracker_epsilon_pct: float = 0.02
-    tracker_max_records_per_pair: int = 0  # 0 = derive from tracking_window_sec / tracker_record_interval_sec
+    tracker_max_records_per_pair: int = 0  # 0 = derive from tracker_memory_window_sec / tracker_record_interval_sec
     tracker_gap_threshold_sec: float = 0.0  # 0 = derive from record interval (max(60, 4 * interval))
     tracker_capture_mode: str = "continuous_all_pairs"
     min_total_spread_pct: float = 1.0
+    label_cost_floor_pct: float = 1.0
+    label_percentile: int = 70
+    label_episode_window_days: int = 5
     tracker_db_path: str = ""
     symbols: List[str] = field(default_factory=lambda: [
         "BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "AVAX", "DOT",

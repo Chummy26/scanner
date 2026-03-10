@@ -65,11 +65,12 @@ class WSManager:
         self.config.tracker_db_path = str(tracker_db_path)
         self.tracker = SpreadTracker(
             window_sec=max(int(getattr(self.config, "tracking_window_sec", 604800) or 604800), 1),
+            memory_window_sec=max(int(getattr(self.config, "tracker_memory_window_sec", 43200) or 43200), 1),
             record_interval_sec=getattr(self.config, "tracker_record_interval_sec", 15.0),
             max_records_per_pair=getattr(self.config, "tracker_max_records_per_pair", 0),
             epsilon_pct=getattr(self.config, "tracker_epsilon_pct", 0.02),
-            history_enable_entry_spread_pct=getattr(self.config, "min_spread_pct", 0.1),
-            track_enable_entry_spread_pct=getattr(self.config, "min_spread_pct", 0.1),
+            history_enable_entry_spread_pct=getattr(self.config, "tracker_min_spread_pct", 0.05),
+            track_enable_entry_spread_pct=getattr(self.config, "tracker_min_spread_pct", 0.05),
             max_pairs=10_000,
             db_path=tracker_db_path,
             gap_threshold_sec=getattr(self.config, "tracker_gap_threshold_sec", 0.0),
@@ -1337,8 +1338,8 @@ class WSManager:
         capture_mode = str(getattr(self.config, "tracker_capture_mode", "continuous_all_pairs") or "continuous_all_pairs").strip().lower()
         capture_tracker_records = bool(capture_tracker and capture_mode == "continuous_all_pairs")
         tracker_shard_count = self._tracker_capture_shards()
-        raw_capture_records: List[tuple] = []
-        raw_capture_rejections: List[dict[str, Any]] = []
+        raw_capture_records: List[tuple] | None = [] if capture_tracker_records else None
+        raw_capture_rejections: List[dict[str, Any]] | None = [] if capture_tracker_records else None
         try:
             opportunities = self.engine.calculate_all(
                 on_spread=None,

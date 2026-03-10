@@ -1,0 +1,124 @@
+{
+  "details": {
+    "configs": [
+      {
+        "merge_off": {
+          "dataset_fingerprint": "fp-0-0.8",
+          "failure_reasons": [],
+          "qualifies_for_training": true,
+          "selected_label_config": {
+            "cost_floor_pct": 0.0,
+            "label_episode_window_days": null,
+            "label_percentile": null,
+            "label_threshold_mode": "fixed_threshold",
+            "threshold": 0.0
+          },
+          "selected_threshold": 0.8,
+          "selection_mode": "primary"
+        },
+        "merge_on": {
+          "dataset_fingerprint": "fp-1-0.8",
+          "failure_reasons": [],
+          "qualifies_for_training": true,
+          "selected_label_config": {
+            "cost_floor_pct": 0.0,
+            "label_episode_window_days": null,
+            "label_percentile": null,
+            "label_threshold_mode": "fixed_threshold",
+            "threshold": 0.0
+          },
+          "selected_threshold": 0.8,
+          "selection_mode": "primary"
+        },
+        "prediction_horizon_sec": 240,
+        "sequence_length": 4
+      },
+      {
+        "merge_off": {
+          "dataset_fingerprint": "fp-0-0.8",
+          "failure_reasons": [],
+          "qualifies_for_training": true,
+          "selected_label_config": {
+            "cost_floor_pct": 0.0,
+            "label_episode_window_days": null,
+            "label_percentile": null,
+            "label_threshold_mode": "fixed_threshold",
+            "threshold": 0.0
+          },
+          "selected_threshold": 0.8,
+          "selection_mode": "primary"
+        },
+        "merge_on": {
+          "dataset_fingerprint": "fp-1-0.8",
+          "failure_reasons": [],
+          "qualifies_for_training": true,
+          "selected_label_config": {
+            "cost_floor_pct": 0.0,
+            "label_episode_window_days": null,
+            "label_percentile": null,
+            "label_threshold_mode": "fixed_threshold",
+            "threshold": 0.0
+          },
+          "selected_threshold": 0.8,
+          "selection_mode": "primary"
+        },
+        "prediction_horizon_sec": 600,
+        "sequence_length": 8
+      },
+      {
+        "merge_off": {
+          "dataset_fingerprint": "fp-0-0.8",
+          "failure_reasons": [],
+          "qualifies_for_training": true,
+          "selected_label_config": {
+            "cost_floor_pct": 0.0,
+            "label_episode_window_days": null,
+            "label_percentile": null,
+            "label_threshold_mode": "fixed_threshold",
+            "threshold": 0.0
+          },
+          "selected_threshold": 0.8,
+          "selection_mode": "primary"
+        },
+        "merge_on": {
+          "dataset_fingerprint": "fp-1-0.8",
+          "failure_reasons": [],
+          "qualifies_for_training": true,
+          "selected_label_config": {
+            "cost_floor_pct": 0.0,
+            "label_episode_window_days": null,
+            "label_percentile": null,
+            "label_threshold_mode": "fixed_threshold",
+            "threshold": 0.0
+          },
+          "selected_threshold": 0.8,
+          "selection_mode": "primary"
+        },
+        "prediction_horizon_sec": 14400,
+        "sequence_length": 15
+      }
+    ],
+    "dataset_fingerprints": {
+      "seq15_h14400_merge_off": "fp-0-0.8",
+      "seq15_h14400_merge_on": "fp-1-0.8",
+      "seq4_h240_merge_off": "fp-0-0.8",
+      "seq4_h240_merge_on": "fp-1-0.8",
+      "seq8_h600_merge_off": "fp-0-0.8",
+      "seq8_h600_merge_on": "fp-1-0.8"
+    },
+    "qualifying_configs": [
+      "seq4_h240_merge_off:0.8",
+      "seq4_h240_merge_on:0.8",
+      "seq8_h600_merge_off:0.8",
+      "seq8_h600_merge_on:0.8",
+      "seq15_h14400_merge_off:0.8",
+      "seq15_h14400_merge_on:0.8"
+    ]
+  },
+  "failure_reasons": [],
+  "gate_id": "gate_10_dual_mode_preflight",
+  "recommendations": [],
+  "status": "PASS",
+  "title": "Dual-mode preflight",
+  "warnings": []
+}

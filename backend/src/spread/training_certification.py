@@ -16,13 +16,79 @@ from .ml_dataset import FEATURE_NAMES, build_dataset_bundle, _load_blocks_from_s
 from .spread_tracker import SpreadRecord, compute_closed_episodes
 
 CHECKPOINT_WINDOW_SEC = 30 * 60
-DEFAULT_CERTIFICATION_THRESHOLDS = [1.0, 0.8, 0.7]
+DEFAULT_CERTIFICATION_THRESHOLDS = [0.8, 1.0, 1.2]
+DEFAULT_CERTIFICATION_LABEL_PERCENTILES = [60, 70, 80]
 DEFAULT_DUAL_PREFLIGHT_CONFIGS = [
     {"sequence_length": 4, "prediction_horizon_sec": 240},
     {"sequence_length": 8, "prediction_horizon_sec": 600},
     {"sequence_length": 15, "prediction_horizon_sec": 14_400},
 ]
 DEFAULT_RUNTIME_AUDIT_STALENESS_SEC = 24 * 60 * 60
+
+
+def _normalize_threshold_values(thresholds: list[float] | None) -> list[float]:
+    values = [float(value) for value in (thresholds or DEFAULT_CERTIFICATION_THRESHOLDS)]
+    normalized: list[float] = []
+    seen: set[float] = set()
+    for value in values:
+        if not math.isfinite(value):
+            continue
+        numeric = float(value)
+        if numeric in seen:
+            continue
+        seen.add(numeric)
+        normalized.append(numeric)
+    return normalized or [float(value) for value in DEFAULT_CERTIFICATION_THRESHOLDS]
+
+
+def _normalize_label_percentiles(label_percentiles: list[int] | None) -> list[int]:
+    values = [int(value) for value in (label_percentiles or DEFAULT_CERTIFICATION_LABEL_PERCENTILES)]
+    normalized: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        numeric = max(0, min(100, int(value)))
+        if numeric in seen:
+            continue
+        seen.add(numeric)
+        normalized.append(numeric)
+    return normalized or [int(value) for value in DEFAULT_CERTIFICATION_LABEL_PERCENTILES]
+
+
+def _adaptive_label_requested(
+    *,
+    thresholds: list[float] | None,
+    label_percentiles: list[int] | None,
+) -> bool:
+    return label_percentiles is not None or thresholds is None
+
+
+def _label_config_payload(label_config: dict[str, Any] | None) -> dict[str, Any]:
+    config = dict(label_config or {})
+    percentile_raw = config.get("label_percentile")
+    percentile = None if percentile_raw is None else int(percentile_raw)
+    window_days_raw = config.get("label_episode_window_days")
+    window_days = None if window_days_raw is None else int(window_days_raw)
+    return {
+        "threshold": float(config.get("threshold", config.get("cost_floor_pct", 0.0)) or 0.0),
+        "cost_floor_pct": float(config.get("cost_floor_pct", config.get("threshold", 0.0)) or 0.0),
+        "label_percentile": percentile,
+        "label_episode_window_days": window_days,
+        "label_threshold_mode": str(config.get("label_threshold_mode") or "fixed_threshold"),
+    }
+
+
+def _dataset_build_kwargs_for_label_config(label_config: dict[str, Any] | None) -> dict[str, Any]:
+    payload = _label_config_payload(label_config)
+    kwargs: dict[str, Any] = {"min_total_spread_pct": float(payload["cost_floor_pct"])}
+    if payload["label_threshold_mode"] == "rolling_pair_percentile":
+        kwargs.update(
+            {
+                "label_cost_floor_pct": float(payload["cost_floor_pct"]),
+                "label_percentile": int(payload["label_percentile"]) if payload["label_percentile"] is not None else 70,
+                "label_episode_window_days": int(payload["label_episode_window_days"]) if payload["label_episode_window_days"] is not None else 5,
+            }
+        )
+    return kwargs
 
 
 def _utc_now_iso() -> str:
@@ -578,17 +644,19 @@ def run_training_certification(
     artifact_dir: Path,
     sequence_length: int,
     prediction_horizon_sec: int,
-    thresholds: list[float] | None,
-    selected_session_ids: list[int] | None,
-    selected_block_ids: list[int] | None,
-    allow_cross_session_merge: bool,
-    max_session_gap_sec: float | None,
-    regime_shift_score_threshold: float | None,
-    certification_mode: str,
-    max_certification_duration_sec: int,
-    allow_legacy_sessions: bool,
-    runtime_audit_dir: Path | None,
-    run_reconnection_stress: bool,
+    thresholds: list[float] | None = None,
+    label_percentiles: list[int] | None = None,
+    selected_session_ids: list[int] | None = None,
+    selected_block_ids: list[int] | None = None,
+    allow_cross_session_merge: bool = False,
+    max_session_gap_sec: float | None = None,
+    regime_shift_score_threshold: float | None = 3.0,
+    certification_mode: str = "full",
+    max_certification_duration_sec: int = 300,
+    label_episode_window_days: int = 5,
+    allow_legacy_sessions: bool = False,
+    runtime_audit_dir: Path | None = None,
+    run_reconnection_stress: bool = False,
     preflight_fn: Callable[..., dict[str, Any]],
     dataset_fingerprint_fn: Callable[..., str],
 ) -> dict[str, Any]:
@@ -596,7 +664,9 @@ def run_training_certification(
     artifact_root = Path(artifact_dir)
     gate_dir = artifact_root / "gate_results"
     started_at = time.perf_counter()
-    threshold_values = [float(value) for value in (thresholds or DEFAULT_CERTIFICATION_THRESHOLDS)]
+    threshold_values = _normalize_threshold_values(thresholds)
+    adaptive_label_mode = _adaptive_label_requested(thresholds=thresholds, label_percentiles=label_percentiles)
+    effective_label_percentiles = _normalize_label_percentiles(label_percentiles) if adaptive_label_mode else []
     operational_min_total_spread_pct = min(threshold_values) if threshold_values else 0.0
 
     with sqlite3.connect(state_path, timeout=30.0) as conn:
@@ -650,7 +720,6 @@ def run_training_certification(
             state_path=state_path,
             sequence_length=sequence_length,
             prediction_horizon_sec=prediction_horizon_sec,
-            min_total_spread_pct=operational_min_total_spread_pct,
             selected_block_ids=effective_block_ids or None,
             selected_session_ids=effective_session_ids or None,
             selected_only=False,
@@ -658,6 +727,19 @@ def run_training_certification(
             allow_cross_session_merge=allow_cross_session_merge,
             max_session_gap_sec=max_session_gap_sec,
             regime_shift_score_threshold=regime_shift_score_threshold,
+            **_dataset_build_kwargs_for_label_config(
+                {
+                    "threshold": operational_min_total_spread_pct,
+                    "cost_floor_pct": operational_min_total_spread_pct,
+                    "label_percentile": (
+                        max(effective_label_percentiles)
+                        if adaptive_label_mode and effective_label_percentiles
+                        else None
+                    ),
+                    "label_episode_window_days": int(max(label_episode_window_days, 1)) if adaptive_label_mode else None,
+                    "label_threshold_mode": "rolling_pair_percentile" if adaptive_label_mode else "fixed_threshold",
+                }
+            ),
         ) if records else None
         block_diagnostics = dict(bundle.summary.get("block_diagnostics", {})) if bundle is not None else {}
         total_blocks = max(len(blocks), 1)
@@ -859,6 +941,8 @@ def run_training_certification(
                     sequence_length=int(config["sequence_length"]),
                     prediction_horizon_sec=int(config["prediction_horizon_sec"]),
                     thresholds=list(threshold_values),
+                    label_percentiles=list(effective_label_percentiles) if adaptive_label_mode else None,
+                    label_episode_window_days=int(max(label_episode_window_days, 1)),
                     selected_session_ids=effective_session_ids or None,
                     selected_block_ids=effective_block_ids or None,
                     allow_cross_session_merge=merge_enabled,
@@ -869,12 +953,12 @@ def run_training_certification(
                     min_test_positive_samples=1,
                 )
                 fingerprint_threshold = float(preflight.get("selected_threshold") or operational_min_total_spread_pct)
+                selected_label_config = _label_config_payload(preflight.get("selected_label_config"))
                 try:
                     config_bundle = build_dataset_bundle(
                         state_path=state_path,
                         sequence_length=int(config["sequence_length"]),
                         prediction_horizon_sec=int(config["prediction_horizon_sec"]),
-                        min_total_spread_pct=fingerprint_threshold,
                         selected_block_ids=effective_block_ids or None,
                         selected_session_ids=effective_session_ids or None,
                         selected_only=False,
@@ -882,11 +966,37 @@ def run_training_certification(
                         allow_cross_session_merge=merge_enabled,
                         max_session_gap_sec=max_session_gap_sec,
                         regime_shift_score_threshold=regime_shift_score_threshold,
+                        **_dataset_build_kwargs_for_label_config(
+                            selected_label_config or {
+                                "threshold": fingerprint_threshold,
+                                "cost_floor_pct": fingerprint_threshold,
+                                "label_percentile": None,
+                                "label_episode_window_days": None,
+                                "label_threshold_mode": "fixed_threshold",
+                            }
+                        ),
                     )
                     fingerprint = dataset_fingerprint_fn(
                         state_path=state_path,
                         bundle=config_bundle,
                         min_total_spread_pct=fingerprint_threshold,
+                        label_cost_floor_pct=(
+                            float(selected_label_config["cost_floor_pct"])
+                            if selected_label_config
+                            and selected_label_config.get("label_threshold_mode") == "rolling_pair_percentile"
+                            else None
+                        ),
+                        label_percentile=(
+                            int(selected_label_config["label_percentile"])
+                            if selected_label_config and selected_label_config.get("label_percentile") is not None
+                            else None
+                        ),
+                        label_episode_window_days=(
+                            int(selected_label_config["label_episode_window_days"])
+                            if selected_label_config and selected_label_config.get("label_episode_window_days") is not None
+                            else None
+                        ),
+                        label_threshold_mode=str(selected_label_config.get("label_threshold_mode") or "fixed_threshold"),
                         selected_session_ids=effective_session_ids or None,
                         selected_block_ids=effective_block_ids or None,
                         allow_cross_session_merge=merge_enabled,
@@ -907,6 +1017,7 @@ def run_training_certification(
                 config_entry[key] = {
                     "qualifies_for_training": bool(preflight.get("qualifies_for_training")),
                     "selected_threshold": preflight.get("selected_threshold"),
+                    "selected_label_config": dict(selected_label_config),
                     "selection_mode": preflight.get("selection_mode"),
                     "failure_reasons": reason_list,
                     "dataset_fingerprint": fingerprint,

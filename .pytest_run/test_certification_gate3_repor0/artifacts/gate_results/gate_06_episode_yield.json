@@ -1,0 +1,20 @@
+{
+  "details": {
+    "duration_sec_quantiles": {
+      "p50": 120.0,
+      "p90": 120.0
+    },
+    "episode_count": 2,
+    "episodes_per_hour": 1.0,
+    "total_spread_quantiles": {
+      "p50": 1.315,
+      "p90": 1.327
+    }
+  },
+  "failure_reasons": [],
+  "gate_id": "gate_06_episode_yield",
+  "recommendations": [],
+  "status": "PASS",
+  "title": "Episode yield",
+  "warnings": []
+}

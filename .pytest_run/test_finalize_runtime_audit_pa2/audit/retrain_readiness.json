@@ -1,0 +1,5 @@
+{
+  "min_total_spread_pct": 1.0,
+  "qualified_episode_count_at_threshold": 3,
+  "retrain_readiness_status": "below_minimum"
+}

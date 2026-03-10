@@ -1,0 +1,244 @@
+{
+  "artifacts": {},
+  "auxiliary_short_block_smoke": {
+    "all_negative_expected": true,
+    "auxiliary_short_block_smoke": true,
+    "dataset_status": "built",
+    "dataset_summary": {
+      "block_diagnostics": {
+        "duration_sec_quantiles": {
+          "max": 705.0,
+          "p10": 705.0,
+          "p25": 705.0,
+          "p50": 705.0,
+          "p75": 705.0,
+          "p90": 705.0
+        },
+        "feature_window_feasibility": {
+          "eligible_blocks_for_sequence_length": 1,
+          "eligible_sessions_with_any_eligible_block": 1,
+          "sequence_length": 15
+        },
+        "inter_record_interval_sec_quantiles": {
+          "max": 15.0,
+          "p10": 15.0,
+          "p25": 15.0,
+          "p50": 15.0,
+          "p75": 15.0,
+          "p90": 15.0
+        },
+        "irregular_block_count": 0,
+        "max_to_median_interval_ratio_quantiles": {
+          "max": 1.0,
+          "p10": 1.0,
+          "p25": 1.0,
+          "p50": 1.0,
+          "p75": 1.0,
+          "p90": 1.0
+        },
+        "record_count_quantiles": {
+          "max": 48.0,
+          "p10": 48.0,
+          "p25": 48.0,
+          "p50": 48.0,
+          "p75": 48.0,
+          "p90": 48.0
+        },
+        "record_count_threshold_counts": {
+          "ge_10": 1,
+          "ge_12": 1,
+          "ge_15": 1,
+          "ge_20": 1,
+          "ge_8": 1
+        },
+        "session_summaries": {
+          "1": {
+            "duration_sec_quantiles": {
+              "max": 705.0,
+              "p10": 705.0,
+              "p25": 705.0,
+              "p50": 705.0,
+              "p75": 705.0,
+              "p90": 705.0
+            },
+            "eligible_blocks_for_sequence_length": 1,
+            "inter_record_interval_sec_quantiles": {
+              "max": 15.0,
+              "p10": 15.0,
+              "p25": 15.0,
+              "p50": 15.0,
+              "p75": 15.0,
+              "p90": 15.0
+            },
+            "irregular_block_count": 0,
+            "max_record_count": 48,
+            "max_to_median_interval_ratio_quantiles": {
+              "max": 1.0,
+              "p10": 1.0,
+              "p25": 1.0,
+              "p50": 1.0,
+              "p75": 1.0,
+              "p90": 1.0
+            },
+            "num_blocks": 1,
+            "record_count_quantiles": {
+              "max": 48.0,
+              "p10": 48.0,
+              "p25": 48.0,
+              "p50": 48.0,
+              "p75": 48.0,
+              "p90": 48.0
+            },
+            "record_count_threshold_counts": {
+              "ge_10": 1,
+              "ge_12": 1,
+              "ge_15": 1,
+              "ge_20": 1,
+              "ge_8": 1
+            }
+          }
+        }
+      },
+      "block_ids_used": [],
+      "blocks_used": 0,
+      "class_has_nan": false,
+      "cross_session_boundaries": 0,
+      "cross_session_gap_threshold_sec": null,
+      "cross_session_merge_diagnostics": {
+        "applied_count": 0,
+        "calibration_log": [],
+        "candidate_count": 0,
+        "gap_sec_quantiles": {
+          "max": 0.0,
+          "p10": 0.0,
+          "p25": 0.0,
+          "p50": 0.0,
+          "p75": 0.0,
+          "p90": 0.0
+        },
+        "max_session_gap_sec": null,
+        "rejected_gap_count": 0,
+        "rejected_regime_shift_count": 0,
+        "score_quantiles": {
+          "max": 0.0,
+          "p10": 0.0,
+          "p25": 0.0,
+          "p50": 0.0,
+          "p75": 0.0,
+          "p90": 0.0
+        },
+        "threshold": 3.0,
+        "window_size_quantiles": {
+          "max": 0.0,
+          "p10": 0.0,
+          "p25": 0.0,
+          "p50": 0.0,
+          "p75": 0.0,
+          "p90": 0.0
+        }
+      },
+      "cross_session_merge_enabled": false,
+      "cross_session_merges_applied": 0,
+      "episode_diagnostics": {
+        "duration_sec_quantiles": {
+          "max": 120.0,
+          "p10": 78.0,
+          "p25": 82.5,
+          "p50": 90.0,
+          "p75": 105.0,
+          "p90": 114.0
+        },
+        "episode_count": 3,
+        "total_spread_quantiles": {
+          "max": 1.17,
+          "p10": 1.1380000000000001,
+          "p25": 1.15,
+          "p50": 1.17,
+          "p75": 1.17,
+          "p90": 1.17
+        }
+      },
+      "eta_has_nan": false,
+      "feature_abs_sum": 0.0,
+      "feature_has_inf": false,
+      "feature_has_nan": false,
+      "label_audit": {
+        "future_episode_total_spread_quantiles": {
+          "max": 0.0,
+          "p10": 0.0,
+          "p25": 0.0,
+          "p50": 0.0,
+          "p75": 0.0,
+          "p90": 0.0
+        },
+        "positive_entry_spread_buckets": {
+          "0_30_to_0_50": 0,
+          "0_50_to_1_00": 0,
+          "1_00_to_2_00": 0,
+          "ge_2_00": 0,
+          "lt_0_30": 0
+        },
+        "right_censored_windows": 34,
+        "timeout_peak_future_total_spread_buckets": {
+          "0_30_to_0_50": 0,
+          "0_50_to_0_80": 0,
+          "0_80_to_1_00": 0,
+          "ge_1_00": 0,
+          "lt_0_30": 0
+        },
+        "timeouts_with_only_sub_threshold_episode": 0,
+        "timeouts_without_future_episode": 0
+      },
+      "label_cost_floor_pct": 1.0,
+      "label_episode_window_days": 5,
+      "label_percentile": 70.0,
+      "label_threshold_mode": "fixed_threshold",
+      "label_thresholds": {},
+      "labeling_method": "episode_take_profit_time_barrier",
+      "labeling_timeout_only": true,
+      "manual_feature_checks": [],
+      "manual_label_checks": [],
+      "min_total_spread_pct": 0.0,
+      "num_blocks": 1,
+      "num_cross_block_windows": 0,
+      "num_cross_session_windows": 0,
+      "num_negative_samples": 0,
+      "num_pairs": 0,
+      "num_positive_samples": 0,
+      "num_samples": 0,
+      "num_sessions": 1,
+      "prediction_horizon_sec": 14400,
+      "selected_block_ids": [
+        1
+      ],
+      "selected_session_ids": [],
+      "sequence_length": 15,
+      "session_ids_used": [],
+      "sessions_used": 0,
+      "shape": [
+        0,
+        15,
+        25
+      ],
+      "skipped_blocks_too_short": 0,
+      "skipped_windows_cross_session_boundary": 0,
+      "skipped_windows_right_censored": 34,
+      "state_saved_at": 1700000720.0,
+      "state_storage_kind": "sqlite_blocks"
+    },
+    "not_for_model_quality_decision": true,
+    "selected_block_duration_sec": 705.0,
+    "selected_block_id": 1,
+    "selected_block_record_count": 48,
+    "status": "completed",
+    "training_report": {
+      "artifacts": {},
+      "metrics": {},
+      "model_status": "skipped",
+      "thresholds": {}
+    }
+  },
+  "metrics": {},
+  "model_status": "skipped",
+  "thresholds": {}
+}

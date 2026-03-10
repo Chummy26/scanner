@@ -1,0 +1,166 @@
+{
+  "alert_counts": {},
+  "api_probe_latency_ms": {
+    "count": 0,
+    "max": 0.0,
+    "mean": 0.0,
+    "min": 0.0,
+    "p95": 0.0,
+    "p99": 0.0
+  },
+  "context_coverage": {
+    "eligible_ready_pairs": 0,
+    "insufficient_empirical_context_pairs": 0,
+    "insufficient_empirical_context_rate": 0.0,
+    "near_miss_reasons": {},
+    "ready_long_fallback_pairs": 0,
+    "ready_short_pairs": 0,
+    "support_long": {
+      "count": 0,
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    },
+    "support_short": {
+      "count": 0,
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    }
+  },
+  "counts": {
+    "alerts": 0,
+    "events": 2,
+    "samples": 0
+  },
+  "dashboard_validation": {
+    "above_band_mismatch_count": 0,
+    "actionable_without_range_count": 0,
+    "adjusting_count": 0,
+    "book_age_asymmetry_p95_sec": {
+      "count": 0,
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    },
+    "book_age_max_sec": {
+      "count": 0,
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    },
+    "book_age_median_sec": {
+      "count": 0,
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    },
+    "book_age_p95_sec": {
+      "count": 0,
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    },
+    "empty_invalid_quote_rate_pct": {
+      "count": 0,
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    },
+    "probe_count": 0,
+    "range_core_mismatch_count": 0,
+    "reason_lane_message_mismatch_count": 0,
+    "strong_eta_divergent_count": 0
+  },
+  "duration_sec": 120,
+  "end_to_end_latency_ms": {
+    "count": 1,
+    "max": 15.0041,
+    "mean": 15.0041,
+    "min": 15.0041,
+    "p95": 15.0041,
+    "p99": 15.0041
+  },
+  "finished_at_utc": "2026-03-10T22:26:41.084042+00:00",
+  "inference_latency_ms": {
+    "count": 1,
+    "max": 10.0,
+    "mean": 10.0,
+    "min": 10.0,
+    "p95": 10.0,
+    "p99": 10.0
+  },
+  "legacy_comparison": {
+    "status": "not_requested"
+  },
+  "model_status_counts": {
+    "ready": 1
+  },
+  "psi_monitoring": {
+    "reason": "psi reference missing from metadata",
+    "status": "unavailable"
+  },
+  "resource_summary": {
+    "cpu_percent": {
+      "count": 0,
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    },
+    "db_size_bytes": {
+      "count": 0,
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    },
+    "rss_bytes": {
+      "count": 0,
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    }
+  },
+  "retrain_readiness": {
+    "min_total_spread_pct": 1.0,
+    "qualified_episode_count_at_threshold": 0,
+    "retrain_readiness_status": "below_minimum"
+  },
+  "run_status": "completed",
+  "signal_confirmation_summary": {
+    "awaiting_confirmation": 1,
+    "confirmable_now": 0,
+    "confirmed": 0,
+    "not_confirmed": 0,
+    "total": 1
+  },
+  "signal_counts": {
+    "EXECUTE": 1
+  },
+  "snapshot_replay": {
+    "confirmation_summary": {},
+    "deduped_signal_count": 0,
+    "raw_actionable_state_count": 0,
+    "status": "unavailable"
+  },
+  "ws_ingest_latency_ms": {}
+}

@@ -164,6 +164,28 @@ def test_ws_manager_hot_path_enqueues_and_reuses_prediction_when_tracker_marker_
         market_data._market_data_ready = original_ready
 
 
+def test_ws_manager_skips_raw_record_collection_when_capture_tracker_is_disabled(monkeypatch, tmp_path: Path):
+    config = SpreadConfig(exchanges=[], symbols=[], tracker_db_path=str(tmp_path / "tracker.sqlite"))
+    ws_mgr = WSManager(config)
+    ws_mgr.tracker = _FakeTracker()
+    ws_mgr.ml_analyzer = _FakeAnalyzer()
+    captured_args: list[tuple[object, object]] = []
+
+    def _fake_calculate_all(on_spread=None, record_sink=None, rejection_sink=None):
+        captured_args.append((record_sink, rejection_sink))
+        return [_make_opportunity()]
+
+    ws_mgr.engine.calculate_all = _fake_calculate_all
+    original_ready = market_data._market_data_ready
+    try:
+        _mark_post_warmup(ws_mgr, monkeypatch)
+        ws_mgr._do_calc_enrich(False)
+    finally:
+        market_data._market_data_ready = original_ready
+
+    assert captured_args == [(None, None)]
+
+
 def test_ws_manager_hot_path_enqueues_refresh_when_tracker_marker_changes(monkeypatch, tmp_path: Path):
     config = SpreadConfig(exchanges=[], symbols=[], tracker_db_path=str(tmp_path / "tracker.sqlite"))
     ws_mgr = WSManager(config)

@@ -1,0 +1,83 @@
+{
+  "artifact_metadata": {
+    "training_config": {
+      "certification_failure_reasons": [],
+      "certification_id": "cert-123",
+      "certification_verdict": "CERTIFIED",
+      "certification_warnings": [],
+      "effective_session_scope": {
+        "block_ids": [],
+        "session_ids": [
+          101
+        ]
+      },
+      "preflight_off_vs_on_summary": {},
+      "runtime_audit_package_path": "",
+      "selected_label_config": {
+        "cost_floor_pct": 0.0,
+        "label_episode_window_days": null,
+        "label_percentile": null,
+        "label_threshold_mode": "fixed_threshold",
+        "threshold": 0.0
+      },
+      "selected_threshold": 0.8
+    }
+  },
+  "artifacts": {
+    "report_path": "C:\\Users\\nicoolas\\Pictures\\scanner\\scanner\\.pytest_run\\test_run_clean_training_cycle_1\\artifacts\\best_lstm_model.report.json"
+  },
+  "certification_id": "cert-123",
+  "data_certification": {
+    "certification_id": "cert-123",
+    "certified": true,
+    "effective_session_scope": {
+      "block_ids": [],
+      "session_ids": [
+        101
+      ]
+    },
+    "failure_reasons": [],
+    "gate_results": {
+      "gate_10_dual_mode_preflight": {
+        "details": {
+          "qualifying_configs": [
+            "seq4_h240_merge_off:0.8"
+          ]
+        }
+      }
+    },
+    "runtime_audit_package_path": "",
+    "verdict": "CERTIFIED",
+    "warnings": []
+  },
+  "legacy_archive_dir": "",
+  "preflight": {
+    "qualifies_for_training": true,
+    "selected_threshold": 0.8
+  },
+  "training": {
+    "certification_id": "cert-123",
+    "selected_label_config": {
+      "cost_floor_pct": 0.0,
+      "label_episode_window_days": null,
+      "label_percentile": null,
+      "label_threshold_mode": "fixed_threshold",
+      "threshold": 0.0
+    },
+    "selected_threshold": 0.8
+  },
+  "training_config": {
+    "certification_id": "cert-123",
+    "certification_verdict": "CERTIFIED",
+    "preflight_off_vs_on_summary": {},
+    "runtime_audit_package_path": "",
+    "selected_label_config": {
+      "cost_floor_pct": 0.0,
+      "label_episode_window_days": null,
+      "label_percentile": null,
+      "label_threshold_mode": "fixed_threshold",
+      "threshold": 0.0
+    },
+    "selected_threshold": 0.8
+  }
+}

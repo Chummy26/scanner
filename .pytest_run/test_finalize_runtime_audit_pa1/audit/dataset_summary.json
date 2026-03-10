@@ -1,0 +1,20 @@
+{
+  "class_has_nan": false,
+  "error": "file is not a database",
+  "eta_has_nan": false,
+  "feature_abs_sum": 0.0,
+  "feature_has_inf": false,
+  "feature_has_nan": false,
+  "manual_feature_checks": [],
+  "manual_label_checks": [],
+  "model_status": "dataset_failed",
+  "num_cross_block_windows": 0,
+  "num_negative_samples": 0,
+  "num_positive_samples": 0,
+  "num_samples": 0,
+  "shape": [
+    0,
+    15,
+    10
+  ]
+}

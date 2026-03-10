@@ -56,6 +56,7 @@ def _save_ready_artifact(
     platt_scale: float = 1.0,
     platt_bias: float = 0.0,
     selected_threshold: float | None = None,
+    training_config_extra: dict | None = None,
 ) -> None:
     model = SpreadSequenceLSTM(input_sz=len(FEATURE_NAMES), hidden_sz=8, num_layers=1, dropout=0.0)
     with torch.no_grad():
@@ -87,6 +88,7 @@ def _save_ready_artifact(
             "prediction_horizon_sec": 14_400,
             "selected_threshold": float(selected_threshold) if selected_threshold is not None else execute_threshold,
             "min_total_spread_pct": float(selected_threshold) if selected_threshold is not None else execute_threshold,
+            **dict(training_config_extra or {}),
         },
         use_attention=True,
         trained_at_utc="2026-03-07T00:00:00+00:00",
@@ -187,6 +189,32 @@ def test_analyzer_fails_closed_on_threshold_mismatch(tmp_path: Path):
     assert result["model_status"] == "threshold_mismatch"
     assert result["signal_action"] == "WAIT"
     assert result["signal_reason_code"] == "threshold_mismatch"
+
+
+def test_analyzer_accepts_adaptive_label_metadata_when_operational_floor_matches(tmp_path: Path):
+    _save_ready_artifact(
+        tmp_path,
+        sequence_length=12,
+        execute_threshold=0.45,
+        selected_threshold=1.0,
+        training_config_extra={
+            "label_threshold_mode": "rolling_pair_percentile",
+            "label_cost_floor_pct": 1.0,
+            "label_percentile": 70,
+            "label_episode_window_days": 5,
+            "selected_label_config": {
+                "threshold": 1.0,
+                "cost_floor_pct": 1.0,
+                "label_percentile": 70,
+                "label_episode_window_days": 5,
+                "label_threshold_mode": "rolling_pair_percentile",
+            },
+        },
+    )
+
+    analyzer = SpreadMLAnalyzer(sequence_length=12, artifact_dir=tmp_path, min_total_spread_pct=1.0)
+
+    assert analyzer.model_status == "ready"
 
 
 def test_analyzer_backward_compat_loads_legacy_4_feature_artifact(tmp_path: Path):

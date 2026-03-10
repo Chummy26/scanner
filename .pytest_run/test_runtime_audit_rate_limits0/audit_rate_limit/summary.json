@@ -1,0 +1,148 @@
+{
+  "alert_counts": {
+    "gap_detected": 2
+  },
+  "api_probe_latency_ms": {
+    "count": 0,
+    "max": 0.0,
+    "mean": 0.0,
+    "min": 0.0,
+    "p95": 0.0,
+    "p99": 0.0
+  },
+  "context_coverage": {
+    "eligible_ready_pairs": 0,
+    "insufficient_empirical_context_pairs": 0,
+    "insufficient_empirical_context_rate": 0.0,
+    "near_miss_reasons": {},
+    "ready_long_fallback_pairs": 0,
+    "ready_short_pairs": 0,
+    "support_long": {
+      "count": 0,
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    },
+    "support_short": {
+      "count": 0,
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    }
+  },
+  "counts": {
+    "alerts": 2,
+    "events": 0,
+    "samples": 0
+  },
+  "dashboard_validation": {
+    "above_band_mismatch_count": 0,
+    "actionable_without_range_count": 0,
+    "adjusting_count": 0,
+    "book_age_asymmetry_p95_sec": {
+      "count": 0,
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    },
+    "book_age_max_sec": {
+      "count": 0,
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    },
+    "book_age_median_sec": {
+      "count": 0,
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    },
+    "book_age_p95_sec": {
+      "count": 0,
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    },
+    "empty_invalid_quote_rate_pct": {
+      "count": 0,
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    },
+    "probe_count": 0,
+    "range_core_mismatch_count": 0,
+    "reason_lane_message_mismatch_count": 0,
+    "strong_eta_divergent_count": 0
+  },
+  "end_to_end_latency_ms": {
+    "count": 0,
+    "max": 0.0,
+    "mean": 0.0,
+    "min": 0.0,
+    "p95": 0.0,
+    "p99": 0.0
+  },
+  "finished_at_utc": "2026-03-10T22:26:40.954019+00:00",
+  "inference_latency_ms": {
+    "count": 0,
+    "max": 0.0,
+    "mean": 0.0,
+    "min": 0.0,
+    "p95": 0.0,
+    "p99": 0.0
+  },
+  "legacy_comparison": {
+    "status": "not_requested"
+  },
+  "manifest": {
+    "duration_sec": 120,
+    "gap_threshold_sec": 60.0,
+    "record_interval_sec": 15.0,
+    "resource_sample_sec": 60,
+    "started_at_utc": "2026-03-10T22:26:40.951796+00:00",
+    "status_sample_sec": 5
+  },
+  "model_status_counts": {},
+  "resource_summary": {
+    "cpu_percent": {
+      "count": 0,
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    },
+    "db_size_bytes": {
+      "count": 0,
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    },
+    "rss_bytes": {
+      "count": 0,
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    }
+  },
+  "signal_counts": {},
+  "ws_ingest_latency_ms": {}
+}

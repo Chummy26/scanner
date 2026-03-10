@@ -1,0 +1,11 @@
+{
+  "details": {
+    "shifted_checkpoint_pairs": []
+  },
+  "failure_reasons": [],
+  "gate_id": "gate_04_checkpoint_stationarity",
+  "recommendations": [],
+  "status": "PASS",
+  "title": "Checkpoint stationarity",
+  "warnings": []
+}

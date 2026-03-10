@@ -1,0 +1,13 @@
+{
+  "details": {
+    "runtime_audit_package_path": ""
+  },
+  "failure_reasons": [],
+  "gate_id": "gate_11_runtime_audit_health",
+  "recommendations": [],
+  "status": "WARNING",
+  "title": "Runtime audit health",
+  "warnings": [
+    "runtime_audit_unavailable"
+  ]
+}

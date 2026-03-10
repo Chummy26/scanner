@@ -1,0 +1,123 @@
+{
+  "artifact_metadata": {
+    "training_config": {
+      "certification_failure_reasons": [],
+      "certification_id": "test-certification-id",
+      "certification_verdict": "CERTIFIED",
+      "certification_warnings": [],
+      "effective_session_scope": {
+        "effective_session_ids": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "legacy_session_ids": [],
+        "legacy_sessions_excluded": 0,
+        "selected_block_ids": [],
+        "selected_session_ids": []
+      },
+      "preflight_off_vs_on_summary": {
+        "qualifying_configs": [
+          "seq4_h240_merge_off"
+        ]
+      },
+      "runtime_audit_package_path": "",
+      "selected_label_config": {
+        "cost_floor_pct": 0.0,
+        "label_episode_window_days": null,
+        "label_percentile": null,
+        "label_threshold_mode": "fixed_threshold",
+        "threshold": 0.0
+      },
+      "selected_threshold": 0.8
+    }
+  },
+  "artifacts": {
+    "audit_path": "C:\\Users\\nicoolas\\Pictures\\scanner\\scanner\\.pytest_run\\test_clean_training_cycle_arch0\\artifacts_clean_cycle\\best_lstm_model.audit.md",
+    "metadata_path": "C:\\Users\\nicoolas\\Pictures\\scanner\\scanner\\.pytest_run\\test_clean_training_cycle_arch0\\artifacts_clean_cycle\\best_lstm_model.meta.json",
+    "report_path": "C:\\Users\\nicoolas\\Pictures\\scanner\\scanner\\.pytest_run\\test_clean_training_cycle_arch0\\artifacts_clean_cycle\\best_lstm_model.report.json"
+  },
+  "certification_id": "test-certification-id",
+  "data_certification": {
+    "certification_duration_sec": 0.01,
+    "certification_id": "test-certification-id",
+    "certification_mode": "full",
+    "certified": true,
+    "effective_session_scope": {
+      "effective_session_ids": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "legacy_session_ids": [],
+      "legacy_sessions_excluded": 0,
+      "selected_block_ids": [],
+      "selected_session_ids": []
+    },
+    "failure_reasons": [],
+    "gate_results": {
+      "gate_10_dual_mode_preflight": {
+        "metrics": {
+          "qualifying_configs": [
+            "seq4_h240_merge_off"
+          ]
+        }
+      }
+    },
+    "legacy_session_ids": [],
+    "legacy_sessions_excluded": 0,
+    "preflight_off_vs_on_summary": {
+      "qualifying_configs": [
+        "seq4_h240_merge_off"
+      ]
+    },
+    "recommendations": [],
+    "runtime_audit_package_path": "",
+    "verdict": "CERTIFIED",
+    "warnings": []
+  },
+  "legacy_archive_dir": "C:\\Users\\nicoolas\\Pictures\\scanner\\scanner\\.pytest_run\\test_clean_training_cycle_arch0\\artifacts_clean_cycle\\legacy_artifacts\\20260310T222640Z",
+  "preflight": {
+    "block_diagnostics": {},
+    "qualifies_for_training": true,
+    "selected_threshold": 0.8,
+    "selection_mode": "primary",
+    "thresholds": {
+      "0.8": {
+        "failure_reasons": [],
+        "qualifies_for_training": true
+      }
+    }
+  },
+  "training": {
+    "certification_id": "test-certification-id",
+    "selected_label_config": {
+      "cost_floor_pct": 0.0,
+      "label_episode_window_days": null,
+      "label_percentile": null,
+      "label_threshold_mode": "fixed_threshold",
+      "threshold": 0.0
+    },
+    "selected_threshold": 0.8
+  },
+  "training_config": {
+    "certification_id": "test-certification-id",
+    "certification_verdict": "CERTIFIED",
+    "preflight_off_vs_on_summary": {
+      "qualifying_configs": [
+        "seq4_h240_merge_off"
+      ]
+    },
+    "runtime_audit_package_path": "",
+    "selected_label_config": {
+      "cost_floor_pct": 0.0,
+      "label_episode_window_days": null,
+      "label_percentile": null,
+      "label_threshold_mode": "fixed_threshold",
+      "threshold": 0.0
+    },
+    "selected_threshold": 0.8
+  }
+}

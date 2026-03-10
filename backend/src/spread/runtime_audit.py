@@ -1035,6 +1035,33 @@ def _training_threshold_from_report(training_report: dict[str, Any]) -> float:
     return 1.0
 
 
+def _dataset_build_kwargs_from_training_config(training_config: dict[str, Any] | None) -> dict[str, Any]:
+    config = dict(training_config or {})
+    cost_floor_raw = config.get("label_cost_floor_pct", config.get("min_total_spread_pct", 1.0))
+    try:
+        cost_floor = float(cost_floor_raw)
+    except (TypeError, ValueError):
+        cost_floor = 1.0
+    kwargs: dict[str, Any] = {"min_total_spread_pct": float(cost_floor)}
+    if str(config.get("label_threshold_mode") or "") == "rolling_pair_percentile":
+        try:
+            percentile = int(config.get("label_percentile", 70) or 70)
+        except (TypeError, ValueError):
+            percentile = 70
+        try:
+            window_days = int(config.get("label_episode_window_days", 5) or 5)
+        except (TypeError, ValueError):
+            window_days = 5
+        kwargs.update(
+            {
+                "label_cost_floor_pct": float(cost_floor),
+                "label_percentile": int(percentile),
+                "label_episode_window_days": int(max(window_days, 1)),
+            }
+        )
+    return kwargs
+
+
 def _build_snapshot_retrain_readiness(snapshot_path: Path, *, min_total_spread_pct: float) -> dict[str, Any]:
     qualified_episodes_by_pair, _ = _load_snapshot_qualified_episodes(
         snapshot_path,
@@ -1083,11 +1110,12 @@ def _build_snapshot_psi_summary(
     min_samples_required = int(psi_reference.get("min_samples_required", 200) or 200)
     if not feature_bins:
         return {"status": "unavailable", "reason": "psi reference missing from metadata"}
+    training_config = dict(metadata.get("training_config", {}) or {})
     bundle = build_dataset_bundle(
         state_path=snapshot_path,
         sequence_length=sequence_length,
         prediction_horizon_sec=prediction_horizon_sec,
-        min_total_spread_pct=float(metadata.get("training_config", {}).get("min_total_spread_pct", 1.0) or 1.0),
+        **_dataset_build_kwargs_from_training_config(training_config),
     )
     if int(bundle.summary.get("num_samples", 0)) < min_samples_required:
         return {

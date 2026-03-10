@@ -1,0 +1,1 @@
+{"qualifies_for_training": true, "selected_threshold": 0.8, "selection_mode": "primary", "thresholds": {"0.8": {"qualifies_for_training": true, "failure_reasons": []}}, "block_diagnostics": {}}

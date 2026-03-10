@@ -1,0 +1,12 @@
+{
+  "details": {
+    "drifted_features": [],
+    "feature_count": 25
+  },
+  "failure_reasons": [],
+  "gate_id": "gate_05_intra_soak_feature_drift",
+  "recommendations": [],
+  "status": "PASS",
+  "title": "Intra-soak feature drift",
+  "warnings": []
+}

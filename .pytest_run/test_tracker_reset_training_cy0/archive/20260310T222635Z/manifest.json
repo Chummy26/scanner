@@ -1,0 +1,71 @@
+{
+  "archived_at_utc": "2026-03-10T22:26:35Z",
+  "archived_files": [
+    "C:\\Users\\nicoolas\\Pictures\\scanner\\scanner\\.pytest_run\\test_tracker_reset_training_cy0\\archive\\20260310T222635Z\\tracker_history.sqlite",
+    "C:\\Users\\nicoolas\\Pictures\\scanner\\scanner\\.pytest_run\\test_tracker_reset_training_cy0\\archive\\20260310T222635Z\\tracker_history.sqlite-wal",
+    "C:\\Users\\nicoolas\\Pictures\\scanner\\scanner\\.pytest_run\\test_tracker_reset_training_cy0\\archive\\20260310T222635Z\\tracker_history.sqlite-shm"
+  ],
+  "quality_report_summary": {
+    "approved_sessions": 1,
+    "auto_approved_sessions": 0,
+    "burn_in_passed_sessions": 0,
+    "checkpoint_ready_sessions": 0,
+    "critical_sessions": 0,
+    "exception_sessions": 1,
+    "missing_event_blocks": 0,
+    "range_mismatches": 0,
+    "record_count_mismatches": 0,
+    "review_state_counts": {
+      "needs_review": 1
+    },
+    "total_sessions": 1,
+    "trainable_sessions": 0,
+    "training_ready_sessions": 0,
+    "zero_record_blocks": 0
+  },
+  "source_db_path": "C:\\Users\\nicoolas\\Pictures\\scanner\\scanner\\.pytest_run\\test_tracker_reset_training_cy0\\tracker_history.sqlite",
+  "storage_stats": {
+    "active_session_id": 0,
+    "attempted_records_total": 2,
+    "blocks_total": 1,
+    "db_path": "C:\\Users\\nicoolas\\Pictures\\scanner\\scanner\\.pytest_run\\test_tracker_reset_training_cy0\\tracker_history.sqlite",
+    "db_size_bytes": 155648,
+    "episodes_total": 0,
+    "events_total": 0,
+    "exchange_attempts": {
+      "gate": 2,
+      "mexc": 2
+    },
+    "exchange_rejections": {},
+    "gap_threshold_sec": 60.0,
+    "invalid_entry_rejections_total": 0,
+    "invalid_exit_rejections_total": 0,
+    "invalid_record_rejections_total": 0,
+    "last_flush_at": 1773181595.8894756,
+    "max_records_per_pair": 480,
+    "min_total_spread_pct": 0.0,
+    "open_blocks": 0,
+    "pair_attempts": {
+      "BTC|mexc|spot|gate|futures": 2
+    },
+    "pair_rejections": {},
+    "pairs_in_memory": 1,
+    "pairs_persisted": 1,
+    "quality_fix_activated_at": 1773181595.8823526,
+    "record_interval_sec": 15.0,
+    "records_total": 1,
+    "rejection_rate_by_exchange": {
+      "gate": 0.0,
+      "mexc": 0.0
+    },
+    "rejection_rate_by_pair": {
+      "BTC|mexc|spot|gate|futures": 0.0
+    },
+    "rejection_rate_total": 0.0,
+    "selected_training_blocks": 1,
+    "sessions_total": 1,
+    "storage_window_sec": 7200,
+    "tracker_memory_window_sec": 7200,
+    "window_sec": 7200
+  }
+}

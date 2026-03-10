@@ -70,6 +70,50 @@ def test_tracker_uses_15s_interval_and_derives_record_cap(tmp_path: Path):
     assert [round(item["timestamp"], 1) for item in history] == [30.0, 45.0, 60.0, 75.0]
 
 
+def test_tracker_keeps_8d_storage_while_pruning_12h_memory_window(tmp_path: Path):
+    db_path = tmp_path / "tracker_history.sqlite"
+    tracker = SpreadTracker(
+        window_sec=8 * 24 * 60 * 60,
+        memory_window_sec=12 * 60 * 60,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=db_path,
+    )
+
+    pair = ("XRP", "mexc", "spot", "gate", "futures")
+    tracker.record_spread(*pair, 0.30, -0.15, now_ts=0.0)
+    tracker.record_spread(*pair, 0.42, -0.10, now_ts=float((12 * 60 * 60) + 15))
+    assert tracker.flush_to_storage(now_ts=float((12 * 60 * 60) + 15), force=True)
+
+    history = tracker.get_history(*pair, limit=10)
+    training_config = tracker.get_training_config()
+    with sqlite3.connect(db_path, timeout=30.0) as conn:
+        records_total = int(conn.execute("SELECT COUNT(*) FROM tracker_records").fetchone()[0])
+
+    assert len(history) == 1
+    assert history[0]["timestamp"] == pytest.approx(float((12 * 60 * 60) + 15))
+    assert records_total == 2
+    assert training_config["storage_window_sec"] == 8 * 24 * 60 * 60
+    assert training_config["tracker_memory_window_sec"] == 12 * 60 * 60
+
+    restored = SpreadTracker(
+        window_sec=8 * 24 * 60 * 60,
+        memory_window_sec=12 * 60 * 60,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=db_path,
+    )
+    assert restored.load_from_storage(now_ts=float((12 * 60 * 60) + 15)) == 1
+    assert len(restored.get_history(*pair, limit=10)) == 1
+    assert restored.get_storage_stats()["records_total"] == 2
+
+
 def test_tracker_prune_removes_stale_pairs_from_sqlite(tmp_path: Path):
     db_path = tmp_path / "tracker_history.sqlite"
     tracker = SpreadTracker(

@@ -1,0 +1,335 @@
+{
+  "artifacts": {
+    "audit_path": "C:\\Users\\nicoolas\\Pictures\\scanner\\scanner\\.pytest_run\\test_finalize_runtime_audit_pa0\\audit\\training_artifacts\\best_lstm_model.audit.md",
+    "metadata_path": "C:\\Users\\nicoolas\\Pictures\\scanner\\scanner\\.pytest_run\\test_finalize_runtime_audit_pa0\\audit\\training_artifacts\\best_lstm_model.meta.json",
+    "model_path": "C:\\Users\\nicoolas\\Pictures\\scanner\\scanner\\.pytest_run\\test_finalize_runtime_audit_pa0\\audit\\training_artifacts\\best_lstm_model.pth",
+    "report_path": "C:\\Users\\nicoolas\\Pictures\\scanner\\scanner\\.pytest_run\\test_finalize_runtime_audit_pa0\\audit\\training_artifacts\\best_lstm_model.report.json"
+  },
+  "auxiliary_short_block_smoke": {
+    "all_negative_expected": true,
+    "auxiliary_short_block_smoke": true,
+    "dataset_status": "built",
+    "dataset_summary": {
+      "block_diagnostics": {
+        "duration_sec_quantiles": {
+          "max": 285.0,
+          "p10": 285.0,
+          "p25": 285.0,
+          "p50": 285.0,
+          "p75": 285.0,
+          "p90": 285.0
+        },
+        "feature_window_feasibility": {
+          "eligible_blocks_for_sequence_length": 1,
+          "eligible_sessions_with_any_eligible_block": 1,
+          "sequence_length": 15
+        },
+        "inter_record_interval_sec_quantiles": {
+          "max": 15.0,
+          "p10": 15.0,
+          "p25": 15.0,
+          "p50": 15.0,
+          "p75": 15.0,
+          "p90": 15.0
+        },
+        "irregular_block_count": 0,
+        "max_to_median_interval_ratio_quantiles": {
+          "max": 1.0,
+          "p10": 1.0,
+          "p25": 1.0,
+          "p50": 1.0,
+          "p75": 1.0,
+          "p90": 1.0
+        },
+        "record_count_quantiles": {
+          "max": 20.0,
+          "p10": 20.0,
+          "p25": 20.0,
+          "p50": 20.0,
+          "p75": 20.0,
+          "p90": 20.0
+        },
+        "record_count_threshold_counts": {
+          "ge_10": 1,
+          "ge_12": 1,
+          "ge_15": 1,
+          "ge_20": 1,
+          "ge_8": 1
+        },
+        "session_summaries": {
+          "4": {
+            "duration_sec_quantiles": {
+              "max": 285.0,
+              "p10": 285.0,
+              "p25": 285.0,
+              "p50": 285.0,
+              "p75": 285.0,
+              "p90": 285.0
+            },
+            "eligible_blocks_for_sequence_length": 1,
+            "inter_record_interval_sec_quantiles": {
+              "max": 15.0,
+              "p10": 15.0,
+              "p25": 15.0,
+              "p50": 15.0,
+              "p75": 15.0,
+              "p90": 15.0
+            },
+            "irregular_block_count": 0,
+            "max_record_count": 20,
+            "max_to_median_interval_ratio_quantiles": {
+              "max": 1.0,
+              "p10": 1.0,
+              "p25": 1.0,
+              "p50": 1.0,
+              "p75": 1.0,
+              "p90": 1.0
+            },
+            "num_blocks": 1,
+            "record_count_quantiles": {
+              "max": 20.0,
+              "p10": 20.0,
+              "p25": 20.0,
+              "p50": 20.0,
+              "p75": 20.0,
+              "p90": 20.0
+            },
+            "record_count_threshold_counts": {
+              "ge_10": 1,
+              "ge_12": 1,
+              "ge_15": 1,
+              "ge_20": 1,
+              "ge_8": 1
+            }
+          }
+        }
+      },
+      "block_ids_used": [
+        4
+      ],
+      "blocks_used": 1,
+      "class_has_nan": false,
+      "cross_session_boundaries": 0,
+      "cross_session_gap_threshold_sec": null,
+      "cross_session_merge_diagnostics": {
+        "applied_count": 0,
+        "calibration_log": [],
+        "candidate_count": 0,
+        "gap_sec_quantiles": {
+          "max": 0.0,
+          "p10": 0.0,
+          "p25": 0.0,
+          "p50": 0.0,
+          "p75": 0.0,
+          "p90": 0.0
+        },
+        "max_session_gap_sec": null,
+        "rejected_gap_count": 0,
+        "rejected_regime_shift_count": 0,
+        "score_quantiles": {
+          "max": 0.0,
+          "p10": 0.0,
+          "p25": 0.0,
+          "p50": 0.0,
+          "p75": 0.0,
+          "p90": 0.0
+        },
+        "threshold": 3.0,
+        "window_size_quantiles": {
+          "max": 0.0,
+          "p10": 0.0,
+          "p25": 0.0,
+          "p50": 0.0,
+          "p75": 0.0,
+          "p90": 0.0
+        }
+      },
+      "cross_session_merge_enabled": false,
+      "cross_session_merges_applied": 0,
+      "episode_diagnostics": {
+        "duration_sec_quantiles": {
+          "max": 0.0,
+          "p10": 0.0,
+          "p25": 0.0,
+          "p50": 0.0,
+          "p75": 0.0,
+          "p90": 0.0
+        },
+        "episode_count": 0,
+        "total_spread_quantiles": {
+          "max": 0.0,
+          "p10": 0.0,
+          "p25": 0.0,
+          "p50": 0.0,
+          "p75": 0.0,
+          "p90": 0.0
+        }
+      },
+      "eta_has_nan": false,
+      "feature_abs_sum": 294.3915710449219,
+      "feature_has_inf": false,
+      "feature_has_nan": false,
+      "label_audit": {
+        "future_episode_total_spread_quantiles": {
+          "max": 0.0,
+          "p10": 0.0,
+          "p25": 0.0,
+          "p50": 0.0,
+          "p75": 0.0,
+          "p90": 0.0
+        },
+        "positive_entry_spread_buckets": {
+          "0_30_to_0_50": 0,
+          "0_50_to_1_00": 0,
+          "1_00_to_2_00": 0,
+          "ge_2_00": 0,
+          "lt_0_30": 0
+        },
+        "right_censored_windows": 4,
+        "timeout_peak_future_total_spread_buckets": {
+          "0_30_to_0_50": 0,
+          "0_50_to_0_80": 0,
+          "0_80_to_1_00": 0,
+          "ge_1_00": 0,
+          "lt_0_30": 2
+        },
+        "timeouts_with_only_sub_threshold_episode": 0,
+        "timeouts_without_future_episode": 2
+      },
+      "label_cost_floor_pct": 1.0,
+      "label_episode_window_days": 5,
+      "label_percentile": 70.0,
+      "label_threshold_mode": "fixed_threshold",
+      "label_thresholds": {
+        "BTC|mexc|spot|gate|futures": {
+          "latest": 0.0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p90": 0.0,
+          "samples": 2
+        }
+      },
+      "labeling_method": "episode_take_profit_time_barrier",
+      "labeling_timeout_only": true,
+      "manual_feature_checks": [
+        {
+          "block_id": 4,
+          "delta_entry_actual": 0.01,
+          "delta_entry_expected": 0.01,
+          "pair_id": "BTC|mexc|spot|gate|futures",
+          "rolling_std_entry_actual": 0.014142,
+          "rolling_std_entry_expected": 0.014142,
+          "sample_index": 0,
+          "zscore_entry_actual": 1.414214,
+          "zscore_entry_expected": 1.414213
+        },
+        {
+          "block_id": 4,
+          "delta_entry_actual": 0.01,
+          "delta_entry_expected": 0.01,
+          "pair_id": "BTC|mexc|spot|gate|futures",
+          "rolling_std_entry_actual": 0.014142,
+          "rolling_std_entry_expected": 0.014142,
+          "sample_index": 1,
+          "zscore_entry_actual": 1.414214,
+          "zscore_entry_expected": 1.414214
+        }
+      ],
+      "manual_label_checks": [
+        {
+          "block_id": 4,
+          "pair_id": "BTC|mexc|spot|gate|futures",
+          "sample_index": 0,
+          "session_id": 4,
+          "y_class": 0.0,
+          "y_eta": 0.0
+        },
+        {
+          "block_id": 4,
+          "pair_id": "BTC|mexc|spot|gate|futures",
+          "sample_index": 1,
+          "session_id": 4,
+          "y_class": 0.0,
+          "y_eta": 0.0
+        }
+      ],
+      "min_total_spread_pct": 0.0,
+      "num_blocks": 1,
+      "num_cross_block_windows": 0,
+      "num_cross_session_windows": 0,
+      "num_negative_samples": 2,
+      "num_pairs": 1,
+      "num_positive_samples": 0,
+      "num_samples": 2,
+      "num_sessions": 1,
+      "prediction_horizon_sec": 60,
+      "selected_block_ids": [
+        4
+      ],
+      "selected_session_ids": [],
+      "sequence_length": 15,
+      "session_ids_used": [
+        4
+      ],
+      "sessions_used": 1,
+      "shape": [
+        2,
+        15,
+        25
+      ],
+      "skipped_blocks_too_short": 0,
+      "skipped_windows_cross_session_boundary": 0,
+      "skipped_windows_right_censored": 4,
+      "state_saved_at": 1700031000.0,
+      "state_storage_kind": "sqlite_blocks"
+    },
+    "not_for_model_quality_decision": true,
+    "selected_block_duration_sec": 285.0,
+    "selected_block_id": 4,
+    "selected_block_record_count": 20,
+    "status": "completed",
+    "training_report": {
+      "artifacts": {
+        "audit_path": "C:\\Users\\nicoolas\\Pictures\\scanner\\scanner\\.pytest_run\\test_finalize_runtime_audit_pa0\\audit\\training_artifacts\\auxiliary_short_block_smoke\\best_lstm_model.audit.md",
+        "metadata_path": "C:\\Users\\nicoolas\\Pictures\\scanner\\scanner\\.pytest_run\\test_finalize_runtime_audit_pa0\\audit\\training_artifacts\\auxiliary_short_block_smoke\\best_lstm_model.meta.json",
+        "model_path": "C:\\Users\\nicoolas\\Pictures\\scanner\\scanner\\.pytest_run\\test_finalize_runtime_audit_pa0\\audit\\training_artifacts\\auxiliary_short_block_smoke\\best_lstm_model.pth",
+        "report_path": "C:\\Users\\nicoolas\\Pictures\\scanner\\scanner\\.pytest_run\\test_finalize_runtime_audit_pa0\\audit\\training_artifacts\\auxiliary_short_block_smoke\\best_lstm_model.report.json"
+      },
+      "calibration": {
+        "test": {
+          "ece": 0.08
+        }
+      },
+      "metrics": {
+        "test": {
+          "average_precision": 0.52,
+          "f1": 0.44,
+          "precision": 0.5,
+          "recall": 0.4
+        }
+      },
+      "thresholds": {
+        "execute_threshold": 0.45,
+        "strong_threshold": 0.85
+      }
+    }
+  },
+  "calibration": {
+    "test": {
+      "ece": 0.08
+    }
+  },
+  "metrics": {
+    "test": {
+      "average_precision": 0.52,
+      "f1": 0.44,
+      "precision": 0.5,
+      "recall": 0.4
+    }
+  },
+  "thresholds": {
+    "execute_threshold": 0.45,
+    "strong_threshold": 0.85
+  }
+}

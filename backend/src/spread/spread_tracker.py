@@ -32,6 +32,7 @@ _TRACKER_META_KEYS = (
     "schema_version",
     "record_interval_sec",
     "tracking_window_sec",
+    "tracker_memory_window_sec",
     "gap_threshold_sec",
     "min_total_spread_pct",
     "quality_fix_activated_at",
@@ -454,9 +455,11 @@ class PairStats:
             pruned = True
         return pruned
 
-    def _prune_records(self, cutoff: float) -> bool:
+    def _prune_records(self, cutoff: float, *, preserve_after_ts: float | None = None) -> bool:
         pruned = False
         while self.records and self.records[0].timestamp < cutoff:
+            if preserve_after_ts is not None and self.records[0].timestamp >= float(preserve_after_ts):
+                break
             self.records.popleft()
             self._stats_dirty = True
             self._episodes_cache_valid = False
@@ -521,6 +524,7 @@ class SpreadTracker:
     def __init__(
         self,
         window_sec: int = 604800,
+        memory_window_sec: int | None = None,
         record_interval_sec: float = 15.0,
         max_records_per_pair: int = 0,
         epsilon_pct: float = 0.02,
@@ -532,9 +536,16 @@ class SpreadTracker:
         min_total_spread_pct: float = _DEFAULT_MIN_TOTAL_SPREAD_PCT,
         audit_collector: Any | None = None,
     ):
-        self.window_sec = int(window_sec)
+        self.storage_window_sec = max(int(window_sec), 1)
+        effective_memory_window = self.storage_window_sec if memory_window_sec is None else max(int(memory_window_sec), 1)
+        self.memory_window_sec = int(effective_memory_window)
+        self.window_sec = int(self.storage_window_sec)
         self.record_interval_sec = float(record_interval_sec)
-        self.max_records_per_pair = self._resolve_max_records_per_pair(max_records_per_pair, self.window_sec, self.record_interval_sec)
+        self.max_records_per_pair = self._resolve_max_records_per_pair(
+            max_records_per_pair,
+            self.memory_window_sec,
+            self.record_interval_sec,
+        )
         self.epsilon_pct = float(epsilon_pct)
         self.max_pairs = int(max_pairs)
         self.history_enable_entry_spread_pct = float(history_enable_entry_spread_pct)
@@ -595,6 +606,12 @@ class SpreadTracker:
         if float(gap_threshold_sec or 0.0) > 0.0:
             return float(gap_threshold_sec)
         return max(60.0, 4.0 * max(float(record_interval_sec), 0.0))
+
+    def _memory_cutoff(self, ts: float) -> float:
+        return float(ts) - float(self.memory_window_sec)
+
+    def _storage_cutoff(self, ts: float) -> float:
+        return float(ts) - float(self.storage_window_sec)
 
     @staticmethod
     def _resolve_min_total_spread_pct(min_total_spread_pct: float) -> float:
@@ -1069,7 +1086,8 @@ class SpreadTracker:
                 conn,
                 {
                     "record_interval_sec": self.record_interval_sec,
-                    "tracking_window_sec": self.window_sec,
+                    "tracking_window_sec": self.storage_window_sec,
+                    "tracker_memory_window_sec": self.memory_window_sec,
                     "gap_threshold_sec": self.gap_threshold_sec,
                     "min_total_spread_pct": self.min_total_spread_pct,
                     "last_flush_at": self._last_flush_at,
@@ -1132,7 +1150,7 @@ class SpreadTracker:
                 min_record_ts,
                 ended_at if ended_at >= min_record_ts else max_record_ts,
                 self.record_interval_sec,
-                self.window_sec,
+                self.storage_window_sec,
                 self.gap_threshold_sec,
                 created_at,
                 now,
@@ -1261,14 +1279,15 @@ class SpreadTracker:
                 )
                 VALUES(?, NULL, 'open', ?, ?, ?, 'runtime', ?, ?)
                 """,
-                (now, self.record_interval_sec, self.window_sec, self.gap_threshold_sec, now, now),
+                (now, self.record_interval_sec, self.storage_window_sec, self.gap_threshold_sec, now, now),
             )
             self._active_session_id = int(cursor.lastrowid)
             self._write_meta(
                 conn,
                 {
                     "record_interval_sec": self.record_interval_sec,
-                    "tracking_window_sec": self.window_sec,
+                    "tracking_window_sec": self.storage_window_sec,
+                    "tracker_memory_window_sec": self.memory_window_sec,
                     "gap_threshold_sec": self.gap_threshold_sec,
                 },
             )
@@ -1350,10 +1369,11 @@ class SpreadTracker:
         self._dirty_pairs.add(key)
         self._deleted_pairs.discard(key)
 
-    def _drop_pair_locked(self, key: PairKey):
+    def _drop_pair_locked(self, key: PairKey, *, delete_storage: bool = True):
         if key in self._pairs:
             del self._pairs[key]
-            self._deleted_pairs.add(key)
+            if delete_storage:
+                self._deleted_pairs.add(key)
             self._dirty_pairs.discard(key)
 
     @staticmethod
@@ -1481,21 +1501,28 @@ class SpreadTracker:
             return self._create_block_locked(key, ps, ts, "auto_gap")
         return ps.current_block_id
 
-    def _pair_snapshot(self, key: PairKey, ps: PairStats, cutoff: float) -> dict[str, object]:
+    def _pair_snapshot(
+        self,
+        key: PairKey,
+        ps: PairStats,
+        *,
+        state_cutoff: float,
+        record_cutoff: float,
+    ) -> dict[str, object]:
         inv = [
             (float(event.timestamp), int(event.session_id), int(event.block_id) if event.block_id is not None else None)
             for event in ps.inverted_events
-            if event.timestamp >= cutoff
+            if event.timestamp >= state_cutoff
         ]
         ent = [
             (float(event.timestamp), int(event.session_id), int(event.block_id) if event.block_id is not None else None)
             for event in ps.entry_events
-            if event.timestamp >= cutoff
+            if event.timestamp >= state_cutoff
         ]
         ext = [
             (float(event.timestamp), int(event.session_id), int(event.block_id) if event.block_id is not None else None)
             for event in ps.exit_events
-            if event.timestamp >= cutoff
+            if event.timestamp >= state_cutoff
         ]
         recs = [
             (
@@ -1506,7 +1533,7 @@ class SpreadTracker:
                 int(record.block_id),
             )
             for record in ps.records
-            if record.timestamp >= cutoff
+            if record.timestamp >= record_cutoff
         ]
         blocks = [
             {
@@ -1520,7 +1547,7 @@ class SpreadTracker:
                 "is_open": bool(meta.is_open),
             }
             for block_id, meta in ps.block_meta.items()
-            if bool(meta.is_open) or float(meta.end_ts) >= cutoff
+            if bool(meta.is_open) or float(meta.end_ts) >= state_cutoff
         ]
         return {
             "key": key,
@@ -1535,6 +1562,24 @@ class SpreadTracker:
             "records": recs,
             "blocks": blocks,
         }
+
+    @staticmethod
+    def _delete_pair_storage_range(
+        conn: sqlite3.Connection,
+        *,
+        pair_id: int,
+        storage_cutoff: float,
+        record_rewrite_cutoff: float,
+    ) -> None:
+        conn.execute("DELETE FROM tracker_events WHERE pair_id = ?", (pair_id,))
+        conn.execute(
+            "DELETE FROM tracker_records WHERE pair_id = ? AND (ts < ? OR ts >= ?)",
+            (pair_id, float(storage_cutoff), float(record_rewrite_cutoff)),
+        )
+        conn.execute(
+            "DELETE FROM tracker_pair_episodes WHERE pair_id = ? AND end_ts < ?",
+            (pair_id, float(storage_cutoff)),
+        )
 
     @staticmethod
     def _group_records_by_block(records: list[tuple[float, float, float, int, int]]) -> dict[int, dict[str, float]]:
@@ -1674,7 +1719,7 @@ class SpreadTracker:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT symbol, buy_ex, buy_mt, sell_ex, sell_mt
+                SELECT symbol, buy_ex, buy_mt, sell_ex, sell_mt, last_seen_ts
                 FROM tracker_pairs
                 WHERE id = ?
                 """,
@@ -1682,6 +1727,11 @@ class SpreadTracker:
             ).fetchone()
             if row is None:
                 return
+            reference_now = float(row["last_seen_ts"] or 0.0)
+            if reference_now <= 0.0:
+                reference_now = time.time()
+            record_cutoff = self._memory_cutoff(reference_now)
+            state_cutoff = self._storage_cutoff(reference_now)
             key = self._pair_key(row["symbol"], row["buy_ex"], row["buy_mt"], row["sell_ex"], row["sell_mt"])
             records = [
                 SpreadRecord(
@@ -1695,10 +1745,10 @@ class SpreadTracker:
                     """
                     SELECT ts, entry_spread_pct, exit_spread_pct, session_id, block_id
                     FROM tracker_records
-                    WHERE pair_id = ?
+                    WHERE pair_id = ? AND ts >= ?
                     ORDER BY ts ASC
                     """,
-                    (int(pair_id),),
+                    (int(pair_id), float(record_cutoff)),
                 )
             ]
             episode_rows = list(
@@ -1708,10 +1758,10 @@ class SpreadTracker:
                            baseline_median, baseline_mad, activation_threshold, release_threshold,
                            session_id, block_id, source_version, is_closed
                     FROM tracker_pair_episodes
-                    WHERE pair_id = ?
+                    WHERE pair_id = ? AND end_ts >= ?
                     ORDER BY end_ts ASC, start_ts ASC
                     """,
-                    (int(pair_id),),
+                    (int(pair_id), float(state_cutoff)),
                 )
             )
         with self._lock:
@@ -1759,7 +1809,8 @@ class SpreadTracker:
         exit_v = float(exit_spread)
 
         new_state = self._state(entry_v, exit_v)
-        cutoff = ts - self.window_sec
+        record_cutoff = self._memory_cutoff(ts)
+        state_cutoff = self._storage_cutoff(ts)
         with self._lock:
             pair_dirty = False
             if key not in self._pairs:
@@ -1771,10 +1822,10 @@ class SpreadTracker:
 
             ps = self._pairs[key]
             ps.last_seen_ts = ts
-            if ps._prune_events(cutoff):
+            if ps._prune_events(state_cutoff):
                 pair_dirty = True
-            ps._prune_block_meta(cutoff)
-            ps._prune_episodes(cutoff)
+            ps._prune_block_meta(state_cutoff)
+            ps._prune_episodes(state_cutoff)
             event_session_id = self._active_session_id or ps.current_session_id or self._ephemeral_session_id
             event_block_id = ps.current_block_id if ps.history_enabled and ps.current_block_id else None
             if new_state in (-1, 1):
@@ -1797,7 +1848,8 @@ class SpreadTracker:
                 pair_dirty = True
 
             if ps.history_enabled and self.record_interval_sec >= 0:
-                if ps._prune_records(cutoff):
+                preserve_after_ts = self._last_flush_at if self._last_flush_at > 0.0 else float("-inf")
+                if ps._prune_records(record_cutoff, preserve_after_ts=preserve_after_ts):
                     pair_dirty = True
                 record_delta_sec = (ts - ps._last_record_ts) if ps._last_record_ts > 0.0 else 0.0
                 gap_detected = bool(ps._last_record_ts > 0.0 and record_delta_sec > self.gap_threshold_sec)
@@ -2161,30 +2213,35 @@ class SpreadTracker:
         )
 
     def prune(self, *, now_ts: float | None = None):
-        cutoff = (float(now_ts) if now_ts is not None else time.time()) - self.window_sec
+        now = float(now_ts) if now_ts is not None else time.time()
+        storage_cutoff = self._storage_cutoff(now)
+        storage_stale: list[PairKey] = []
         with self._lock:
             before = len(self._pairs)
-            stale = [key for key, stats in self._pairs.items() if (stats.last_seen_ts or 0.0) < cutoff]
+            stale = [key for key, stats in self._pairs.items() if (stats.last_seen_ts or 0.0) < storage_cutoff]
             for key in stale:
                 self._drop_pair_locked(key)
+                storage_stale.append(key)
             if self.max_pairs > 0 and len(self._pairs) > self.max_pairs:
                 by_lru = sorted(self._pairs.items(), key=lambda item: item[1].last_seen_ts)
                 excess = len(self._pairs) - self.max_pairs
                 for key, _ in by_lru[:excess]:
-                    self._drop_pair_locked(key)
+                    self._drop_pair_locked(key, delete_storage=False)
             after = len(self._pairs)
             if before != after:
                 logger.info("[Tracker] Pruned %s pairs (%s -> %s)", before - after, before, after)
 
-        if self.db_path is not None:
+        if self.db_path is not None and storage_stale:
             with self._connect() as conn:
-                self._delete_pairs_from_storage(conn, stale)
+                self._delete_pairs_from_storage(conn, storage_stale)
 
     def flush_to_storage(self, *, now_ts: float | None = None, force: bool = False) -> bool:
         if self.db_path is None:
             return False
         ts = float(now_ts) if now_ts is not None else time.time()
-        cutoff = ts - self.window_sec
+        memory_cutoff = self._memory_cutoff(ts)
+        storage_cutoff = self._storage_cutoff(ts)
+        record_rewrite_cutoff = min(memory_cutoff, float(self._last_flush_at)) if self._last_flush_at > 0.0 else -1e18
         with self._lock:
             rejection_stats_payload = self._hot_path_rejection_snapshot_locked()
             rejection_stats_dirty = bool(self._hot_path_rejection_stats_dirty)
@@ -2197,10 +2254,19 @@ class SpreadTracker:
                 ps = self._pairs.get(key)
                 if ps is None:
                     continue
-                ps._prune_events(cutoff)
-                ps._prune_records(cutoff)
-                ps._prune_block_meta(cutoff)
-                snapshots.append(self._pair_snapshot(key, ps, cutoff))
+                ps._prune_events(storage_cutoff)
+                preserve_after_ts = self._last_flush_at if self._last_flush_at > 0.0 else float("-inf")
+                ps._prune_records(memory_cutoff, preserve_after_ts=preserve_after_ts)
+                ps._prune_block_meta(storage_cutoff)
+                ps._prune_episodes(storage_cutoff)
+                snapshots.append(
+                    self._pair_snapshot(
+                        key,
+                        ps,
+                        state_cutoff=storage_cutoff,
+                        record_cutoff=record_rewrite_cutoff,
+                    )
+                )
 
         started_at = time.perf_counter()
         snapshot_rebindings: list[tuple[PairKey, int, dict[int, int]]] = []
@@ -2219,10 +2285,9 @@ class SpreadTracker:
                     ent = snapshot["entry_events"]
                     ext = snapshot["exit_events"]
                     has_payload = bool(records or inv or ent or ext)
-                    if not has_payload:
-                        self._delete_pairs_from_storage(conn, [key])
-                        continue
                     storage_pair_id = int(snapshot["storage_pair_id"] or 0)
+                    if not has_payload and storage_pair_id <= 0:
+                        continue
                     if not storage_pair_id:
                         conn.execute(
                             """
@@ -2272,8 +2337,14 @@ class SpreadTracker:
                             )
                     if storage_pair_id > 0:
                         reconciled_pair_ids.add(int(storage_pair_id))
-                    conn.execute("DELETE FROM tracker_events WHERE pair_id = ?", (storage_pair_id,))
-                    conn.execute("DELETE FROM tracker_records WHERE pair_id = ?", (storage_pair_id,))
+                    self._delete_pair_storage_range(
+                        conn,
+                        pair_id=storage_pair_id,
+                        storage_cutoff=storage_cutoff,
+                        record_rewrite_cutoff=record_rewrite_cutoff,
+                    )
+                    if not has_payload:
+                        continue
                     block_metadata = {
                         int(item["runtime_block_id"]): {
                             "session_id": int(item["session_id"]),
@@ -2434,7 +2505,8 @@ class SpreadTracker:
                     {
                         "schema_version": _SCHEMA_VERSION,
                         "record_interval_sec": self.record_interval_sec,
-                        "tracking_window_sec": self.window_sec,
+                        "tracking_window_sec": self.storage_window_sec,
+                        "tracker_memory_window_sec": self.memory_window_sec,
                         "gap_threshold_sec": self.gap_threshold_sec,
                         "min_total_spread_pct": self.min_total_spread_pct,
                         "quality_fix_activated_at": self.quality_fix_activated_at,
@@ -2480,6 +2552,11 @@ class SpreadTracker:
                             existing.is_open = bool(existing.is_open or meta.is_open)
                     ps.block_meta = remapped_block_meta
                     ps.current_block_id = int(block_id_map.get(int(ps.current_block_id), int(ps.current_block_id))) if ps.current_block_id else 0
+            for key in dirty_keys:
+                ps = self._pairs.get(key)
+                if ps is None:
+                    continue
+                ps._prune_records(memory_cutoff)
             if force:
                 self._dirty_pairs.clear()
             else:
@@ -2507,7 +2584,9 @@ class SpreadTracker:
     def load_from_storage(self, *, now_ts: float | None = None) -> int:
         if self.db_path is None or not self.db_path.is_file():
             return 0
-        cutoff = (float(now_ts) if now_ts is not None else time.time()) - self.window_sec
+        now = float(now_ts) if now_ts is not None else time.time()
+        state_cutoff = self._storage_cutoff(now)
+        record_cutoff = self._memory_cutoff(now)
         loaded_pairs: dict[int, tuple[PairKey, PairStats]] = {}
         try:
             with self._connect() as conn:
@@ -2546,7 +2625,7 @@ class SpreadTracker:
                     WHERE ts >= ?
                     ORDER BY ts ASC
                     """,
-                    (cutoff,),
+                    (state_cutoff,),
                 ):
                     pair = loaded_pairs.get(int(row["pair_id"]))
                     if pair is None:
@@ -2571,7 +2650,7 @@ class SpreadTracker:
                     WHERE ts >= ?
                     ORDER BY ts ASC
                     """,
-                    (cutoff,),
+                    (record_cutoff,),
                 ):
                     pair = loaded_pairs.get(int(row["pair_id"]))
                     if pair is None:
@@ -2596,7 +2675,7 @@ class SpreadTracker:
                     WHERE end_ts >= ?
                     ORDER BY end_ts ASC, start_ts ASC
                     """,
-                    (cutoff,),
+                    (state_cutoff,),
                 ):
                     pair = loaded_pairs.get(int(row["pair_id"]))
                     if pair is None:
@@ -2629,7 +2708,7 @@ class SpreadTracker:
             self._pairs = defaultdict(PairStats)
             count = 0
             for _, (key, ps) in loaded_pairs.items():
-                if (ps.last_seen_ts or 0.0) < cutoff and not ps.records and not ps.inverted_events and not ps.entry_events and not ps.exit_events:
+                if (ps.last_seen_ts or 0.0) < state_cutoff and not ps.records and not ps.inverted_events and not ps.entry_events and not ps.exit_events:
                     continue
                 self._pairs[key] = ps
                 count += 1
@@ -2643,7 +2722,9 @@ class SpreadTracker:
             "gap_threshold_sec": self.gap_threshold_sec,
             "min_total_spread_pct": self.min_total_spread_pct,
             "record_interval_sec": self.record_interval_sec,
-            "window_sec": self.window_sec,
+            "window_sec": self.storage_window_sec,
+            "storage_window_sec": self.storage_window_sec,
+            "tracker_memory_window_sec": self.memory_window_sec,
             "active_session_id": self._active_session_id,
             "quality_fix_activated_at": self.quality_fix_activated_at,
             "hot_path_rejection_stats": self._hot_path_rejection_snapshot_locked(),
@@ -4590,7 +4671,9 @@ class SpreadTracker:
         stats: Dict[str, object] = {
             "db_path": str(self.db_path) if self.db_path is not None else "",
             "record_interval_sec": self.record_interval_sec,
-            "window_sec": self.window_sec,
+            "window_sec": self.storage_window_sec,
+            "storage_window_sec": self.storage_window_sec,
+            "tracker_memory_window_sec": self.memory_window_sec,
             "max_records_per_pair": self.max_records_per_pair,
             "gap_threshold_sec": self.gap_threshold_sec,
             "min_total_spread_pct": self.min_total_spread_pct,
@@ -4628,12 +4711,17 @@ class SpreadTracker:
     def save_state(self, path: str | Path) -> bool:
         path = Path(path)
         now = time.time()
-        cutoff = now - self.window_sec
-        data: Dict[str, object] = {"saved_at": now, "window_sec": self.window_sec, "pairs": {}}
+        cutoff = self._memory_cutoff(now)
+        data: Dict[str, object] = {
+            "saved_at": now,
+            "window_sec": self.storage_window_sec,
+            "tracker_memory_window_sec": self.memory_window_sec,
+            "pairs": {},
+        }
         with self._lock:
             for key, ps in self._pairs.items():
                 pair_id = self._pair_id(key)
-                snapshot = self._pair_snapshot(key, ps, cutoff)
+                snapshot = self._pair_snapshot(key, ps, state_cutoff=cutoff, record_cutoff=cutoff)
                 inv = snapshot["inverted_events"]
                 ent = snapshot["entry_events"]
                 ext = snapshot["exit_events"]
@@ -4671,7 +4759,7 @@ class SpreadTracker:
             return 0
         if not isinstance(raw, dict) or "pairs" not in raw:
             return 0
-        cutoff = time.time() - self.window_sec
+        cutoff = self._memory_cutoff(time.time())
         count = 0
         with self._lock:
             for pair_id, payload in raw["pairs"].items():
@@ -4769,7 +4857,8 @@ class SpreadTracker:
         if not records:
             return
         ts = float(now_ts) if now_ts is not None else time.time()
-        cutoff = ts - self.window_sec
+        record_cutoff = self._memory_cutoff(ts)
+        state_cutoff = self._storage_cutoff(ts)
         track_gate = self.track_enable_entry_spread_pct
         hist_gate = self.history_enable_entry_spread_pct
         rec_interval = max(self.record_interval_sec, 0.0)
@@ -4794,15 +4883,17 @@ class SpreadTracker:
                         continue
                     if track_gate > 0 and entry_v < track_gate:
                         continue
-                    pair_dirty = True
+                pair_dirty = True
                 ps = self._pairs[key]
                 ps.last_seen_ts = ts
                 if key not in pruned:
-                    if ps._prune_events(cutoff):
+                    if ps._prune_events(state_cutoff):
                         pair_dirty = True
-                    if ps._prune_records(cutoff):
+                    preserve_after_ts = self._last_flush_at if self._last_flush_at > 0.0 else float("-inf")
+                    if ps._prune_records(record_cutoff, preserve_after_ts=preserve_after_ts):
                         pair_dirty = True
-                    ps._prune_block_meta(cutoff)
+                    ps._prune_block_meta(state_cutoff)
+                    ps._prune_episodes(state_cutoff)
                     pruned.add(key)
                 event_session_id = self._active_session_id or ps.current_session_id or self._ephemeral_session_id
                 event_block_id = ps.current_block_id if ps.history_enabled and ps.current_block_id else None

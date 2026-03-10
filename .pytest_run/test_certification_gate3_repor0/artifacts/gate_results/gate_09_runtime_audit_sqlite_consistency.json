@@ -1,0 +1,13 @@
+{
+  "details": {
+    "reason": "runtime_audit_unavailable"
+  },
+  "failure_reasons": [],
+  "gate_id": "gate_09_runtime_audit_sqlite_consistency",
+  "recommendations": [],
+  "status": "SKIPPED",
+  "title": "Runtime audit to SQLite consistency",
+  "warnings": [
+    "runtime_audit_unavailable"
+  ]
+}

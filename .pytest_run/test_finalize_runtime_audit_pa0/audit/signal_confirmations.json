@@ -1,0 +1,40 @@
+{
+  "by_action": {
+    "EXECUTE": {
+      "awaiting_confirmation": 1
+    }
+  },
+  "by_eta_alignment": {
+    "unknown": {
+      "awaiting_confirmation": 1
+    }
+  },
+  "signals": [
+    {
+      "actual_duration_sec": null,
+      "available_until_ts": 1700030285.0,
+      "confirmed_within_eta": false,
+      "context_strength": "normal",
+      "current_entry": 0.0,
+      "display_eta_seconds": 1200,
+      "eta_alignment_status": "unknown",
+      "inversion_probability": 0.62,
+      "model_eta_seconds": 0,
+      "pair_key": "BTC|mexc|spot|gate|futures",
+      "range_status": "unknown",
+      "range_window": "none",
+      "recommended_entry_range": "--",
+      "recommended_exit_range": "--",
+      "signal_action": "EXECUTE",
+      "signal_ts": 1773181601.049695,
+      "status": "awaiting_confirmation"
+    }
+  ],
+  "summary": {
+    "awaiting_confirmation": 1,
+    "confirmable_now": 0,
+    "confirmed": 0,
+    "not_confirmed": 0,
+    "total": 1
+  }
+}

@@ -25,6 +25,7 @@ class DatasetBundle:
     X: torch.Tensor
     y_class: torch.Tensor
     y_eta: torch.Tensor
+    label_thresholds: list[float]
     pair_ids: list[str]
     block_ids: list[int]
     session_ids: list[int]
@@ -39,6 +40,7 @@ class DatasetBundle:
             X=self.X[indices],
             y_class=self.y_class[indices],
             y_eta=self.y_eta[indices],
+            label_thresholds=[self.label_thresholds[index] for index in indices],
             pair_ids=[self.pair_ids[index] for index in indices],
             block_ids=[self.block_ids[index] for index in indices],
             session_ids=[self.session_ids[index] for index in indices],
@@ -53,6 +55,11 @@ class DatasetBundle:
                 "num_negative_samples": len(indices) - int(self.y_class[indices].sum().item()) if indices else 0,
                 "positive_rate": (
                     float(self.y_class[indices].mean().item())
+                    if indices
+                    else 0.0
+                ),
+                "label_threshold_p50": (
+                    float(np.percentile(np.asarray([self.label_thresholds[index] for index in indices], dtype=float), 50))
                     if indices
                     else 0.0
                 ),
@@ -736,14 +743,54 @@ def _build_pair_segments(
     return merged_segments, diagnostics
 
 
+def compute_label_threshold(
+    pair_key: str,
+    episodes: list[Any],
+    *,
+    cost_floor_pct: float,
+    percentile: float,
+) -> float:
+    del pair_key
+    total_spreads = [
+        float(getattr(episode, "total_spread", 0.0) or 0.0)
+        for episode in episodes
+    ]
+    if not total_spreads:
+        return float(max(0.0, cost_floor_pct))
+    return float(max(float(cost_floor_pct), np.percentile(np.asarray(total_spreads, dtype=float), float(percentile))))
+
+
 def _label_window_from_episodes(
     current_ts: float,
     episodes: list[Any],
     *,
     prediction_horizon_sec: int,
     min_total_spread_pct: float,
+    adaptive_threshold_enabled: bool = False,
+    pair_key: str = "",
+    label_cost_floor_pct: float | None = None,
+    label_percentile: float = 70.0,
+    label_episode_window_days: int = 5,
 ) -> dict[str, Any]:
     horizon_end_ts = float(current_ts) + float(prediction_horizon_sec)
+    effective_cost_floor = float(max(0.0, label_cost_floor_pct if label_cost_floor_pct is not None else min_total_spread_pct or 0.0))
+    pair_threshold = float(max(0.0, min_total_spread_pct or 0.0))
+    threshold_support = 0
+    if adaptive_threshold_enabled:
+        history_window_sec = max(int(label_episode_window_days), 1) * 24 * 60 * 60
+        prior_episodes = [
+            episode
+            for episode in episodes
+            if float(getattr(episode, "end_ts", 0.0) or 0.0) <= float(current_ts)
+            and float(getattr(episode, "end_ts", 0.0) or 0.0) >= (float(current_ts) - float(history_window_sec))
+        ]
+        threshold_support = int(len(prior_episodes))
+        pair_threshold = compute_label_threshold(
+            pair_key,
+            prior_episodes,
+            cost_floor_pct=effective_cost_floor,
+            percentile=label_percentile,
+        )
     future_episodes = [
         episode
         for episode in episodes
@@ -754,7 +801,7 @@ def _label_window_from_episodes(
     qualified_episodes = [
         episode
         for episode in future_episodes
-        if float(episode.total_spread) >= float(min_total_spread_pct or 0.0)
+        if float(episode.total_spread) >= float(pair_threshold)
     ]
     if qualified_episodes:
         first_qualified = qualified_episodes[0]
@@ -762,6 +809,8 @@ def _label_window_from_episodes(
             "y_class": 1.0,
             "y_eta": float(first_qualified.end_ts) - float(current_ts),
             "timeout_reason": "qualified_episode",
+            "label_threshold": float(pair_threshold),
+            "label_threshold_support": int(threshold_support),
             "peak_future_total_spread": max(future_total_spreads) if future_total_spreads else 0.0,
             "qualified_episode_total_spread": float(first_qualified.total_spread),
             "future_episode_total_spreads": future_total_spreads,
@@ -770,6 +819,8 @@ def _label_window_from_episodes(
         "y_class": 0.0,
         "y_eta": 0.0,
         "timeout_reason": "sub_threshold_only" if future_episodes else "no_future_episode",
+        "label_threshold": float(pair_threshold),
+        "label_threshold_support": int(threshold_support),
         "peak_future_total_spread": max(future_total_spreads) if future_total_spreads else 0.0,
         "qualified_episode_total_spread": 0.0,
         "future_episode_total_spreads": future_total_spreads,
@@ -980,6 +1031,9 @@ def build_dataset_bundle(
     prediction_horizon_sec: int = 14_400,
     *,
     min_total_spread_pct: float = 0.0,
+    label_cost_floor_pct: float | None = None,
+    label_percentile: float | None = None,
+    label_episode_window_days: int | None = None,
     selected_block_ids: list[int] | None = None,
     selected_session_ids: list[int] | None = None,
     selected_only: bool | None = None,
@@ -991,6 +1045,7 @@ def build_dataset_bundle(
     X_samples: list[list[list[float]]] = []
     y_class: list[float] = []
     y_eta: list[float] = []
+    sample_label_thresholds: list[float] = []
     pair_ids: list[str] = []
     block_ids: list[int] = []
     session_ids: list[int] = []
@@ -1007,6 +1062,7 @@ def build_dataset_bundle(
     timeouts_without_future_episode = 0
     timeouts_with_only_sub_threshold_episode = 0
     skipped_windows_right_censored = 0
+    pair_label_thresholds: dict[str, list[float]] = defaultdict(list)
 
     if state_path.suffix.lower() == ".json":
         pairs, saved_at = _load_pairs_from_json(state_path)
@@ -1033,7 +1089,16 @@ def build_dataset_bundle(
         )
         storage_kind = str(block_summary.get("state_storage_kind", "sqlite"))
 
-    min_total_spread_pct = max(0.0, float(min_total_spread_pct or 0.0))
+    legacy_min_total_spread_pct = max(0.0, float(min_total_spread_pct or 0.0))
+    adaptive_threshold_enabled = any(value is not None for value in (label_cost_floor_pct, label_percentile, label_episode_window_days))
+    effective_label_cost_floor_pct = (
+        max(0.0, float(label_cost_floor_pct))
+        if label_cost_floor_pct is not None
+        else (legacy_min_total_spread_pct if legacy_min_total_spread_pct > 0.0 else 1.0)
+    )
+    effective_label_percentile = float(label_percentile if label_percentile is not None else 70.0)
+    effective_label_episode_window_days = max(1, int(label_episode_window_days if label_episode_window_days is not None else 5))
+    effective_min_total_spread_pct = effective_label_cost_floor_pct if adaptive_threshold_enabled else legacy_min_total_spread_pct
     effective_max_session_gap_sec = max_session_gap_sec
     if bool(allow_cross_session_merge) and effective_max_session_gap_sec is None:
         effective_max_session_gap_sec = _load_tracker_gap_threshold_sec(state_path)
@@ -1093,18 +1158,25 @@ def build_dataset_bundle(
                 current_ts,
                 episodes,
                 prediction_horizon_sec=prediction_horizon_sec,
-                min_total_spread_pct=min_total_spread_pct,
+                min_total_spread_pct=effective_min_total_spread_pct,
+                adaptive_threshold_enabled=adaptive_threshold_enabled,
+                pair_key=normalized_pair_id,
+                label_cost_floor_pct=effective_label_cost_floor_pct,
+                label_percentile=effective_label_percentile,
+                label_episode_window_days=effective_label_episode_window_days,
             )
 
             X_samples.append(segment_feature_rows[start : start + sequence_length])
             y_class.append(float(label["y_class"]))
             y_eta.append(float(label["y_eta"]))
+            sample_label_thresholds.append(float(label["label_threshold"]))
             pair_ids.append(normalized_pair_id)
             block_ids.append(int(window[-1].get("block_id") or 0))
             session_ids.append(int(window[-1].get("session_id") or 0))
             timestamps.append(current_ts)
             label_end_timestamps.append(float(current_ts) + float(prediction_horizon_sec))
             last_entries.append(float(window[-1]["entry_spread"]))
+            pair_label_thresholds[normalized_pair_id].append(float(label["label_threshold"]))
 
             future_episode_total_spreads.extend(float(value) for value in label["future_episode_total_spreads"])
             if float(label["y_class"]) >= 0.5:
@@ -1144,6 +1216,18 @@ def build_dataset_bundle(
         X_tensor = torch.empty((0, sequence_length, len(FEATURE_NAMES)), dtype=torch.float32)
         y_class_tensor = torch.empty((0,), dtype=torch.float32)
         y_eta_tensor = torch.empty((0,), dtype=torch.float32)
+    label_threshold_summary = {
+        pair_id: {
+            "latest": float(values[-1]),
+            "min": float(min(values)),
+            "p50": float(np.percentile(np.asarray(values, dtype=float), 50)),
+            "p90": float(np.percentile(np.asarray(values, dtype=float), 90)),
+            "max": float(max(values)),
+            "samples": int(len(values)),
+        }
+        for pair_id, values in sorted(pair_label_thresholds.items())
+        if values
+    }
 
     summary = {
         "num_samples": len(X_samples),
@@ -1165,14 +1249,19 @@ def build_dataset_bundle(
         "num_cross_session_windows": int(cross_session_window_count),
         "prediction_horizon_sec": int(prediction_horizon_sec),
         "sequence_length": int(sequence_length),
-        "min_total_spread_pct": float(min_total_spread_pct),
+        "min_total_spread_pct": float(effective_min_total_spread_pct),
+        "label_threshold_mode": "rolling_pair_percentile" if adaptive_threshold_enabled else "fixed_threshold",
+        "label_cost_floor_pct": float(effective_label_cost_floor_pct),
+        "label_percentile": float(effective_label_percentile),
+        "label_episode_window_days": int(effective_label_episode_window_days),
+        "label_thresholds": label_threshold_summary,
         "cross_session_merge_enabled": bool(allow_cross_session_merge),
         "cross_session_merges_applied": int(cross_session_merge_diagnostics.get("applied_count", 0)),
         "cross_session_gap_threshold_sec": None if effective_max_session_gap_sec is None else float(effective_max_session_gap_sec),
         "cross_session_boundaries": int(cross_session_merge_diagnostics.get("applied_count", 0)),
         "cross_session_merge_diagnostics": dict(cross_session_merge_diagnostics),
         "episode_diagnostics": episode_diagnostics,
-        "labeling_method": "episode_take_profit_time_barrier",
+        "labeling_method": "rolling_pair_percentile_take_profit_time_barrier" if adaptive_threshold_enabled else "episode_take_profit_time_barrier",
         "labeling_timeout_only": True,
         "label_audit": _finalize_label_audit(
             positive_entry_spread_buckets,
@@ -1190,6 +1279,7 @@ def build_dataset_bundle(
         X=X_tensor,
         y_class=y_class_tensor,
         y_eta=y_eta_tensor,
+        label_thresholds=sample_label_thresholds,
         pair_ids=pair_ids,
         block_ids=block_ids,
         session_ids=session_ids,

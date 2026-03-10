@@ -1,0 +1,133 @@
+{
+  "baselines": {
+    "always_negative": {
+      "recall": 0.0
+    }
+  },
+  "dataset_fingerprint": "test-dataset-fingerprint",
+  "dataset_summary": {
+    "num_samples": 10
+  },
+  "dropout": 0.0,
+  "execute_threshold": 0.45,
+  "feature_contract_version": "v2_multiscale_25",
+  "feature_mean": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "feature_names": [
+    "entry_spread",
+    "exit_spread",
+    "delta_entry",
+    "delta_exit",
+    "delta2_entry",
+    "delta2_exit",
+    "rolling_std_entry",
+    "rolling_std_exit",
+    "zscore_entry",
+    "zscore_exit",
+    "mean_entry_30m",
+    "std_entry_30m",
+    "max_entry_30m",
+    "episode_count_30m",
+    "position_in_range_30m",
+    "mean_entry_2h",
+    "std_entry_2h",
+    "max_entry_2h",
+    "episode_count_2h",
+    "trend_slope_2h",
+    "mean_entry_8h",
+    "std_entry_8h",
+    "max_entry_8h",
+    "episode_count_8h",
+    "zscore_vs_8h"
+  ],
+  "feature_schema_hash": "590ee5de64fbc52dd7ef681569de554946128516",
+  "feature_std": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "hidden_size": 8,
+  "input_size": 25,
+  "min_empirical_events": 2,
+  "min_history_points": 12,
+  "num_layers": 1,
+  "platt_bias": 0.0,
+  "platt_scale": 1.0,
+  "sequence_length": 12,
+  "split_summary": {
+    "pair_overlap": 0
+  },
+  "strong_threshold": 0.7,
+  "test_metrics": {
+    "average_precision": 0.5
+  },
+  "trained_at_utc": "2026-03-07T00:00:00+00:00",
+  "training_config": {
+    "label_cost_floor_pct": 1.0,
+    "label_episode_window_days": 5,
+    "label_percentile": 70,
+    "label_threshold_mode": "rolling_pair_percentile",
+    "min_total_spread_pct": 1.0,
+    "prediction_horizon_sec": 14400,
+    "selected_label_config": {
+      "cost_floor_pct": 1.0,
+      "label_episode_window_days": 5,
+      "label_percentile": 70,
+      "label_threshold_mode": "rolling_pair_percentile",
+      "threshold": 1.0
+    },
+    "selected_threshold": 1.0
+  },
+  "use_attention": true,
+  "validation_metrics": {
+    "average_precision": 0.5
+  },
+  "version": "test-bundle"
+}

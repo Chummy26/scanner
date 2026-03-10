@@ -1,0 +1,23 @@
+{
+  "details": {
+    "block_diagnostics": {
+      "inter_record_interval_sec_quantiles": {
+        "p50": 15.0
+      },
+      "irregular_block_count": 0,
+      "max_to_median_interval_ratio_quantiles": {
+        "p90": 1.2
+      }
+    },
+    "irregular_block_rate": 0.0,
+    "max_to_median_ratio_p90": 1.2,
+    "median_interval_p50_sec": 15.0,
+    "total_blocks": 1
+  },
+  "failure_reasons": [],
+  "gate_id": "gate_02_intra_block_temporal_regularity",
+  "recommendations": [],
+  "status": "PASS",
+  "title": "Intra-block temporal regularity",
+  "warnings": []
+}

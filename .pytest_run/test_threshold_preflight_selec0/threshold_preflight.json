@@ -1,0 +1,1336 @@
+{
+  "block_diagnostics": {
+    "duration_sec_quantiles": {
+      "max": 480.0,
+      "p10": 480.0,
+      "p25": 480.0,
+      "p50": 480.0,
+      "p75": 480.0,
+      "p90": 480.0
+    },
+    "feature_window_feasibility": {
+      "eligible_blocks_for_sequence_length": 18,
+      "eligible_sessions_with_any_eligible_block": 1,
+      "sequence_length": 3
+    },
+    "inter_record_interval_sec_quantiles": {
+      "max": 60.0,
+      "p10": 60.0,
+      "p25": 60.0,
+      "p50": 60.0,
+      "p75": 60.0,
+      "p90": 60.0
+    },
+    "irregular_block_count": 0,
+    "max_to_median_interval_ratio_quantiles": {
+      "max": 1.0,
+      "p10": 1.0,
+      "p25": 1.0,
+      "p50": 1.0,
+      "p75": 1.0,
+      "p90": 1.0
+    },
+    "record_count_quantiles": {
+      "max": 9.0,
+      "p10": 9.0,
+      "p25": 9.0,
+      "p50": 9.0,
+      "p75": 9.0,
+      "p90": 9.0
+    },
+    "record_count_threshold_counts": {
+      "ge_10": 0,
+      "ge_12": 0,
+      "ge_15": 0,
+      "ge_20": 0,
+      "ge_8": 18
+    },
+    "session_summaries": {
+      "0": {
+        "duration_sec_quantiles": {
+          "max": 480.0,
+          "p10": 480.0,
+          "p25": 480.0,
+          "p50": 480.0,
+          "p75": 480.0,
+          "p90": 480.0
+        },
+        "eligible_blocks_for_sequence_length": 18,
+        "inter_record_interval_sec_quantiles": {
+          "max": 60.0,
+          "p10": 60.0,
+          "p25": 60.0,
+          "p50": 60.0,
+          "p75": 60.0,
+          "p90": 60.0
+        },
+        "irregular_block_count": 0,
+        "max_record_count": 9,
+        "max_to_median_interval_ratio_quantiles": {
+          "max": 1.0,
+          "p10": 1.0,
+          "p25": 1.0,
+          "p50": 1.0,
+          "p75": 1.0,
+          "p90": 1.0
+        },
+        "num_blocks": 18,
+        "record_count_quantiles": {
+          "max": 9.0,
+          "p10": 9.0,
+          "p25": 9.0,
+          "p50": 9.0,
+          "p75": 9.0,
+          "p90": 9.0
+        },
+        "record_count_threshold_counts": {
+          "ge_10": 0,
+          "ge_12": 0,
+          "ge_15": 0,
+          "ge_20": 0,
+          "ge_8": 18
+        }
+      }
+    }
+  },
+  "cost_floors": [
+    1.0,
+    0.8,
+    0.7
+  ],
+  "cross_session_merge_enabled": false,
+  "label_episode_window_days": 5,
+  "label_percentiles": [],
+  "label_threshold_mode": "fixed_threshold",
+  "max_session_gap_sec": null,
+  "prediction_horizon_sec": 240,
+  "qualifies_for_training": true,
+  "regime_shift_score_threshold": 3.0,
+  "selected_label_config": {
+    "cost_floor_pct": 0.8,
+    "label_episode_window_days": null,
+    "label_percentile": null,
+    "label_threshold_mode": "fixed_threshold",
+    "threshold": 0.8
+  },
+  "selected_threshold": 0.8,
+  "selection_mode": "primary",
+  "sequence_length": 3,
+  "state_path": "C:\\Users\\nicoolas\\Pictures\\scanner\\scanner\\.pytest_run\\test_threshold_preflight_selec0\\tracker_state_near_threshold.json",
+  "thresholds": {
+    "0.7": {
+      "block_diagnostics": {
+        "duration_sec_quantiles": {
+          "max": 480.0,
+          "p10": 480.0,
+          "p25": 480.0,
+          "p50": 480.0,
+          "p75": 480.0,
+          "p90": 480.0
+        },
+        "feature_window_feasibility": {
+          "eligible_blocks_for_sequence_length": 18,
+          "eligible_sessions_with_any_eligible_block": 1,
+          "sequence_length": 3
+        },
+        "inter_record_interval_sec_quantiles": {
+          "max": 60.0,
+          "p10": 60.0,
+          "p25": 60.0,
+          "p50": 60.0,
+          "p75": 60.0,
+          "p90": 60.0
+        },
+        "irregular_block_count": 0,
+        "max_to_median_interval_ratio_quantiles": {
+          "max": 1.0,
+          "p10": 1.0,
+          "p25": 1.0,
+          "p50": 1.0,
+          "p75": 1.0,
+          "p90": 1.0
+        },
+        "record_count_quantiles": {
+          "max": 9.0,
+          "p10": 9.0,
+          "p25": 9.0,
+          "p50": 9.0,
+          "p75": 9.0,
+          "p90": 9.0
+        },
+        "record_count_threshold_counts": {
+          "ge_10": 0,
+          "ge_12": 0,
+          "ge_15": 0,
+          "ge_20": 0,
+          "ge_8": 18
+        },
+        "session_summaries": {
+          "0": {
+            "duration_sec_quantiles": {
+              "max": 480.0,
+              "p10": 480.0,
+              "p25": 480.0,
+              "p50": 480.0,
+              "p75": 480.0,
+              "p90": 480.0
+            },
+            "eligible_blocks_for_sequence_length": 18,
+            "inter_record_interval_sec_quantiles": {
+              "max": 60.0,
+              "p10": 60.0,
+              "p25": 60.0,
+              "p50": 60.0,
+              "p75": 60.0,
+              "p90": 60.0
+            },
+            "irregular_block_count": 0,
+            "max_record_count": 9,
+            "max_to_median_interval_ratio_quantiles": {
+              "max": 1.0,
+              "p10": 1.0,
+              "p25": 1.0,
+              "p50": 1.0,
+              "p75": 1.0,
+              "p90": 1.0
+            },
+            "num_blocks": 18,
+            "record_count_quantiles": {
+              "max": 9.0,
+              "p10": 9.0,
+              "p25": 9.0,
+              "p50": 9.0,
+              "p75": 9.0,
+              "p90": 9.0
+            },
+            "record_count_threshold_counts": {
+              "ge_10": 0,
+              "ge_12": 0,
+              "ge_15": 0,
+              "ge_20": 0,
+              "ge_8": 18
+            }
+          }
+        }
+      },
+      "build_ok": true,
+      "cost_floor_pct": 0.7,
+      "cross_session_merge_diagnostics": {
+        "applied_count": 0,
+        "calibration_log": [],
+        "candidate_count": 0,
+        "gap_sec_quantiles": {
+          "max": 0.0,
+          "p10": 0.0,
+          "p25": 0.0,
+          "p50": 0.0,
+          "p75": 0.0,
+          "p90": 0.0
+        },
+        "max_session_gap_sec": null,
+        "rejected_gap_count": 0,
+        "rejected_regime_shift_count": 0,
+        "score_quantiles": {
+          "max": 0.0,
+          "p10": 0.0,
+          "p25": 0.0,
+          "p50": 0.0,
+          "p75": 0.0,
+          "p90": 0.0
+        },
+        "threshold": 3.0,
+        "window_size_quantiles": {
+          "max": 0.0,
+          "p10": 0.0,
+          "p25": 0.0,
+          "p50": 0.0,
+          "p75": 0.0,
+          "p90": 0.0
+        }
+      },
+      "cross_session_merge_enabled": false,
+      "cross_session_merges_applied": 0,
+      "episode_diagnostics": {
+        "duration_sec_quantiles": {
+          "max": 180.0,
+          "p10": 180.0,
+          "p25": 180.0,
+          "p50": 180.0,
+          "p75": 180.0,
+          "p90": 180.0
+        },
+        "episode_count": 18,
+        "total_spread_quantiles": {
+          "max": 0.8999999999999999,
+          "p10": 0.8999999999999999,
+          "p25": 0.8999999999999999,
+          "p50": 0.8999999999999999,
+          "p75": 0.8999999999999999,
+          "p90": 0.8999999999999999
+        }
+      },
+      "error": "",
+      "failure_reasons": [
+        "right_censoring_present"
+      ],
+      "guardrail_ok": true,
+      "label_audit": {
+        "future_episode_total_spread_quantiles": {
+          "max": 0.8999999999999999,
+          "p10": 0.8999999999999999,
+          "p25": 0.8999999999999999,
+          "p50": 0.8999999999999999,
+          "p75": 0.8999999999999999,
+          "p90": 0.8999999999999999
+        },
+        "positive_entry_spread_buckets": {
+          "0_30_to_0_50": 0,
+          "0_50_to_1_00": 0,
+          "1_00_to_2_00": 0,
+          "ge_2_00": 0,
+          "lt_0_30": 18
+        },
+        "right_censored_windows": 72,
+        "timeout_peak_future_total_spread_buckets": {
+          "0_30_to_0_50": 0,
+          "0_50_to_0_80": 0,
+          "0_80_to_1_00": 0,
+          "ge_1_00": 0,
+          "lt_0_30": 36
+        },
+        "timeouts_with_only_sub_threshold_episode": 0,
+        "timeouts_without_future_episode": 36
+      },
+      "label_episode_window_days": null,
+      "label_percentile": null,
+      "label_threshold_mode": "fixed_threshold",
+      "label_thresholds": {
+        "NEAR00|buy|spot|sell|futures": {
+          "latest": 0.7,
+          "max": 0.7,
+          "min": 0.7,
+          "p50": 0.7,
+          "p90": 0.7,
+          "samples": 3
+        },
+        "NEAR01|buy|spot|sell|futures": {
+          "latest": 0.7,
+          "max": 0.7,
+          "min": 0.7,
+          "p50": 0.7,
+          "p90": 0.7,
+          "samples": 3
+        },
+        "NEAR02|buy|spot|sell|futures": {
+          "latest": 0.7,
+          "max": 0.7,
+          "min": 0.7,
+          "p50": 0.7,
+          "p90": 0.7,
+          "samples": 3
+        },
+        "NEAR03|buy|spot|sell|futures": {
+          "latest": 0.7,
+          "max": 0.7,
+          "min": 0.7,
+          "p50": 0.7,
+          "p90": 0.7,
+          "samples": 3
+        },
+        "NEAR04|buy|spot|sell|futures": {
+          "latest": 0.7,
+          "max": 0.7,
+          "min": 0.7,
+          "p50": 0.7,
+          "p90": 0.7,
+          "samples": 3
+        },
+        "NEAR05|buy|spot|sell|futures": {
+          "latest": 0.7,
+          "max": 0.7,
+          "min": 0.7,
+          "p50": 0.7,
+          "p90": 0.7,
+          "samples": 3
+        },
+        "NEAR06|buy|spot|sell|futures": {
+          "latest": 0.7,
+          "max": 0.7,
+          "min": 0.7,
+          "p50": 0.7,
+          "p90": 0.7,
+          "samples": 3
+        },
+        "NEAR07|buy|spot|sell|futures": {
+          "latest": 0.7,
+          "max": 0.7,
+          "min": 0.7,
+          "p50": 0.7,
+          "p90": 0.7,
+          "samples": 3
+        },
+        "NEAR08|buy|spot|sell|futures": {
+          "latest": 0.7,
+          "max": 0.7,
+          "min": 0.7,
+          "p50": 0.7,
+          "p90": 0.7,
+          "samples": 3
+        },
+        "NEAR09|buy|spot|sell|futures": {
+          "latest": 0.7,
+          "max": 0.7,
+          "min": 0.7,
+          "p50": 0.7,
+          "p90": 0.7,
+          "samples": 3
+        },
+        "NEAR10|buy|spot|sell|futures": {
+          "latest": 0.7,
+          "max": 0.7,
+          "min": 0.7,
+          "p50": 0.7,
+          "p90": 0.7,
+          "samples": 3
+        },
+        "NEAR11|buy|spot|sell|futures": {
+          "latest": 0.7,
+          "max": 0.7,
+          "min": 0.7,
+          "p50": 0.7,
+          "p90": 0.7,
+          "samples": 3
+        },
+        "NEAR12|buy|spot|sell|futures": {
+          "latest": 0.7,
+          "max": 0.7,
+          "min": 0.7,
+          "p50": 0.7,
+          "p90": 0.7,
+          "samples": 3
+        },
+        "NEAR13|buy|spot|sell|futures": {
+          "latest": 0.7,
+          "max": 0.7,
+          "min": 0.7,
+          "p50": 0.7,
+          "p90": 0.7,
+          "samples": 3
+        },
+        "NEAR14|buy|spot|sell|futures": {
+          "latest": 0.7,
+          "max": 0.7,
+          "min": 0.7,
+          "p50": 0.7,
+          "p90": 0.7,
+          "samples": 3
+        },
+        "NEAR15|buy|spot|sell|futures": {
+          "latest": 0.7,
+          "max": 0.7,
+          "min": 0.7,
+          "p50": 0.7,
+          "p90": 0.7,
+          "samples": 3
+        },
+        "NEAR16|buy|spot|sell|futures": {
+          "latest": 0.7,
+          "max": 0.7,
+          "min": 0.7,
+          "p50": 0.7,
+          "p90": 0.7,
+          "samples": 3
+        },
+        "NEAR17|buy|spot|sell|futures": {
+          "latest": 0.7,
+          "max": 0.7,
+          "min": 0.7,
+          "p50": 0.7,
+          "p90": 0.7,
+          "samples": 3
+        }
+      },
+      "max_positive_rate_delta": 0.041666656732559204,
+      "min_to_max_positive_rate_ratio": 0.8888889153798422,
+      "num_negative_samples": 36,
+      "num_positive_samples": 18,
+      "num_samples": 54,
+      "positive_rate": 0.3333333333333333,
+      "purging_ok": true,
+      "qualifies_for_training": true,
+      "qualifies_for_training_relaxed": true,
+      "split_positive_counts": {
+        "test": 2,
+        "train": 13,
+        "val": 3
+      },
+      "split_positive_rates": {
+        "test": 0.3333333432674408,
+        "train": 0.34210526943206787,
+        "val": 0.375
+      },
+      "split_summary": {
+        "embargo_samples": 2,
+        "embargo_time_sec": 240,
+        "global_temporal_order": true,
+        "min_cross_split_gap_sec": 9700.0,
+        "pair_overlap": 0,
+        "pair_overlap_breakdown": {
+          "train_test": 0,
+          "train_val": 0,
+          "val_test": 0
+        },
+        "pair_overlap_pairwise_sum": 0,
+        "pair_overlap_rate": 0.0,
+        "purged_temporal_separation_ok": true,
+        "split_mode": "sample_chronological_purged",
+        "split_mode_fallback_reason": "insufficient_sessions",
+        "test_blocks": 1,
+        "test_end_ts": 1702170240.0,
+        "test_negative_pairs": 0,
+        "test_pairs": 2,
+        "test_positive_pairs": 2,
+        "test_positive_rate": 0.3333333432674408,
+        "test_samples": 6,
+        "test_session_ids": [],
+        "test_start_ts": 1702160120.0,
+        "train_blocks": 1,
+        "train_end_label_ts": 1702120420.0,
+        "train_end_ts": 1702120180.0,
+        "train_negative_pairs": 0,
+        "train_pairs": 13,
+        "train_positive_pairs": 13,
+        "train_positive_rate": 0.34210526943206787,
+        "train_samples": 38,
+        "train_session_ids": [],
+        "train_start_ts": 1702000120.0,
+        "val_blocks": 1,
+        "val_end_label_ts": 1702150420.0,
+        "val_end_ts": 1702150180.0,
+        "val_negative_pairs": 0,
+        "val_pairs": 3,
+        "val_positive_pairs": 3,
+        "val_positive_rate": 0.375,
+        "val_samples": 8,
+        "val_session_ids": [],
+        "val_start_ts": 1702130120.0
+      },
+      "stability_mode": "primary",
+      "stability_ok": true,
+      "stability_ok_primary": true,
+      "stability_ok_relaxed": true,
+      "threshold": 0.7
+    },
+    "0.8": {
+      "block_diagnostics": {
+        "duration_sec_quantiles": {
+          "max": 480.0,
+          "p10": 480.0,
+          "p25": 480.0,
+          "p50": 480.0,
+          "p75": 480.0,
+          "p90": 480.0
+        },
+        "feature_window_feasibility": {
+          "eligible_blocks_for_sequence_length": 18,
+          "eligible_sessions_with_any_eligible_block": 1,
+          "sequence_length": 3
+        },
+        "inter_record_interval_sec_quantiles": {
+          "max": 60.0,
+          "p10": 60.0,
+          "p25": 60.0,
+          "p50": 60.0,
+          "p75": 60.0,
+          "p90": 60.0
+        },
+        "irregular_block_count": 0,
+        "max_to_median_interval_ratio_quantiles": {
+          "max": 1.0,
+          "p10": 1.0,
+          "p25": 1.0,
+          "p50": 1.0,
+          "p75": 1.0,
+          "p90": 1.0
+        },
+        "record_count_quantiles": {
+          "max": 9.0,
+          "p10": 9.0,
+          "p25": 9.0,
+          "p50": 9.0,
+          "p75": 9.0,
+          "p90": 9.0
+        },
+        "record_count_threshold_counts": {
+          "ge_10": 0,
+          "ge_12": 0,
+          "ge_15": 0,
+          "ge_20": 0,
+          "ge_8": 18
+        },
+        "session_summaries": {
+          "0": {
+            "duration_sec_quantiles": {
+              "max": 480.0,
+              "p10": 480.0,
+              "p25": 480.0,
+              "p50": 480.0,
+              "p75": 480.0,
+              "p90": 480.0
+            },
+            "eligible_blocks_for_sequence_length": 18,
+            "inter_record_interval_sec_quantiles": {
+              "max": 60.0,
+              "p10": 60.0,
+              "p25": 60.0,
+              "p50": 60.0,
+              "p75": 60.0,
+              "p90": 60.0
+            },
+            "irregular_block_count": 0,
+            "max_record_count": 9,
+            "max_to_median_interval_ratio_quantiles": {
+              "max": 1.0,
+              "p10": 1.0,
+              "p25": 1.0,
+              "p50": 1.0,
+              "p75": 1.0,
+              "p90": 1.0
+            },
+            "num_blocks": 18,
+            "record_count_quantiles": {
+              "max": 9.0,
+              "p10": 9.0,
+              "p25": 9.0,
+              "p50": 9.0,
+              "p75": 9.0,
+              "p90": 9.0
+            },
+            "record_count_threshold_counts": {
+              "ge_10": 0,
+              "ge_12": 0,
+              "ge_15": 0,
+              "ge_20": 0,
+              "ge_8": 18
+            }
+          }
+        }
+      },
+      "build_ok": true,
+      "cost_floor_pct": 0.8,
+      "cross_session_merge_diagnostics": {
+        "applied_count": 0,
+        "calibration_log": [],
+        "candidate_count": 0,
+        "gap_sec_quantiles": {
+          "max": 0.0,
+          "p10": 0.0,
+          "p25": 0.0,
+          "p50": 0.0,
+          "p75": 0.0,
+          "p90": 0.0
+        },
+        "max_session_gap_sec": null,
+        "rejected_gap_count": 0,
+        "rejected_regime_shift_count": 0,
+        "score_quantiles": {
+          "max": 0.0,
+          "p10": 0.0,
+          "p25": 0.0,
+          "p50": 0.0,
+          "p75": 0.0,
+          "p90": 0.0
+        },
+        "threshold": 3.0,
+        "window_size_quantiles": {
+          "max": 0.0,
+          "p10": 0.0,
+          "p25": 0.0,
+          "p50": 0.0,
+          "p75": 0.0,
+          "p90": 0.0
+        }
+      },
+      "cross_session_merge_enabled": false,
+      "cross_session_merges_applied": 0,
+      "episode_diagnostics": {
+        "duration_sec_quantiles": {
+          "max": 180.0,
+          "p10": 180.0,
+          "p25": 180.0,
+          "p50": 180.0,
+          "p75": 180.0,
+          "p90": 180.0
+        },
+        "episode_count": 18,
+        "total_spread_quantiles": {
+          "max": 0.8999999999999999,
+          "p10": 0.8999999999999999,
+          "p25": 0.8999999999999999,
+          "p50": 0.8999999999999999,
+          "p75": 0.8999999999999999,
+          "p90": 0.8999999999999999
+        }
+      },
+      "error": "",
+      "failure_reasons": [
+        "right_censoring_present"
+      ],
+      "guardrail_ok": true,
+      "label_audit": {
+        "future_episode_total_spread_quantiles": {
+          "max": 0.8999999999999999,
+          "p10": 0.8999999999999999,
+          "p25": 0.8999999999999999,
+          "p50": 0.8999999999999999,
+          "p75": 0.8999999999999999,
+          "p90": 0.8999999999999999
+        },
+        "positive_entry_spread_buckets": {
+          "0_30_to_0_50": 0,
+          "0_50_to_1_00": 0,
+          "1_00_to_2_00": 0,
+          "ge_2_00": 0,
+          "lt_0_30": 18
+        },
+        "right_censored_windows": 72,
+        "timeout_peak_future_total_spread_buckets": {
+          "0_30_to_0_50": 0,
+          "0_50_to_0_80": 0,
+          "0_80_to_1_00": 0,
+          "ge_1_00": 0,
+          "lt_0_30": 36
+        },
+        "timeouts_with_only_sub_threshold_episode": 0,
+        "timeouts_without_future_episode": 36
+      },
+      "label_episode_window_days": null,
+      "label_percentile": null,
+      "label_threshold_mode": "fixed_threshold",
+      "label_thresholds": {
+        "NEAR00|buy|spot|sell|futures": {
+          "latest": 0.8,
+          "max": 0.8,
+          "min": 0.8,
+          "p50": 0.8,
+          "p90": 0.8,
+          "samples": 3
+        },
+        "NEAR01|buy|spot|sell|futures": {
+          "latest": 0.8,
+          "max": 0.8,
+          "min": 0.8,
+          "p50": 0.8,
+          "p90": 0.8,
+          "samples": 3
+        },
+        "NEAR02|buy|spot|sell|futures": {
+          "latest": 0.8,
+          "max": 0.8,
+          "min": 0.8,
+          "p50": 0.8,
+          "p90": 0.8,
+          "samples": 3
+        },
+        "NEAR03|buy|spot|sell|futures": {
+          "latest": 0.8,
+          "max": 0.8,
+          "min": 0.8,
+          "p50": 0.8,
+          "p90": 0.8,
+          "samples": 3
+        },
+        "NEAR04|buy|spot|sell|futures": {
+          "latest": 0.8,
+          "max": 0.8,
+          "min": 0.8,
+          "p50": 0.8,
+          "p90": 0.8,
+          "samples": 3
+        },
+        "NEAR05|buy|spot|sell|futures": {
+          "latest": 0.8,
+          "max": 0.8,
+          "min": 0.8,
+          "p50": 0.8,
+          "p90": 0.8,
+          "samples": 3
+        },
+        "NEAR06|buy|spot|sell|futures": {
+          "latest": 0.8,
+          "max": 0.8,
+          "min": 0.8,
+          "p50": 0.8,
+          "p90": 0.8,
+          "samples": 3
+        },
+        "NEAR07|buy|spot|sell|futures": {
+          "latest": 0.8,
+          "max": 0.8,
+          "min": 0.8,
+          "p50": 0.8,
+          "p90": 0.8,
+          "samples": 3
+        },
+        "NEAR08|buy|spot|sell|futures": {
+          "latest": 0.8,
+          "max": 0.8,
+          "min": 0.8,
+          "p50": 0.8,
+          "p90": 0.8,
+          "samples": 3
+        },
+        "NEAR09|buy|spot|sell|futures": {
+          "latest": 0.8,
+          "max": 0.8,
+          "min": 0.8,
+          "p50": 0.8,
+          "p90": 0.8,
+          "samples": 3
+        },
+        "NEAR10|buy|spot|sell|futures": {
+          "latest": 0.8,
+          "max": 0.8,
+          "min": 0.8,
+          "p50": 0.8,
+          "p90": 0.8,
+          "samples": 3
+        },
+        "NEAR11|buy|spot|sell|futures": {
+          "latest": 0.8,
+          "max": 0.8,
+          "min": 0.8,
+          "p50": 0.8,
+          "p90": 0.8,
+          "samples": 3
+        },
+        "NEAR12|buy|spot|sell|futures": {
+          "latest": 0.8,
+          "max": 0.8,
+          "min": 0.8,
+          "p50": 0.8,
+          "p90": 0.8,
+          "samples": 3
+        },
+        "NEAR13|buy|spot|sell|futures": {
+          "latest": 0.8,
+          "max": 0.8,
+          "min": 0.8,
+          "p50": 0.8,
+          "p90": 0.8,
+          "samples": 3
+        },
+        "NEAR14|buy|spot|sell|futures": {
+          "latest": 0.8,
+          "max": 0.8,
+          "min": 0.8,
+          "p50": 0.8,
+          "p90": 0.8,
+          "samples": 3
+        },
+        "NEAR15|buy|spot|sell|futures": {
+          "latest": 0.8,
+          "max": 0.8,
+          "min": 0.8,
+          "p50": 0.8,
+          "p90": 0.8,
+          "samples": 3
+        },
+        "NEAR16|buy|spot|sell|futures": {
+          "latest": 0.8,
+          "max": 0.8,
+          "min": 0.8,
+          "p50": 0.8,
+          "p90": 0.8,
+          "samples": 3
+        },
+        "NEAR17|buy|spot|sell|futures": {
+          "latest": 0.8,
+          "max": 0.8,
+          "min": 0.8,
+          "p50": 0.8,
+          "p90": 0.8,
+          "samples": 3
+        }
+      },
+      "max_positive_rate_delta": 0.041666656732559204,
+      "min_to_max_positive_rate_ratio": 0.8888889153798422,
+      "num_negative_samples": 36,
+      "num_positive_samples": 18,
+      "num_samples": 54,
+      "positive_rate": 0.3333333333333333,
+      "purging_ok": true,
+      "qualifies_for_training": true,
+      "qualifies_for_training_relaxed": true,
+      "split_positive_counts": {
+        "test": 2,
+        "train": 13,
+        "val": 3
+      },
+      "split_positive_rates": {
+        "test": 0.3333333432674408,
+        "train": 0.34210526943206787,
+        "val": 0.375
+      },
+      "split_summary": {
+        "embargo_samples": 2,
+        "embargo_time_sec": 240,
+        "global_temporal_order": true,
+        "min_cross_split_gap_sec": 9700.0,
+        "pair_overlap": 0,
+        "pair_overlap_breakdown": {
+          "train_test": 0,
+          "train_val": 0,
+          "val_test": 0
+        },
+        "pair_overlap_pairwise_sum": 0,
+        "pair_overlap_rate": 0.0,
+        "purged_temporal_separation_ok": true,
+        "split_mode": "sample_chronological_purged",
+        "split_mode_fallback_reason": "insufficient_sessions",
+        "test_blocks": 1,
+        "test_end_ts": 1702170240.0,
+        "test_negative_pairs": 0,
+        "test_pairs": 2,
+        "test_positive_pairs": 2,
+        "test_positive_rate": 0.3333333432674408,
+        "test_samples": 6,
+        "test_session_ids": [],
+        "test_start_ts": 1702160120.0,
+        "train_blocks": 1,
+        "train_end_label_ts": 1702120420.0,
+        "train_end_ts": 1702120180.0,
+        "train_negative_pairs": 0,
+        "train_pairs": 13,
+        "train_positive_pairs": 13,
+        "train_positive_rate": 0.34210526943206787,
+        "train_samples": 38,
+        "train_session_ids": [],
+        "train_start_ts": 1702000120.0,
+        "val_blocks": 1,
+        "val_end_label_ts": 1702150420.0,
+        "val_end_ts": 1702150180.0,
+        "val_negative_pairs": 0,
+        "val_pairs": 3,
+        "val_positive_pairs": 3,
+        "val_positive_rate": 0.375,
+        "val_samples": 8,
+        "val_session_ids": [],
+        "val_start_ts": 1702130120.0
+      },
+      "stability_mode": "primary",
+      "stability_ok": true,
+      "stability_ok_primary": true,
+      "stability_ok_relaxed": true,
+      "threshold": 0.8
+    },
+    "1.0": {
+      "block_diagnostics": {
+        "duration_sec_quantiles": {
+          "max": 480.0,
+          "p10": 480.0,
+          "p25": 480.0,
+          "p50": 480.0,
+          "p75": 480.0,
+          "p90": 480.0
+        },
+        "feature_window_feasibility": {
+          "eligible_blocks_for_sequence_length": 18,
+          "eligible_sessions_with_any_eligible_block": 1,
+          "sequence_length": 3
+        },
+        "inter_record_interval_sec_quantiles": {
+          "max": 60.0,
+          "p10": 60.0,
+          "p25": 60.0,
+          "p50": 60.0,
+          "p75": 60.0,
+          "p90": 60.0
+        },
+        "irregular_block_count": 0,
+        "max_to_median_interval_ratio_quantiles": {
+          "max": 1.0,
+          "p10": 1.0,
+          "p25": 1.0,
+          "p50": 1.0,
+          "p75": 1.0,
+          "p90": 1.0
+        },
+        "record_count_quantiles": {
+          "max": 9.0,
+          "p10": 9.0,
+          "p25": 9.0,
+          "p50": 9.0,
+          "p75": 9.0,
+          "p90": 9.0
+        },
+        "record_count_threshold_counts": {
+          "ge_10": 0,
+          "ge_12": 0,
+          "ge_15": 0,
+          "ge_20": 0,
+          "ge_8": 18
+        },
+        "session_summaries": {
+          "0": {
+            "duration_sec_quantiles": {
+              "max": 480.0,
+              "p10": 480.0,
+              "p25": 480.0,
+              "p50": 480.0,
+              "p75": 480.0,
+              "p90": 480.0
+            },
+            "eligible_blocks_for_sequence_length": 18,
+            "inter_record_interval_sec_quantiles": {
+              "max": 60.0,
+              "p10": 60.0,
+              "p25": 60.0,
+              "p50": 60.0,
+              "p75": 60.0,
+              "p90": 60.0
+            },
+            "irregular_block_count": 0,
+            "max_record_count": 9,
+            "max_to_median_interval_ratio_quantiles": {
+              "max": 1.0,
+              "p10": 1.0,
+              "p25": 1.0,
+              "p50": 1.0,
+              "p75": 1.0,
+              "p90": 1.0
+            },
+            "num_blocks": 18,
+            "record_count_quantiles": {
+              "max": 9.0,
+              "p10": 9.0,
+              "p25": 9.0,
+              "p50": 9.0,
+              "p75": 9.0,
+              "p90": 9.0
+            },
+            "record_count_threshold_counts": {
+              "ge_10": 0,
+              "ge_12": 0,
+              "ge_15": 0,
+              "ge_20": 0,
+              "ge_8": 18
+            }
+          }
+        }
+      },
+      "build_ok": true,
+      "cost_floor_pct": 1.0,
+      "cross_session_merge_diagnostics": {
+        "applied_count": 0,
+        "calibration_log": [],
+        "candidate_count": 0,
+        "gap_sec_quantiles": {
+          "max": 0.0,
+          "p10": 0.0,
+          "p25": 0.0,
+          "p50": 0.0,
+          "p75": 0.0,
+          "p90": 0.0
+        },
+        "max_session_gap_sec": null,
+        "rejected_gap_count": 0,
+        "rejected_regime_shift_count": 0,
+        "score_quantiles": {
+          "max": 0.0,
+          "p10": 0.0,
+          "p25": 0.0,
+          "p50": 0.0,
+          "p75": 0.0,
+          "p90": 0.0
+        },
+        "threshold": 3.0,
+        "window_size_quantiles": {
+          "max": 0.0,
+          "p10": 0.0,
+          "p25": 0.0,
+          "p50": 0.0,
+          "p75": 0.0,
+          "p90": 0.0
+        }
+      },
+      "cross_session_merge_enabled": false,
+      "cross_session_merges_applied": 0,
+      "episode_diagnostics": {
+        "duration_sec_quantiles": {
+          "max": 180.0,
+          "p10": 180.0,
+          "p25": 180.0,
+          "p50": 180.0,
+          "p75": 180.0,
+          "p90": 180.0
+        },
+        "episode_count": 18,
+        "total_spread_quantiles": {
+          "max": 0.8999999999999999,
+          "p10": 0.8999999999999999,
+          "p25": 0.8999999999999999,
+          "p50": 0.8999999999999999,
+          "p75": 0.8999999999999999,
+          "p90": 0.8999999999999999
+        }
+      },
+      "error": "",
+      "failure_reasons": [
+        "no_positive_samples",
+        "right_censoring_present",
+        "insufficient_train_positives",
+        "insufficient_val_positives",
+        "insufficient_test_positives",
+        "temporal_instability"
+      ],
+      "guardrail_ok": false,
+      "label_audit": {
+        "future_episode_total_spread_quantiles": {
+          "max": 0.8999999999999999,
+          "p10": 0.8999999999999999,
+          "p25": 0.8999999999999999,
+          "p50": 0.8999999999999999,
+          "p75": 0.8999999999999999,
+          "p90": 0.8999999999999999
+        },
+        "positive_entry_spread_buckets": {
+          "0_30_to_0_50": 0,
+          "0_50_to_1_00": 0,
+          "1_00_to_2_00": 0,
+          "ge_2_00": 0,
+          "lt_0_30": 0
+        },
+        "right_censored_windows": 72,
+        "timeout_peak_future_total_spread_buckets": {
+          "0_30_to_0_50": 0,
+          "0_50_to_0_80": 0,
+          "0_80_to_1_00": 18,
+          "ge_1_00": 0,
+          "lt_0_30": 36
+        },
+        "timeouts_with_only_sub_threshold_episode": 18,
+        "timeouts_without_future_episode": 36
+      },
+      "label_episode_window_days": null,
+      "label_percentile": null,
+      "label_threshold_mode": "fixed_threshold",
+      "label_thresholds": {
+        "NEAR00|buy|spot|sell|futures": {
+          "latest": 1.0,
+          "max": 1.0,
+          "min": 1.0,
+          "p50": 1.0,
+          "p90": 1.0,
+          "samples": 3
+        },
+        "NEAR01|buy|spot|sell|futures": {
+          "latest": 1.0,
+          "max": 1.0,
+          "min": 1.0,
+          "p50": 1.0,
+          "p90": 1.0,
+          "samples": 3
+        },
+        "NEAR02|buy|spot|sell|futures": {
+          "latest": 1.0,
+          "max": 1.0,
+          "min": 1.0,
+          "p50": 1.0,
+          "p90": 1.0,
+          "samples": 3
+        },
+        "NEAR03|buy|spot|sell|futures": {
+          "latest": 1.0,
+          "max": 1.0,
+          "min": 1.0,
+          "p50": 1.0,
+          "p90": 1.0,
+          "samples": 3
+        },
+        "NEAR04|buy|spot|sell|futures": {
+          "latest": 1.0,
+          "max": 1.0,
+          "min": 1.0,
+          "p50": 1.0,
+          "p90": 1.0,
+          "samples": 3
+        },
+        "NEAR05|buy|spot|sell|futures": {
+          "latest": 1.0,
+          "max": 1.0,
+          "min": 1.0,
+          "p50": 1.0,
+          "p90": 1.0,
+          "samples": 3
+        },
+        "NEAR06|buy|spot|sell|futures": {
+          "latest": 1.0,
+          "max": 1.0,
+          "min": 1.0,
+          "p50": 1.0,
+          "p90": 1.0,
+          "samples": 3
+        },
+        "NEAR07|buy|spot|sell|futures": {
+          "latest": 1.0,
+          "max": 1.0,
+          "min": 1.0,
+          "p50": 1.0,
+          "p90": 1.0,
+          "samples": 3
+        },
+        "NEAR08|buy|spot|sell|futures": {
+          "latest": 1.0,
+          "max": 1.0,
+          "min": 1.0,
+          "p50": 1.0,
+          "p90": 1.0,
+          "samples": 3
+        },
+        "NEAR09|buy|spot|sell|futures": {
+          "latest": 1.0,
+          "max": 1.0,
+          "min": 1.0,
+          "p50": 1.0,
+          "p90": 1.0,
+          "samples": 3
+        },
+        "NEAR10|buy|spot|sell|futures": {
+          "latest": 1.0,
+          "max": 1.0,
+          "min": 1.0,
+          "p50": 1.0,
+          "p90": 1.0,
+          "samples": 3
+        },
+        "NEAR11|buy|spot|sell|futures": {
+          "latest": 1.0,
+          "max": 1.0,
+          "min": 1.0,
+          "p50": 1.0,
+          "p90": 1.0,
+          "samples": 3
+        },
+        "NEAR12|buy|spot|sell|futures": {
+          "latest": 1.0,
+          "max": 1.0,
+          "min": 1.0,
+          "p50": 1.0,
+          "p90": 1.0,
+          "samples": 3
+        },
+        "NEAR13|buy|spot|sell|futures": {
+          "latest": 1.0,
+          "max": 1.0,
+          "min": 1.0,
+          "p50": 1.0,
+          "p90": 1.0,
+          "samples": 3
+        },
+        "NEAR14|buy|spot|sell|futures": {
+          "latest": 1.0,
+          "max": 1.0,
+          "min": 1.0,
+          "p50": 1.0,
+          "p90": 1.0,
+          "samples": 3
+        },
+        "NEAR15|buy|spot|sell|futures": {
+          "latest": 1.0,
+          "max": 1.0,
+          "min": 1.0,
+          "p50": 1.0,
+          "p90": 1.0,
+          "samples": 3
+        },
+        "NEAR16|buy|spot|sell|futures": {
+          "latest": 1.0,
+          "max": 1.0,
+          "min": 1.0,
+          "p50": 1.0,
+          "p90": 1.0,
+          "samples": 3
+        },
+        "NEAR17|buy|spot|sell|futures": {
+          "latest": 1.0,
+          "max": 1.0,
+          "min": 1.0,
+          "p50": 1.0,
+          "p90": 1.0,
+          "samples": 3
+        }
+      },
+      "max_positive_rate_delta": 0.0,
+      "min_to_max_positive_rate_ratio": 0.0,
+      "num_negative_samples": 54,
+      "num_positive_samples": 0,
+      "num_samples": 54,
+      "positive_rate": 0.0,
+      "purging_ok": true,
+      "qualifies_for_training": false,
+      "qualifies_for_training_relaxed": false,
+      "split_positive_counts": {
+        "test": 0,
+        "train": 0,
+        "val": 0
+      },
+      "split_positive_rates": {
+        "test": 0.0,
+        "train": 0.0,
+        "val": 0.0
+      },
+      "split_summary": {
+        "embargo_samples": 2,
+        "embargo_time_sec": 240,
+        "global_temporal_order": true,
+        "min_cross_split_gap_sec": 9700.0,
+        "pair_overlap": 0,
+        "pair_overlap_breakdown": {
+          "train_test": 0,
+          "train_val": 0,
+          "val_test": 0
+        },
+        "pair_overlap_pairwise_sum": 0,
+        "pair_overlap_rate": 0.0,
+        "purged_temporal_separation_ok": true,
+        "split_mode": "sample_chronological_purged",
+        "split_mode_fallback_reason": "insufficient_sessions",
+        "test_blocks": 1,
+        "test_end_ts": 1702170240.0,
+        "test_negative_pairs": 2,
+        "test_pairs": 2,
+        "test_positive_pairs": 0,
+        "test_positive_rate": 0.0,
+        "test_samples": 6,
+        "test_session_ids": [],
+        "test_start_ts": 1702160120.0,
+        "train_blocks": 1,
+        "train_end_label_ts": 1702120420.0,
+        "train_end_ts": 1702120180.0,
+        "train_negative_pairs": 13,
+        "train_pairs": 13,
+        "train_positive_pairs": 0,
+        "train_positive_rate": 0.0,
+        "train_samples": 38,
+        "train_session_ids": [],
+        "train_start_ts": 1702000120.0,
+        "val_blocks": 1,
+        "val_end_label_ts": 1702150420.0,
+        "val_end_ts": 1702150180.0,
+        "val_negative_pairs": 3,
+        "val_pairs": 3,
+        "val_positive_pairs": 0,
+        "val_positive_rate": 0.0,
+        "val_samples": 8,
+        "val_session_ids": [],
+        "val_start_ts": 1702130120.0
+      },
+      "stability_mode": "failed",
+      "stability_ok": false,
+      "stability_ok_primary": false,
+      "stability_ok_relaxed": false,
+      "threshold": 1.0
+    }
+  }
+}

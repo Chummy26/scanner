@@ -1,0 +1,18 @@
+{
+  "details": {
+    "active_pair_count": 2,
+    "checkpoint_count": 2,
+    "disappeared_pair_rate": 0.0,
+    "disappeared_pairs": [],
+    "hot_path_rejection_stats": {},
+    "intermittent_pair_rate": 0.0,
+    "intermittent_pairs": [],
+    "records_per_pair_per_hour": 120.0
+  },
+  "failure_reasons": [],
+  "gate_id": "gate_03_completeness",
+  "recommendations": [],
+  "status": "PASS",
+  "title": "Completeness",
+  "warnings": []
+}
