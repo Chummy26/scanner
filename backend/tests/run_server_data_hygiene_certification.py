@@ -235,26 +235,23 @@ def _build_lightweight_runtime_package(
     return runtime_package
 
 
-def collect_runtime_checkpoint(base_url: str, *, sequence_horizon_pairs: list[tuple[int, int]]) -> dict[str, object]:
+def collect_runtime_checkpoint(
+    base_url: str,
+    *,
+    db_path: Path,
+    sequence_horizon_pairs: list[tuple[int, int]],
+) -> dict[str, object]:
+    training_summaries = verify_training_blocks_runtime.collect_training_summaries_from_db(
+        Path(db_path),
+        sequence_horizon_pairs=sequence_horizon_pairs,
+    )
     checkpoint = {
         "dashboard_summary": _fetch_json(base_url, "/api/v1/ml/dashboard").get("summary", {}),
-        "sessions_summary": _fetch_json(base_url, "/api/v1/ml/training/sessions?include_open=1&summary_only=1").get("summary", {}),
-        "blocks_summary": _fetch_json(base_url, "/api/v1/ml/training/blocks?summary_only=1").get("summary", {}),
-        "cohort_preview_summary": _post_json(base_url, "/api/v1/ml/training/cohorts/preview", {"summary_only": True}).get("summary", {}),
-        "quality_reports": [],
+        "sessions_summary": training_summaries["sessions_payload"].get("summary", {}),
+        "blocks_summary": training_summaries["blocks_payload"].get("summary", {}),
+        "cohort_preview_summary": training_summaries["preview_payload"].get("summary", {}),
+        "quality_reports": list(training_summaries["quality_reports"]),
     }
-    for sequence_length, prediction_horizon_sec in sequence_horizon_pairs:
-        quality_payload = _fetch_json(
-            base_url,
-            f"/api/v1/ml/training/quality-report?sequence_length={int(sequence_length)}&prediction_horizon_sec={int(prediction_horizon_sec)}&summary_only=1",
-        )
-        checkpoint["quality_reports"].append(
-            {
-                "sequence_length": int(sequence_length),
-                "prediction_horizon_sec": int(prediction_horizon_sec),
-                "summary": quality_payload.get("summary", {}),
-            }
-        )
     return checkpoint
 
 
@@ -323,6 +320,7 @@ def run_server_track(
                         "elapsed_sec": int(checkpoint_value),
                         **collect_runtime_checkpoint(
                             base_url,
+                            db_path=db_path,
                             sequence_horizon_pairs=[(4, 240), (8, 600), (15, 14_400)],
                         ),
                     }

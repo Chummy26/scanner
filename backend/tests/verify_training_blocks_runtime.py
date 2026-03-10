@@ -4,6 +4,8 @@ import sqlite3
 import urllib.request
 from pathlib import Path
 
+from src.spread.spread_tracker import SpreadTracker
+
 
 def _fetch_json(base_url: str, path: str) -> dict:
     with urllib.request.urlopen(f"{base_url}{path}", timeout=30) as response:
@@ -26,11 +28,50 @@ def _fetch_text(base_url: str, path: str) -> str:
         return response.read().decode("utf-8")
 
 
+def _tracker_read_only(db_path: Path) -> SpreadTracker:
+    tracker = SpreadTracker(db_path=None)
+    tracker.db_path = Path(db_path)
+    return tracker
+
+
+def collect_training_summaries_from_db(
+    db_path: Path,
+    *,
+    sequence_horizon_pairs: list[tuple[int, int]] | None = None,
+) -> dict:
+    tracker = _tracker_read_only(db_path)
+    sessions_payload = tracker.list_training_sessions(include_open=True)
+    preview_payload = tracker.preview_training_cohorts()
+    blocks_payload = tracker.list_training_blocks(include_open=True)
+    quality_reports = []
+    for sequence_length, prediction_horizon_sec in sequence_horizon_pairs or []:
+        quality_reports.append(
+            {
+                "sequence_length": int(sequence_length),
+                "prediction_horizon_sec": int(prediction_horizon_sec),
+                "summary": tracker.get_training_quality_report(
+                    sequence_length=int(sequence_length),
+                    prediction_horizon_sec=int(prediction_horizon_sec),
+                    summary_only=True,
+                ).get("summary", {}),
+            }
+        )
+    quality_payload = tracker.get_training_quality_report(summary_only=True)
+    return {
+        "sessions_payload": sessions_payload,
+        "preview_payload": preview_payload,
+        "blocks_payload": blocks_payload,
+        "quality_payload": quality_payload,
+        "quality_reports": quality_reports,
+    }
+
+
 def inspect_runtime(db_path: Path, base_url: str, run_id: int | None = None) -> dict:
-    sessions_payload = _fetch_json(base_url, "/api/v1/ml/training/sessions?include_open=1&summary_only=1")
-    preview_payload = _post_json(base_url, "/api/v1/ml/training/cohorts/preview", {})
-    blocks_payload = _fetch_json(base_url, "/api/v1/ml/training/blocks?summary_only=1")
-    quality_payload = _fetch_json(base_url, "/api/v1/ml/training/quality-report?summary_only=1")
+    training_summaries = collect_training_summaries_from_db(Path(db_path))
+    sessions_payload = training_summaries["sessions_payload"]
+    preview_payload = training_summaries["preview_payload"]
+    blocks_payload = training_summaries["blocks_payload"]
+    quality_payload = training_summaries["quality_payload"]
     html = _fetch_text(base_url, "/dashboard/training")
 
     with sqlite3.connect(db_path) as conn:
