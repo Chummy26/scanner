@@ -57,14 +57,24 @@ class GateWS(BaseExchangeWS):
         """
         spot_syms = getattr(self, "_spot_symbols", symbols)
         fut_syms = getattr(self, "_futures_symbols", symbols)
+        spot_mode = self.get_feed_mode("spot")
+        futures_mode = self.get_feed_mode("futures")
         tasks = []
         if self.spot_enabled:
-            for i, chunk in enumerate(chunk_list(spot_syms, self.batch_size)):
-                tasks.append(self._run_batch_loop(chunk, "spot", i, delay=i * 3.0))
+            if spot_mode == "depth_ws":
+                for i, chunk in enumerate(chunk_list(spot_syms, self.batch_size)):
+                    tasks.append(self._run_batch_loop(chunk, "spot", i, delay=i * 3.0))
+            else:
+                for base in spot_syms:
+                    self.get_book(base, "spot")
             tasks.append(self._run_spot_ticker_fallback(spot_syms))
         if self.futures_enabled:
-            for i, chunk in enumerate(chunk_list(fut_syms, self._futures_batch_size)):
-                tasks.append(self._run_batch_loop(chunk, "futures", i, delay=i * 3.0 + 1.5))
+            if futures_mode == "depth_ws":
+                for i, chunk in enumerate(chunk_list(fut_syms, self._futures_batch_size)):
+                    tasks.append(self._run_batch_loop(chunk, "futures", i, delay=i * 3.0 + 1.5))
+            else:
+                for base in fut_syms:
+                    self.get_book(base, "futures")
             # REST fallback: poll all futures tickers every 3s
             tasks.append(self._run_futures_ticker_fallback(fut_syms))
         await asyncio.gather(*tasks, return_exceptions=True)

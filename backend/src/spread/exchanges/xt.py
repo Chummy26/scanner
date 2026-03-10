@@ -40,18 +40,28 @@ class XtWS(BaseExchangeWS):
     async def subscribe_symbol_batch(self, symbols: List[str]):
         """Subscribe spot and futures via WebSocket, with agg-ticker fallback."""
         symbols = list(symbols or [])
+        spot_mode = self.get_feed_mode("spot")
+        futures_mode = self.get_feed_mode("futures")
 
         tasks = []
         if self.spot_enabled:
             spot_syms = getattr(self, "_spot_symbols", symbols)
-            for i, chunk in enumerate(chunk_list(spot_syms, self.batch_size)):
-                tasks.append(self._run_batch_loop(chunk, "spot", i, delay=i * 2.0))
+            if spot_mode == "depth_ws":
+                for i, chunk in enumerate(chunk_list(spot_syms, self.batch_size)):
+                    tasks.append(self._run_batch_loop(chunk, "spot", i, delay=i * 2.0))
+            else:
+                for base in spot_syms:
+                    self.get_book(base, "spot")
             tasks.append(self._run_spot_ticker_fallback(spot_syms))
 
         if self.futures_enabled:
             fut_syms = getattr(self, "_futures_symbols", symbols)
-            for i, chunk in enumerate(chunk_list(fut_syms, self.batch_size)):
-                tasks.append(self._run_batch_loop(chunk, "futures", i, delay=i * 2.0 + 1.0))
+            if futures_mode == "depth_ws":
+                for i, chunk in enumerate(chunk_list(fut_syms, self.batch_size)):
+                    tasks.append(self._run_batch_loop(chunk, "futures", i, delay=i * 2.0 + 1.0))
+            else:
+                for base in fut_syms:
+                    self.get_book(base, "futures")
             # Fallback: poll agg-tickers to catch symbols without WS updates
             tasks.append(self._run_agg_ticker_fallback(fut_syms))
 

@@ -11,9 +11,10 @@ import logging
 import os
 import time
 import threading
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from typing import Dict, List, Set, Optional, Any
 
 from .models import SpreadConfig, SpreadOpportunity
@@ -66,6 +67,14 @@ class WSManager:
         self._ML_REFRESH_BUDGET_MS = 75.0
         self._ml_pending_refreshes: OrderedDict = OrderedDict()
         self._ml_state_lock = threading.Lock()
+        self._tracker_ingest_lock = threading.Lock()
+        self._tracker_pending_records: OrderedDict = OrderedDict()
+        self._tracker_pending_rejections: OrderedDict = OrderedDict()
+        self._tracker_history_mirror: Dict[Any, deque] = {}
+        self._tracker_history_last_ts: Dict[Any, float] = {}
+        self._TRACKER_HISTORY_MIRROR_MAX = 128
+        self._TRACKER_INGEST_LOOP_SEC = 0.5
+        self._TRACKER_INGEST_BATCH_MAX = 2048
         self._exchange_instances: Dict[str, BaseExchangeWS] = {}
         self._scanner_clients: Set[Any] = set()
         self._scanner_lite_clients: Set[Any] = set()
@@ -120,6 +129,11 @@ class WSManager:
         # across time instead of creating 15s bursts that stall the scanner.
         return 5
 
+    def _tracker_capture_shards(self) -> int:
+        capture_period_sec = self._tracker_cycle_every() * max(float(getattr(self.config, "broadcast_interval_sec", 0.15) or 0.15), 0.001)
+        record_interval_sec = max(float(getattr(self.config, "tracker_record_interval_sec", 15.0) or 15.0), capture_period_sec)
+        return max(1, int(round(record_interval_sec / capture_period_sec)))
+
     def _get_ml_cache_entry(self, key: Any) -> Optional[Dict[str, Any]]:
         with self._ml_state_lock:
             cache_entry = self._ml_cache.get(key)
@@ -141,6 +155,187 @@ class WSManager:
         with self._ml_state_lock:
             return len(self._ml_cache)
 
+    def _tracker_pending_record_count(self) -> int:
+        with self._tracker_ingest_lock:
+            return len(self._tracker_pending_records)
+
+    def _tracker_pending_rejection_count(self) -> int:
+        with self._tracker_ingest_lock:
+            return len(self._tracker_pending_rejections)
+
+    def _history_mirror_size(self) -> int:
+        with self._tracker_ingest_lock:
+            return len(self._tracker_history_mirror)
+
+    def _coalesce_tracker_records(self, records: List[tuple]) -> Dict[Any, tuple]:
+        latest: Dict[Any, tuple] = {}
+        pair_key = self.tracker._pair_key
+        for record in records:
+            if not isinstance(record, tuple) or len(record) < 7:
+                continue
+            latest[pair_key(*record[:5])] = record
+        return latest
+
+    def _pair_in_capture_shard(self, key: Any, *, capture_shard: int, shard_count: int) -> bool:
+        if shard_count <= 1:
+            return True
+        if isinstance(key, tuple):
+            payload = "|".join(str(part) for part in key)
+        else:
+            payload = str(key)
+        return (zlib.crc32(payload.encode("utf-8")) % shard_count) == capture_shard
+
+    def _queue_tracker_records(self, records: List[tuple], *, now_ts: float, capture_shard: int = 0, shard_count: int = 1) -> int:
+        latest = self._coalesce_tracker_records(records)
+        if not latest:
+            return 0
+        with self._tracker_ingest_lock:
+            for key, record in latest.items():
+                if not self._pair_in_capture_shard(key, capture_shard=capture_shard, shard_count=shard_count):
+                    continue
+                self._tracker_pending_records[key] = record
+                self._tracker_pending_records.move_to_end(key)
+                last_ts = float(self._tracker_history_last_ts.get(key, 0.0) or 0.0)
+                if last_ts > 0.0 and (now_ts - last_ts) < max(float(getattr(self.config, "tracker_record_interval_sec", 15.0) or 15.0), 0.0):
+                    continue
+                history = self._tracker_history_mirror.get(key)
+                if history is None:
+                    history = deque(maxlen=self._TRACKER_HISTORY_MIRROR_MAX)
+                    self._tracker_history_mirror[key] = history
+                history.append(
+                    {
+                        "timestamp": float(now_ts),
+                        "entry_spread": float(record[5]),
+                        "exit_spread": float(record[6]),
+                    }
+                )
+                self._tracker_history_last_ts[key] = float(now_ts)
+        return sum(
+            1 for key in latest.keys()
+            if self._pair_in_capture_shard(key, capture_shard=capture_shard, shard_count=shard_count)
+        )
+
+    def _queue_tracker_rejections(self, rejections: List[dict[str, Any]], *, capture_shard: int = 0, shard_count: int = 1) -> int:
+        if not rejections:
+            return 0
+        aggregated: Dict[Any, dict[str, Any]] = {}
+        for payload in rejections:
+            if not isinstance(payload, dict):
+                continue
+            invalid_fields = tuple(sorted(str(field) for field in (payload.get("invalid_fields") or [])))
+            queue_key = (
+                str(payload.get("symbol") or ""),
+                str(payload.get("buy_ex") or ""),
+                str(payload.get("buy_mt") or ""),
+                str(payload.get("sell_ex") or ""),
+                str(payload.get("sell_mt") or ""),
+                invalid_fields,
+                str(payload.get("reason") or ""),
+            )
+            existing = aggregated.get(queue_key)
+            if existing is None:
+                aggregated[queue_key] = {
+                    "symbol": str(payload.get("symbol") or ""),
+                    "buy_ex": str(payload.get("buy_ex") or ""),
+                    "buy_mt": str(payload.get("buy_mt") or ""),
+                    "sell_ex": str(payload.get("sell_ex") or ""),
+                    "sell_mt": str(payload.get("sell_mt") or ""),
+                    "invalid_fields": list(payload.get("invalid_fields") or []),
+                    "reason": str(payload.get("reason") or ""),
+                    "count": 1,
+                }
+            else:
+                existing["count"] = int(existing.get("count", 0) or 0) + 1
+        if not aggregated:
+            return 0
+        with self._tracker_ingest_lock:
+            for key, payload in aggregated.items():
+                pair_key = self.tracker._pair_key(
+                    str(payload.get("symbol") or ""),
+                    str(payload.get("buy_ex") or ""),
+                    str(payload.get("buy_mt") or ""),
+                    str(payload.get("sell_ex") or ""),
+                    str(payload.get("sell_mt") or ""),
+                )
+                if not self._pair_in_capture_shard(pair_key, capture_shard=capture_shard, shard_count=shard_count):
+                    continue
+                existing = self._tracker_pending_rejections.get(key)
+                if isinstance(existing, dict):
+                    payload["count"] = int(payload.get("count", 0) or 0) + int(existing.get("count", 0) or 0)
+                self._tracker_pending_rejections[key] = payload
+                self._tracker_pending_rejections.move_to_end(key)
+        return sum(
+            1
+            for payload in aggregated.values()
+            if self._pair_in_capture_shard(
+                self.tracker._pair_key(
+                    str(payload.get("symbol") or ""),
+                    str(payload.get("buy_ex") or ""),
+                    str(payload.get("buy_mt") or ""),
+                    str(payload.get("sell_ex") or ""),
+                    str(payload.get("sell_mt") or ""),
+                ),
+                capture_shard=capture_shard,
+                shard_count=shard_count,
+            )
+        )
+
+    def _get_history_mirror(self, key: Any, *, limit: int = 100) -> List[Dict[str, float]]:
+        with self._tracker_ingest_lock:
+            history = self._tracker_history_mirror.get(key)
+            if not history:
+                return []
+            window = list(history)[-max(int(limit), 0):]
+        return [
+            {
+                "timestamp": float(item["timestamp"]),
+                "entry_spread": float(item["entry_spread"]),
+                "exit_spread": float(item["exit_spread"]),
+            }
+            for item in window
+        ]
+
+    def _drain_tracker_ingest_batch(
+        self,
+        *,
+        now_ts: float,
+        drain_all: bool = False,
+    ) -> Dict[str, int | float]:
+        started = time.perf_counter()
+        with self._tracker_ingest_lock:
+            record_keys = list(self._tracker_pending_records.keys())
+            rejection_keys = list(self._tracker_pending_rejections.keys())
+            if not drain_all:
+                record_keys = record_keys[: self._TRACKER_INGEST_BATCH_MAX]
+                rejection_keys = rejection_keys[: self._TRACKER_INGEST_BATCH_MAX]
+            records = [self._tracker_pending_records.pop(key) for key in record_keys]
+            rejections = [self._tracker_pending_rejections.pop(key) for key in rejection_keys]
+            pending_records_after = len(self._tracker_pending_records)
+            pending_rejections_after = len(self._tracker_pending_rejections)
+        if records:
+            self.tracker.batch_record(records, now_ts=now_ts)
+        if rejections:
+            self.tracker.batch_record_rejections(rejections)
+        total_ms = (time.perf_counter() - started) * 1000.0
+        if self.perf_monitor is not None:
+            self.perf_monitor.record_scanner_cycle(
+                {
+                    "kind": "tracker_ingest",
+                    "total_ms": round(total_ms, 6),
+                    "tracker_records_drained": len(records),
+                    "tracker_rejections_drained": len(rejections),
+                    "tracker_pending_records": pending_records_after,
+                    "tracker_pending_rejections": pending_rejections_after,
+                }
+            )
+        return {
+            "records_drained": len(records),
+            "rejections_drained": len(rejections),
+            "pending_records": pending_records_after,
+            "pending_rejections": pending_rejections_after,
+            "total_ms": round(total_ms, 6),
+        }
+
     def _drain_ml_inference_batch(
         self,
         *,
@@ -161,14 +356,7 @@ class WSManager:
                     break
                 key, refresh_payload = self._ml_pending_refreshes.popitem(last=False)
             _history_started = time.perf_counter()
-            history = self.tracker.get_history(
-                refresh_payload["symbol"],
-                refresh_payload["buy_exchange"],
-                refresh_payload["buy_market_type"],
-                refresh_payload["sell_exchange"],
-                refresh_payload["sell_market_type"],
-                limit=100,
-            )
+            history = self._get_history_mirror(key, limit=100)
             history_fetch_ms += (time.perf_counter() - _history_started) * 1000.0
             _ml_started = time.perf_counter()
             prediction = self.ml_analyzer.predict_history(history)
@@ -239,6 +427,11 @@ class WSManager:
                     stale_cache.append(key)
             for stale_key in stale_cache:
                 self._ml_cache.pop(stale_key, None)
+        with self._tracker_ingest_lock:
+            stale_history = [key for key in self._tracker_history_mirror.keys() if key not in active_keys]
+            for stale_key in stale_history:
+                self._tracker_history_mirror.pop(stale_key, None)
+                self._tracker_history_last_ts.pop(stale_key, None)
 
     def mark_scanner_lite_interest(self) -> None:
         with self._lock:
@@ -333,6 +526,26 @@ class WSManager:
                 if self.runtime_audit is not None:
                     self.runtime_audit.record_error("ml_inference_loop", str(exc))
                 await asyncio.sleep(5.0)
+
+    async def _tracker_ingest_loop(self):
+        """Drain tracker ingest queue outside the calc hot path."""
+        while self._running:
+            try:
+                if self._tracker_pending_record_count() <= 0 and self._tracker_pending_rejection_count() <= 0:
+                    await asyncio.sleep(self._TRACKER_INGEST_LOOP_SEC)
+                    continue
+                await asyncio.to_thread(
+                    self._drain_tracker_ingest_batch,
+                    now_ts=time.time(),
+                )
+                await asyncio.sleep(self._TRACKER_INGEST_LOOP_SEC)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error(f"[WSManager] Tracker ingest loop error: {exc}")
+                if self.runtime_audit is not None:
+                    self.runtime_audit.record_error("tracker_ingest_loop", str(exc))
+                await asyncio.sleep(1.0)
 
     def _on_book_update(self, symbol: str, exchange: str, market_type: str,
                          book: OrderBook):
@@ -485,6 +698,8 @@ class WSManager:
                 spot_enabled=getattr(ex_config, "spot_enabled", True),
                 futures_enabled=getattr(ex_config, "futures_enabled", True),
             )
+            instance.spot_feed_mode = str(getattr(ex_config, "spot_feed_mode", "depth_ws") or "depth_ws")
+            instance.futures_feed_mode = str(getattr(ex_config, "futures_feed_mode", "depth_ws") or "depth_ws")
             self._exchange_instances[ex_config.name] = instance
 
         # Start exchange WS tasks — filter symbols per exchange per market
@@ -534,6 +749,12 @@ class WSManager:
             name="tracker_prune",
         )
         self._tasks.append(prune_task)
+
+        tracker_ingest_task = asyncio.create_task(
+            self._tracker_ingest_loop(),
+            name="tracker_ingest",
+        )
+        self._tasks.append(tracker_ingest_task)
 
         ml_task = asyncio.create_task(
             self._ml_inference_loop(),
@@ -596,6 +817,12 @@ class WSManager:
             task.cancel()
         self._tasks.clear()
 
+        await asyncio.to_thread(
+            self._drain_tracker_ingest_batch,
+            now_ts=time.time(),
+            drain_all=True,
+        )
+
         # Flush tracker state on shutdown so invertidas survive restarts.
         self.tracker.flush_to_storage(force=True)
         self.tracker.close_active_session()
@@ -628,11 +855,15 @@ class WSManager:
             "scanner_lite_rows": len(self._last_scanner_lite_rows),
             "tracker_cycle_every": self._tracker_cycle_every(),
             "tracker_cycle_offset": 2,
+            "tracker_capture_shards": self._tracker_capture_shards(),
             "scanner_lite_interest_age_sec": round(
                 max(0.0, time.perf_counter() - self._last_scanner_lite_interest_perf),
                 3,
             ) if self._last_scanner_lite_interest_perf > 0.0 else None,
             "scanner_lite_interest_active": self._should_refresh_scanner_lite_state(),
+            "tracker_ingest_queue_records": self._tracker_pending_record_count(),
+            "tracker_ingest_queue_rejections": self._tracker_pending_rejection_count(),
+            "tracker_history_pairs": self._history_mirror_size(),
             "tracker_pairs": int(
                 tracker_stats.get(
                     "pairs_in_memory",
@@ -714,7 +945,7 @@ class WSManager:
     # minutes, so 4s staleness is imperceptible in the UI.
     _ENRICH_TRACKER_EVERY = 16
 
-    def _do_calc_enrich(self, on_spread_cb):
+    def _do_calc_enrich(self, capture_tracker: bool, capture_shard: int = 0):
         """Synchronous calc + enrichment — runs in a thread pool so the event
         loop stays free for WS heartbeats and message delivery.
 
@@ -728,8 +959,10 @@ class WSManager:
         # --- 1. Spread calculation ----------------------------------------
         _perf_started = time.perf_counter()
         capture_mode = str(getattr(self.config, "tracker_capture_mode", "continuous_all_pairs") or "continuous_all_pairs").strip().lower()
-        raw_capture_records = [] if (on_spread_cb and capture_mode == "continuous_all_pairs") else None
-        raw_capture_rejections = [] if (on_spread_cb and capture_mode == "continuous_all_pairs") else None
+        capture_tracker_records = bool(capture_tracker and capture_mode == "continuous_all_pairs")
+        tracker_shard_count = self._tracker_capture_shards()
+        raw_capture_records = [] if capture_tracker_records else None
+        raw_capture_rejections = [] if capture_tracker_records else None
         try:
             opportunities = self.engine.calculate_all(
                 on_spread=None,
@@ -884,9 +1117,11 @@ class WSManager:
         _perf_after_filter = time.perf_counter()
 
         _records_batch = []
-        if on_spread_cb and capture_mode == "continuous_all_pairs":
+        queued_records = 0
+        queued_rejections = 0
+        if capture_tracker_records:
             _records_batch = list(raw_capture_records or [])
-        elif on_spread_cb:
+        elif capture_tracker:
             for opp in opportunities:
                 record = (
                     opp.asset,
@@ -899,9 +1134,18 @@ class WSManager:
                 )
                 _records_batch.append(record)
         if _records_batch:
-            self.tracker.batch_record(_records_batch, now_ts=now_ts)
+            queued_records = self._queue_tracker_records(
+                _records_batch,
+                now_ts=now_ts,
+                capture_shard=int(capture_shard),
+                shard_count=tracker_shard_count,
+            )
         if raw_capture_rejections:
-            self.tracker.batch_record_rejections(list(raw_capture_rejections))
+            queued_rejections = self._queue_tracker_rejections(
+                list(raw_capture_rejections),
+                capture_shard=int(capture_shard),
+                shard_count=tracker_shard_count,
+            )
         _perf_after_batch_record = time.perf_counter()
 
         if self._should_refresh_scanner_lite_state():
@@ -935,6 +1179,11 @@ class WSManager:
                     "ml_cache_size": self._ml_cache_size(),
                     "ml_refresh_queue_size": self._ml_queue_size(),
                     "ml_predictions_drained": int(drained_predictions),
+                    "tracker_records_enqueued": int(queued_records),
+                    "tracker_rejections_enqueued": int(queued_rejections),
+                    "tracker_pending_records": self._tracker_pending_record_count(),
+                    "tracker_pending_rejections": self._tracker_pending_rejection_count(),
+                    "tracker_capture_shards": tracker_shard_count,
                 }
             )
         return opportunities
@@ -952,19 +1201,22 @@ class WSManager:
         _TRACKER_OFFSET = 2
         _LOG_EVERY = 21
         _max_calc_ms = 0  # track worst cycle for health monitoring
+        _capture_round = 0
         while self._running:
             try:
                 _cycle += 1
                 t0 = time.time()
 
                 # Tracker recording on offset cycles (avoids full-recalc overlap).
-                is_tracker_cycle = ((_cycle + _TRACKER_OFFSET) % _TRACKER_EVERY == 0)
-                on_spread_cb = self.tracker.record_spread if is_tracker_cycle else None
+                capture_tracker = ((_cycle + _TRACKER_OFFSET) % _TRACKER_EVERY == 0)
+                capture_shard = _capture_round % self._tracker_capture_shards() if capture_tracker else 0
+                if capture_tracker:
+                    _capture_round += 1
 
                 # Run CPU-heavy calc+enrichment in a thread so the event loop
                 # stays free for WS heartbeats, pings, and message delivery.
                 opportunities = await asyncio.to_thread(
-                    self._do_calc_enrich, on_spread_cb
+                    self._do_calc_enrich, capture_tracker, capture_shard
                 )
                 self._last_filtered_opps = opportunities
 
@@ -997,7 +1249,7 @@ class WSManager:
                         f"loop_wait={t_loop}ms wall={calc_ms}ms "
                         f"opps={len(opportunities)} dirty={dirty_n} stale={stale} "
                         f"clients={len(self._scanner_clients)} "
-                        f"tracker={'ON' if is_tracker_cycle else 'off'} "
+                        f"tracker={'ON' if capture_tracker else 'off'} "
                         f"full={'Y' if is_full else 'n'} peak={_max_calc_ms}ms"
                     )
                     _max_calc_ms = 0  # reset peak after logging
@@ -1248,6 +1500,10 @@ class WSManager:
                     {
                         "name": ex_name,
                         "ws_running": not instance.shutdown.is_set(),
+                        "spot_feed_mode": instance.get_feed_mode("spot"),
+                        "futures_feed_mode": instance.get_feed_mode("futures"),
+                        "spot_reconnects": int(instance.get_reconnect_counts().get("spot", 0) or 0),
+                        "futures_reconnects": int(instance.get_reconnect_counts().get("futures", 0) or 0),
                         "book_count": len(getattr(instance, "_books", {})),
                         "median_book_age_sec": round(float(median_age), 6),
                         "p95_book_age_sec": round(float(p95_age), 6),
@@ -1388,4 +1644,15 @@ class WSManager:
             "exchanges": self.engine.get_connected_exchanges(),
             "summary": self.engine.get_snapshot_summary(),
             "scanner_clients": len(self._scanner_clients),
+            "feed_modes": {
+                name: {
+                    "spot": instance.get_feed_mode("spot"),
+                    "futures": instance.get_feed_mode("futures"),
+                }
+                for name, instance in self._exchange_instances.items()
+            },
+            "reconnect_counts": {
+                name: instance.get_reconnect_counts()
+                for name, instance in self._exchange_instances.items()
+            },
         }

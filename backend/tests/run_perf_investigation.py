@@ -281,6 +281,33 @@ def _load_runtime_audit_summary(output_dir: Path) -> dict[str, Any]:
         return {}
 
 
+def _summarize_server_log(log_path: Path) -> dict[str, Any]:
+    if not log_path.is_file():
+        return {}
+    reconnect_counts: dict[str, int] = {}
+    disconnect_counts: dict[str, int] = {}
+    try:
+        for line in log_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if "reconnecting" in line:
+                marker = ": ["
+                if marker in line:
+                    name = line.split(marker, 1)[1].split("]", 1)[0].strip().upper()
+                    reconnect_counts[name] = int(reconnect_counts.get(name, 0) or 0) + 1
+            if "exchange_disconnected" in line:
+                marker = "exchange="
+                if marker in line:
+                    name = line.split(marker, 1)[1].split(",", 1)[0].strip().upper()
+                    disconnect_counts[name] = int(disconnect_counts.get(name, 0) or 0) + 1
+    except Exception:
+        return {}
+    return {
+        "reconnect_counts": reconnect_counts,
+        "disconnect_counts": disconnect_counts,
+        "reconnect_total": sum(reconnect_counts.values()),
+        "disconnect_total": sum(disconnect_counts.values()),
+    }
+
+
 def render_report(summary: dict[str, Any]) -> str:
     scenario = summary.get("scenario", "unknown")
     lines = [
@@ -317,6 +344,7 @@ def render_report(summary: dict[str, Any]) -> str:
     cycle_metrics = scanner_cycle if isinstance(scanner_cycle, dict) else {}
     cycle_candidates = {
         "calculate_ms": float(((cycle_metrics.get("calculate_ms") or {}) if isinstance(cycle_metrics.get("calculate_ms"), dict) else {}).get("p95") or 0.0),
+        "batch_record_ms": float(((cycle_metrics.get("batch_record_ms") or {}) if isinstance(cycle_metrics.get("batch_record_ms"), dict) else {}).get("p95") or 0.0),
         "tracker_enrich_ms": float(((cycle_metrics.get("tracker_enrich_ms") or {}) if isinstance(cycle_metrics.get("tracker_enrich_ms"), dict) else {}).get("p95") or 0.0),
         "history_fetch_ms": float(((cycle_metrics.get("history_fetch_ms") or {}) if isinstance(cycle_metrics.get("history_fetch_ms"), dict) else {}).get("p95") or 0.0),
         "ml_analyze_ms": float(((cycle_metrics.get("ml_analyze_ms") or {}) if isinstance(cycle_metrics.get("ml_analyze_ms"), dict) else {}).get("p95") or 0.0),
@@ -327,6 +355,7 @@ def render_report(summary: dict[str, Any]) -> str:
     rss = summary.get("memory_rss_mb", {})
     runtime_audit = summary.get("runtime_audit", {})
     alert_counts = runtime_audit.get("alert_counts", {})
+    server_log = summary.get("server_log") or {}
     scanner_summary = (probe_summary.get("endpoints") or {}).get("scanner_lite_summary", {})
     scanner_list = (probe_summary.get("endpoints") or {}).get("scanner_lite_list", {})
 
@@ -345,8 +374,14 @@ def render_report(summary: dict[str, Any]) -> str:
     lines.append(
         f"5. Event loop lag p95/p99: `{lag.get('p95', 0)}ms / {lag.get('p99', 0)}ms`"
     )
+    reconnect_total = int(alert_counts.get("exchange_reconnected", 0) or 0)
+    disconnect_total = int(alert_counts.get("exchange_disconnected", 0) or 0)
+    if reconnect_total <= 0 and disconnect_total <= 0 and server_log:
+        reconnect_total = int(server_log.get("reconnect_total", 0) or 0)
+        disconnect_total = int(server_log.get("disconnect_total", 0) or 0)
+    reconnect_suffix = f"; by_exchange={server_log.get('reconnect_counts', {})}" if server_log else ""
     lines.append(
-        f"6. Reconnect/disconnect alerts: `reconnected={alert_counts.get('exchange_reconnected', 0)}` / `disconnected={alert_counts.get('exchange_disconnected', 0)}`"
+        f"6. Reconnect/disconnect alerts: `reconnected={reconnect_total}` / `disconnected={disconnect_total}`{reconnect_suffix}"
     )
     lines.append(
         f"7. Scanner book age p95/p99 (sample-level): `{((scanner_list.get('book_age_p95_sec') or {}).get('p95', 0))}s / {((scanner_list.get('book_age_p99_sec') or {}).get('p95', 0))}s`"
@@ -599,6 +634,7 @@ def run_single_scenario(
         "server_perf": server_perf_summary,
         "browser_perf": browser_summary,
         "runtime_audit": _load_runtime_audit_summary(output_dir),
+        "server_log": _summarize_server_log(log_path),
         "memory_rss_mb": {
             **memory_summary,
             "growth_pct_from_first": growth_pct,

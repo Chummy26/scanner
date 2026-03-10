@@ -243,6 +243,8 @@ class ExchangeConfig:
     enabled: bool = True
     spot_enabled: bool = True
     futures_enabled: bool = True
+    spot_feed_mode: str = "depth_ws"
+    futures_feed_mode: str = "depth_ws"
     symbols: List[str] = field(default_factory=list)  # e.g. ["BTC", "ETH", "SOL"]
 
 
@@ -278,10 +280,10 @@ class SpreadConfig:
         "SUI", "SEI", "TIA", "INJ", "PEPE", "WIF", "BONK", "FLOKI",
     ])
     exchanges: List[ExchangeConfig] = field(default_factory=lambda: [
-        ExchangeConfig("mexc"),
-        ExchangeConfig("bingx"),
-        ExchangeConfig("gate"),
-        ExchangeConfig("kucoin"),
-        ExchangeConfig("xt"),
-        ExchangeConfig("bitget"),
+        ExchangeConfig("mexc", spot_feed_mode="ticker_first", futures_feed_mode="ticker_first"),
+        ExchangeConfig("bingx", spot_feed_mode="ticker_first", futures_feed_mode="ticker_first"),
+        ExchangeConfig("gate", spot_feed_mode="ticker_first", futures_feed_mode="ticker_first"),
+        ExchangeConfig("kucoin", spot_feed_mode="ticker_first", futures_feed_mode="ticker_first"),
+        ExchangeConfig("xt", spot_feed_mode="ticker_first", futures_feed_mode="ticker_first"),
+        ExchangeConfig("bitget", spot_feed_mode="ticker_first", futures_feed_mode="ticker_first"),
     ])

@@ -709,18 +709,19 @@ class SpreadTracker:
             "exchange_rejections": dict(stats["exchange_rejections"]),
         }
 
-    def _record_hot_path_attempt_locked(self, key: PairKey) -> None:
+    def _record_hot_path_attempt_locked(self, key: PairKey, *, count: int = 1) -> None:
+        increment = max(int(count), 1)
         pair_id = self._pair_id(key)
         stats = dict(self._hot_path_rejection_stats)
-        stats["attempted_records_total"] = int(stats.get("attempted_records_total", 0) or 0) + 1
+        stats["attempted_records_total"] = int(stats.get("attempted_records_total", 0) or 0) + increment
         pair_attempts = dict(stats.get("pair_attempts") or {})
-        pair_attempts[pair_id] = int(pair_attempts.get(pair_id, 0) or 0) + 1
+        pair_attempts[pair_id] = int(pair_attempts.get(pair_id, 0) or 0) + increment
         stats["pair_attempts"] = pair_attempts
         exchange_attempts = dict(stats.get("exchange_attempts") or {})
         for exchange in {str(key[1] or ""), str(key[3] or "")}:
             if not exchange:
                 continue
-            exchange_attempts[exchange] = int(exchange_attempts.get(exchange, 0) or 0) + 1
+            exchange_attempts[exchange] = int(exchange_attempts.get(exchange, 0) or 0) + increment
         stats["exchange_attempts"] = exchange_attempts
         self._hot_path_rejection_stats = self._normalized_hot_path_rejection_stats(stats)
         self._hot_path_rejection_stats_dirty = True
@@ -730,23 +731,25 @@ class SpreadTracker:
         key: PairKey,
         *,
         invalid_fields: Iterable[str],
+        count: int = 1,
     ) -> None:
+        increment = max(int(count), 1)
         stats = dict(self._hot_path_rejection_stats)
         fields = {str(field) for field in invalid_fields}
         pair_id = self._pair_id(key)
-        stats["invalid_record_rejections_total"] = int(stats.get("invalid_record_rejections_total", 0) or 0) + 1
+        stats["invalid_record_rejections_total"] = int(stats.get("invalid_record_rejections_total", 0) or 0) + increment
         if "entry" in fields:
-            stats["invalid_entry_rejections_total"] = int(stats.get("invalid_entry_rejections_total", 0) or 0) + 1
+            stats["invalid_entry_rejections_total"] = int(stats.get("invalid_entry_rejections_total", 0) or 0) + increment
         if "exit" in fields:
-            stats["invalid_exit_rejections_total"] = int(stats.get("invalid_exit_rejections_total", 0) or 0) + 1
+            stats["invalid_exit_rejections_total"] = int(stats.get("invalid_exit_rejections_total", 0) or 0) + increment
         pair_rejections = dict(stats.get("pair_rejections") or {})
-        pair_rejections[pair_id] = int(pair_rejections.get(pair_id, 0) or 0) + 1
+        pair_rejections[pair_id] = int(pair_rejections.get(pair_id, 0) or 0) + increment
         stats["pair_rejections"] = pair_rejections
         exchange_rejections = dict(stats.get("exchange_rejections") or {})
         for exchange in {str(key[1] or ""), str(key[3] or "")}:
             if not exchange:
                 continue
-            exchange_rejections[exchange] = int(exchange_rejections.get(exchange, 0) or 0) + 1
+            exchange_rejections[exchange] = int(exchange_rejections.get(exchange, 0) or 0) + increment
         stats["exchange_rejections"] = exchange_rejections
         self._hot_path_rejection_stats = self._normalized_hot_path_rejection_stats(stats)
         self._hot_path_rejection_stats_dirty = True
@@ -793,10 +796,12 @@ class SpreadTracker:
                     str(payload.get("sell_ex") or ""),
                     str(payload.get("sell_mt") or ""),
                 )
-                self._record_hot_path_attempt_locked(key)
+                count = max(int(payload.get("count", 1) or 1), 1)
+                self._record_hot_path_attempt_locked(key, count=count)
                 self._record_hot_path_rejection_locked(
                     key,
                     invalid_fields=list(payload.get("invalid_fields") or []),
+                    count=count,
                 )
 
     @staticmethod

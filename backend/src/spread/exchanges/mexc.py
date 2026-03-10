@@ -86,11 +86,13 @@ class MexcWS(BaseExchangeWS):
         """Override to add futures ticker fallback."""
         spot_syms = list(getattr(self, "_spot_symbols", symbols))
         fut_syms = list(getattr(self, "_futures_symbols", symbols))
+        spot_mode = self.get_feed_mode("spot")
+        futures_mode = self.get_feed_mode("futures")
 
         # Truncate to respect max_connections_per_market
         self._overflow_spot = []
         self._overflow_futures = []
-        if self.max_connections_per_market > 0:
+        if self.max_connections_per_market > 0 and spot_mode == "depth_ws":
             max_syms = self.max_connections_per_market * self.batch_size
             if len(spot_syms) > max_syms:
                 self._overflow_spot = spot_syms[max_syms:]
@@ -98,6 +100,8 @@ class MexcWS(BaseExchangeWS):
                 logger.warning(
                     f"[MEXC] Spot: WS={len(spot_syms)}, "
                     f"REST overflow={len(self._overflow_spot)}")
+        if self.max_connections_per_market > 0 and futures_mode == "depth_ws":
+            max_syms = self.max_connections_per_market * self.batch_size
             if len(fut_syms) > max_syms:
                 self._overflow_futures = fut_syms[max_syms:]
                 fut_syms = fut_syms[:max_syms]
@@ -107,18 +111,24 @@ class MexcWS(BaseExchangeWS):
 
         tasks = []
         if self.spot_enabled:
-            for i, chunk in enumerate(chunk_list(spot_syms, self.batch_size)):
-                tasks.append(self._run_batch_loop(chunk, "spot", i, delay=i * 3.0))
-            # Spot ticker fallback for ALL spot symbols (WS + overflow)
             all_spot = list(spot_syms) + list(self._overflow_spot)
+            if spot_mode == "depth_ws":
+                for i, chunk in enumerate(chunk_list(spot_syms, self.batch_size)):
+                    tasks.append(self._run_batch_loop(chunk, "spot", i, delay=i * 3.0))
+            else:
+                for base in all_spot:
+                    self.get_book(base, "spot")
             tasks.append(self._run_spot_ticker_fallback(all_spot))
         if self.futures_enabled:
-            for i, chunk in enumerate(chunk_list(fut_syms, self.batch_size)):
-                tasks.append(self._run_batch_loop(chunk, "futures", i, delay=i * 3.0 + 1.5))
-            # Futures ticker fallback for ALL futures symbols (WS + overflow)
             all_fut = list(fut_syms) + list(self._overflow_futures)
+            if futures_mode == "depth_ws":
+                for i, chunk in enumerate(chunk_list(fut_syms, self.batch_size)):
+                    tasks.append(self._run_batch_loop(chunk, "futures", i, delay=i * 3.0 + 1.5))
+            else:
+                for base in all_fut:
+                    self.get_book(base, "futures")
             tasks.append(self._run_futures_ticker_fallback(all_fut))
-        if self._overflow_spot or self._overflow_futures:
+        if (self._overflow_spot or self._overflow_futures) and (spot_mode == "depth_ws" or futures_mode == "depth_ws"):
             tasks.append(self._rest_overflow_loop())
         await asyncio.gather(*tasks, return_exceptions=True)
 

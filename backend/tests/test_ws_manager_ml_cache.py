@@ -47,12 +47,13 @@ class _FakeAnalyzer:
 
     def predict_history(self, history):
         self.predict_calls += 1
+        last_ts = float(history[-1]["timestamp"]) if history else 0.0
         return {
             "prediction_status": "ready",
             "model_status": "ready",
             "signal_reason": "trained artifact ready",
             "history_points": len(history),
-            "history_last_ts": float(history[-1]["timestamp"]),
+            "history_last_ts": last_ts,
             "canonical_history": list(history),
             "inversion_probability": 0.77,
             "model_eta_seconds": 1200,
@@ -100,6 +101,21 @@ def _make_opportunity() -> SpreadOpportunity:
     )
 
 
+def test_default_exchange_feed_modes_use_ticker_first_for_mexc_and_kucoin():
+    config = SpreadConfig()
+    feed_modes = {
+        exchange.name: (exchange.spot_feed_mode, exchange.futures_feed_mode)
+        for exchange in config.exchanges
+    }
+
+    assert feed_modes["mexc"] == ("ticker_first", "ticker_first")
+    assert feed_modes["kucoin"] == ("ticker_first", "ticker_first")
+    assert feed_modes["bingx"] == ("ticker_first", "ticker_first")
+    assert feed_modes["gate"] == ("ticker_first", "ticker_first")
+    assert feed_modes["xt"] == ("ticker_first", "ticker_first")
+    assert feed_modes["bitget"] == ("ticker_first", "ticker_first")
+
+
 def test_ws_manager_uses_smoothed_tracker_cadence(tmp_path: Path):
     config = SpreadConfig(
         exchanges=[],
@@ -118,21 +134,21 @@ def test_ws_manager_hot_path_enqueues_and_reuses_prediction_when_tracker_marker_
     ws_mgr = WSManager(config)
     ws_mgr.tracker = _FakeTracker()
     ws_mgr.ml_analyzer = _FakeAnalyzer()
-    ws_mgr.engine.calculate_all = lambda on_spread=None, record_sink=None: [_make_opportunity()]
+    ws_mgr.engine.calculate_all = lambda on_spread=None, record_sink=None, rejection_sink=None: [_make_opportunity()]
 
     ws_mgr._enrich_tracker_cycle = 15
-    ws_mgr._do_calc_enrich(None)
+    ws_mgr._do_calc_enrich(True)
     assert ws_mgr.tracker.history_calls == 0
     assert ws_mgr._ml_queue_size() == 1
 
     ws_mgr._drain_ml_inference_batch(now_ts=200.0)
-    assert ws_mgr.tracker.history_calls == 1
+    assert ws_mgr.tracker.history_calls == 0
     assert ws_mgr.ml_analyzer.predict_calls == 1
     assert ws_mgr.ml_analyzer.render_calls == 1
 
     ws_mgr._enrich_tracker_cycle = 15
-    ws_mgr._do_calc_enrich(None)
-    assert ws_mgr.tracker.history_calls == 1
+    ws_mgr._do_calc_enrich(False)
+    assert ws_mgr.tracker.history_calls == 0
     assert ws_mgr.ml_analyzer.predict_calls == 1
     assert ws_mgr.ml_analyzer.render_calls == 1
 
@@ -143,23 +159,23 @@ def test_ws_manager_hot_path_enqueues_refresh_when_tracker_marker_changes(tmp_pa
     fake_tracker = _FakeTracker()
     ws_mgr.tracker = fake_tracker
     ws_mgr.ml_analyzer = _FakeAnalyzer()
-    ws_mgr.engine.calculate_all = lambda on_spread=None, record_sink=None: [_make_opportunity()]
+    ws_mgr.engine.calculate_all = lambda on_spread=None, record_sink=None, rejection_sink=None: [_make_opportunity()]
 
     ws_mgr._enrich_tracker_cycle = 15
-    ws_mgr._do_calc_enrich(None)
+    ws_mgr._do_calc_enrich(True)
     ws_mgr._drain_ml_inference_batch(now_ts=200.0)
     assert ws_mgr.ml_analyzer.predict_calls == 1
 
     fake_tracker.marker["last_record_ts"] = 315.0
     fake_tracker.marker["history_points"] = 25
     ws_mgr._enrich_tracker_cycle = 15
-    ws_mgr._do_calc_enrich(None)
+    ws_mgr._do_calc_enrich(True)
 
-    assert ws_mgr.tracker.history_calls == 1
+    assert ws_mgr.tracker.history_calls == 0
     assert ws_mgr._ml_queue_size() == 1
 
     ws_mgr._drain_ml_inference_batch(now_ts=215.0)
-    assert ws_mgr.tracker.history_calls == 2
+    assert ws_mgr.tracker.history_calls == 0
     assert ws_mgr.ml_analyzer.predict_calls == 2
 
 
@@ -170,7 +186,7 @@ def test_ws_manager_skips_ml_work_when_model_is_not_ready(tmp_path: Path):
     analyzer = _FakeAnalyzer()
     analyzer.model_status = "missing_artifact"
     ws_mgr.ml_analyzer = analyzer
-    ws_mgr.engine.calculate_all = lambda on_spread=None, record_sink=None: [_make_opportunity()]
+    ws_mgr.engine.calculate_all = lambda on_spread=None, record_sink=None, rejection_sink=None: [_make_opportunity()]
 
     opportunities = ws_mgr._do_calc_enrich(None)
 
@@ -190,6 +206,12 @@ def test_ws_manager_background_ml_drain_renders_with_latest_current_entry(tmp_pa
     ws_mgr.ml_analyzer = analyzer
 
     key = ws_mgr.tracker._pair_key("BTC", "mexc", "spot", "gate", "futures")
+    ws_mgr._queue_tracker_records(
+        [("BTC", "mexc", "spot", "gate", "futures", 1.23, -0.4)],
+        now_ts=200.0,
+        capture_shard=0,
+        shard_count=1,
+    )
     ws_mgr._queue_ml_refresh(
         key,
         {
@@ -306,14 +328,22 @@ def test_ws_manager_continuous_capture_uses_raw_records_not_filtered_opportuniti
     ws_mgr.tracker = _CaptureTracker()
     ws_mgr.ml_analyzer = _FakeAnalyzer()
 
-    def _fake_calculate_all(on_spread=None, record_sink=None):
+    def _fake_calculate_all(on_spread=None, record_sink=None, rejection_sink=None):
         if record_sink is not None:
             record_sink.append(("BTC", "mexc", "spot", "gate", "futures", 0.4, -0.2))
         return []
 
     ws_mgr.engine.calculate_all = _fake_calculate_all
 
-    ws_mgr._do_calc_enrich(object())
+    key = ws_mgr.tracker._pair_key("BTC", "mexc", "spot", "gate", "futures")
+    shard_count = ws_mgr._tracker_capture_shards()
+    capture_shard = next(
+        shard for shard in range(shard_count)
+        if ws_mgr._pair_in_capture_shard(key, capture_shard=shard, shard_count=shard_count)
+    )
+
+    ws_mgr._do_calc_enrich(True, capture_shard=capture_shard)
+    ws_mgr._drain_tracker_ingest_batch(now_ts=200.0, drain_all=True)
 
     assert len(captured_batches) == 1
     assert captured_batches[0][0] == [("BTC", "mexc", "spot", "gate", "futures", 0.4, -0.2)]

@@ -6,6 +6,7 @@ if str(TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(TESTS_DIR))
 
 from run_perf_investigation import (
+    _summarize_server_log,
     browser_targets_for_scenario,
     build_browser_storage_state,
     resolve_tracker_db_path,
@@ -69,3 +70,23 @@ def test_resolve_tracker_db_path_isolated_per_benchmark_output(tmp_path: Path):
     db_path = resolve_tracker_db_path(tmp_path / "scenario_a")
 
     assert db_path == (tmp_path / "scenario_a" / "tracker_history.sqlite")
+
+
+def test_summarize_server_log_extracts_reconnect_counts(tmp_path: Path):
+    log_path = tmp_path / "server.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "2026 [INFO] spread.exchanges.base: [KUCOIN] spot#0 reconnecting (#1, 95 syms, lived 0s, wait 1.0s)",
+                "2026 [INFO] spread.exchanges.base: [MEXC] futures#0 reconnecting (#2, 28 syms, lived 0s, wait 2.0s)",
+                "2026 [INFO] spread.exchanges.base: [KUCOIN] futures#0 reconnecting (#3, 95 syms, lived 0s, wait 4.0s)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    summary = _summarize_server_log(log_path)
+
+    assert summary["reconnect_total"] == 3
+    assert summary["reconnect_counts"]["KUCOIN"] == 2
+    assert summary["reconnect_counts"]["MEXC"] == 1

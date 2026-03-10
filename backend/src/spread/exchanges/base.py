@@ -116,6 +116,20 @@ class BaseExchangeWS(ABC):
         # Overflow symbols that didn't fit in WS capacity (filled by subscribe_symbol_batch)
         self._overflow_spot: List[str] = []
         self._overflow_futures: List[str] = []
+        self.spot_feed_mode: str = "depth_ws"
+        self.futures_feed_mode: str = "depth_ws"
+        self._reconnect_counts: Dict[str, int] = {"spot": 0, "futures": 0}
+
+    def get_feed_mode(self, market: str) -> str:
+        if str(market).lower() == "futures":
+            return str(getattr(self, "futures_feed_mode", "depth_ws") or "depth_ws")
+        return str(getattr(self, "spot_feed_mode", "depth_ws") or "depth_ws")
+
+    def get_reconnect_counts(self) -> Dict[str, int]:
+        return {
+            "spot": int(self._reconnect_counts.get("spot", 0) or 0),
+            "futures": int(self._reconnect_counts.get("futures", 0) or 0),
+        }
 
     def has_book(self, symbol: str, market_type: str) -> bool:
         """Return True if a book has been created (subscribed).
@@ -255,6 +269,7 @@ class BaseExchangeWS(ABC):
                 _reconn_count = 0
             else:
                 _reconn_count += 1
+                self._reconnect_counts[market] = int(self._reconnect_counts.get(market, 0) or 0) + 1
                 if not self.shutdown.is_set():
                     logger.info(
                         f"[{self.name.upper()}] {market}#{batch_id} reconnecting "

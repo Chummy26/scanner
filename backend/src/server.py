@@ -754,6 +754,7 @@ async def handle_debug_books(request):
             for mt, snap in markets.items():
                 result[ex][mt] = {
                     "valid": snap.is_valid(),
+                    "connected": bool(snap.connected),
                     "timestamp": snap.timestamp,
                     "age": time.time() - snap.timestamp if snap.timestamp else -1,
                     "bids_count": len(snap.bids) if snap.bids else 0,
@@ -781,6 +782,11 @@ async def handle_debug_status(request):
     exchanges_status = []
     total_books = 0
     total_symbols_set = set()
+    global_stale_outliers = []
+    per_exchange_stale_outliers = {}
+    manager_status = ws_mgr.get_status()
+    feed_modes = dict(manager_status.get("feed_modes") or {})
+    reconnect_counts = dict(manager_status.get("reconnect_counts") or {})
 
     for ex_name, instance in ws_mgr._exchange_instances.items():
         spot_books = 0
@@ -799,6 +805,7 @@ async def handle_debug_status(request):
                 continue
             sym = parts[1]
             mt = parts[2]
+            connected = bool(book.connected)
             if book._timestamp > 0:
                 age = now - book._timestamp
                 ages.append(age)
@@ -814,6 +821,16 @@ async def handle_debug_status(request):
                     futures_books += 1
                     futures_symbols.add(sym)
                 total_symbols_set.add(sym)
+                stale_entry = {
+                    "exchange": ex_name,
+                    "symbol": sym,
+                    "market_type": mt,
+                    "age_sec": round(age, 6),
+                    "connected": connected,
+                    "valid": bool(book.snapshot() is not None),
+                }
+                global_stale_outliers.append(stale_entry)
+                per_exchange_stale_outliers.setdefault(ex_name, []).append(stale_entry)
 
         if not has_any_book:
             freshest_age = -1
@@ -843,6 +860,9 @@ async def handle_debug_status(request):
         exchanges_status.append({
             "name": ex_name,
             "ws_running": not instance.shutdown.is_set(),
+            "spot_feed_mode": str(feed_modes.get(ex_name, {}).get("spot") or getattr(instance, "spot_feed_mode", "depth_ws")),
+            "futures_feed_mode": str(feed_modes.get(ex_name, {}).get("futures") or getattr(instance, "futures_feed_mode", "depth_ws")),
+            "reconnect_counts": dict(reconnect_counts.get(ex_name) or getattr(instance, "get_reconnect_counts", lambda: {})()),
             "spot_books": spot_books,
             "futures_books": futures_books,
             "spot_symbols": len(spot_symbols),
@@ -887,6 +907,12 @@ async def handle_debug_status(request):
         oldest_ts = min(e.get("ts", now) for e in _md._cache.values())
         md_oldest = round(now - oldest_ts, 1)
 
+    global_stale_outliers = sorted(global_stale_outliers, key=lambda item: float(item.get("age_sec", 0.0) or 0.0), reverse=True)
+    per_exchange_stale_outliers = {
+        exchange: sorted(items, key=lambda item: float(item.get("age_sec", 0.0) or 0.0), reverse=True)[:5]
+        for exchange, items in per_exchange_stale_outliers.items()
+    }
+
     return web.json_response({
         "ts": now,
         "engine_running": ws_mgr._running,
@@ -900,6 +926,12 @@ async def handle_debug_status(request):
             "last_calc": summary.get("last_calc", 0),
         },
         "engine": engine_extra,
+        "stale_outliers": {
+            "global_top": global_stale_outliers[:20],
+            "by_exchange": per_exchange_stale_outliers,
+        },
+        "feed_modes": feed_modes,
+        "reconnect_counts": reconnect_counts,
         "tracker": tracker_stats,
         "market_data": {"cache_entries": md_entries, "oldest_age": md_oldest},
         "config": {
@@ -2832,6 +2864,12 @@ async def on_startup(app):
                 config.min_total_spread_pct = float(os.environ["TEAM_OP_MIN_TOTAL_SPREAD_PCT"])
             if os.environ.get("TEAM_OP_TRACKER_DB_PATH"):
                 config.tracker_db_path = os.environ["TEAM_OP_TRACKER_DB_PATH"].strip()
+            for exchange_config in config.exchanges:
+                prefix = f"TEAM_OP_{str(exchange_config.name or '').upper()}"
+                if os.environ.get(f"{prefix}_SPOT_FEED_MODE"):
+                    exchange_config.spot_feed_mode = os.environ[f"{prefix}_SPOT_FEED_MODE"].strip().lower()
+                if os.environ.get(f"{prefix}_FUTURES_FEED_MODE"):
+                    exchange_config.futures_feed_mode = os.environ[f"{prefix}_FUTURES_FEED_MODE"].strip().lower()
         except Exception as e:
             logger.warning(f"Invalid TEAM_OP_* tuning env vars: {e}")
 
