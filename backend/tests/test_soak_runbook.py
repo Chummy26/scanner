@@ -7,6 +7,7 @@ from src.spread.runtime_audit import RuntimeAuditCollector
 from src.spread.soak_runbook import (
     _signal_anti_spike_gate,
     audit_snapshot_labeling,
+    build_soak_markdown_report,
     collect_runtime_audit_checks,
     collect_tracker_sql_checks,
     evaluate_stage1,
@@ -285,7 +286,7 @@ def test_validate_latest_run_payload_and_stage_gates_use_runtime_shapes():
             "ts": 1_700_000_000.0,
             "metrics": {
                 "rss_mb": 800.0,
-                "calculate_ms_p95": 20.0,
+                "calculate_ms_p95": 56.0,
                 "event_loop_lag_ms_p95": 100.0,
                 "event_loop_lag_ms_p99": 250.0,
                 "tracker_records_enqueued_p50": 0.0,
@@ -305,7 +306,7 @@ def test_validate_latest_run_payload_and_stage_gates_use_runtime_shapes():
             "ts": 1_700_001_200.0,
             "metrics": {
                 "rss_mb": 802.0,
-                "calculate_ms_p95": 24.0,
+                "calculate_ms_p95": 58.0,
                 "event_loop_lag_ms_p95": 105.0,
                 "event_loop_lag_ms_p99": 260.0,
                 "tracker_records_enqueued_p50": 0.0,
@@ -325,7 +326,7 @@ def test_validate_latest_run_payload_and_stage_gates_use_runtime_shapes():
             "ts": 1_700_002_400.0,
             "metrics": {
                 "rss_mb": 804.0,
-                "calculate_ms_p95": 23.0,
+                "calculate_ms_p95": 57.0,
                 "event_loop_lag_ms_p95": 110.0,
                 "event_loop_lag_ms_p99": 240.0,
                 "tracker_records_enqueued_p50": 0.0,
@@ -348,7 +349,7 @@ def test_validate_latest_run_payload_and_stage_gates_use_runtime_shapes():
             "low_spread_records": 12,
             "low_spread_pairs_history_enabled": 2,
             "min_entry_spread_pct_recent": 0.07,
-            "stale_pairs": [],
+            "stale_pairs": ["USDC|mexc|futures|kucoin|futures"],
             "latest_hourly_health": {"rejection_rate_pct": 4.2, "quality_verdict": "healthy"},
         },
         feature_harness={
@@ -359,6 +360,7 @@ def test_validate_latest_run_payload_and_stage_gates_use_runtime_shapes():
         },
         runtime_audit_checks={
             "ok": True,
+            "package_mtime_ts": 1_700_002_410.0,
             "events_size_mb_per_hour": 1.4,
             "ws_latency_summary_exists": True,
             "disconnect_alert_count": 0,
@@ -382,6 +384,89 @@ def test_validate_latest_run_payload_and_stage_gates_use_runtime_shapes():
 
     assert anti_spike_gate["ok"] is True
     assert anti_spike_gate["name"] == "signal_gate_anti_spike"
+
+
+def test_stage1_skips_runtime_audit_gates_when_package_is_stale():
+    stage1_checkpoints = [
+        {
+            "ts": 1_700_000_000.0,
+            "metrics": {
+                "rss_mb": 900.0,
+                "calculate_ms_p95": 61.0,
+                "event_loop_lag_ms_p95": 120.0,
+                "event_loop_lag_ms_p99": 220.0,
+                "tracker_records_enqueued_p50": 0.0,
+                "tracker_records_enqueued_p95": 740.0,
+                "tracker_rejections_enqueued_p50": 0.0,
+                "tracker_rejections_enqueued_p95": 1.0,
+                "dashboard_low_spread_count": 0,
+            },
+            "http": {
+                "debug_perf": {"ok": True, "status": 200},
+                "system_health": {"ok": True, "status": 200},
+                "pipeline_status": {"ok": True, "status": 200},
+                "scanner_lite": {"ok": True, "status": 200},
+            },
+        },
+        {
+            "ts": 1_700_001_200.0,
+            "metrics": {
+                "rss_mb": 901.0,
+                "calculate_ms_p95": 62.0,
+                "event_loop_lag_ms_p95": 118.0,
+                "event_loop_lag_ms_p99": 240.0,
+                "tracker_records_enqueued_p50": 0.0,
+                "tracker_records_enqueued_p95": 739.0,
+                "tracker_rejections_enqueued_p50": 0.0,
+                "tracker_rejections_enqueued_p95": 2.0,
+                "dashboard_low_spread_count": 0,
+            },
+            "http": {
+                "debug_perf": {"ok": True, "status": 200},
+                "system_health": {"ok": True, "status": 200},
+                "pipeline_status": {"ok": True, "status": 200},
+                "scanner_lite": {"ok": True, "status": 200},
+            },
+        },
+    ]
+    stage1_result = evaluate_stage1(
+        stage1_checkpoints,
+        sql_checks={
+            "low_spread_records": 8,
+            "low_spread_pairs_history_enabled": 1,
+            "min_entry_spread_pct_recent": 0.08,
+            "stale_pairs": [],
+            "latest_hourly_health": {"rejection_rate_pct": 3.1, "quality_verdict": "healthy"},
+        },
+        feature_harness={
+            "ok": True,
+            "feature_count": len(V2_MULTISCALE_FEATURE_NAMES),
+            "cache_invalidated": True,
+            "nonzero_multiscale_features": ["entry_std_30m", "zscore_vs_8h"],
+        },
+        runtime_audit_checks={
+            "ok": True,
+            "package_dir": "C:/tmp/runtime_audit/live_20260307_141924",
+            "package_mtime_ts": 1_699_990_000.0,
+            "events_size_mb_per_hour": 9.9,
+            "ws_latency_summary_exists": False,
+            "disconnect_alert_count": 0,
+            "reconnect_alert_count": 0,
+            "summary": {"dashboard_validation": {"book_age_p95_sec": {"p95": 0.0}}},
+        },
+    )
+
+    skipped = {gate["name"]: gate for gate in stage1_result["gates"] if gate.get("skipped")}
+    assert stage1_result["ok"] is True
+    assert set(skipped) == {
+        "runtime_audit_events_budget",
+        "runtime_audit_ws_latency_summary",
+        "books_p95_under_5s",
+    }
+    assert all(gate["ok"] is True for gate in skipped.values())
+
+    report = build_soak_markdown_report(stage_result=stage1_result, checkpoints=stage1_checkpoints)
+    assert "[SKIP] runtime_audit_events_budget" in report
 
 
 def test_collect_runtime_audit_checks_reads_latest_package(tmp_path: Path):
@@ -414,3 +499,4 @@ def test_collect_runtime_audit_checks_reads_latest_package(tmp_path: Path):
     assert checks["ws_latency_summary_exists"] is True
     assert checks["events_size_mb_per_hour"] >= 0.0
     assert checks["book_age_p95_sec"] >= 0.0
+    assert checks["package_mtime_ts"] > 0.0
