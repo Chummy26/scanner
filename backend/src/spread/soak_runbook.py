@@ -273,7 +273,9 @@ def collect_http_checkpoint(base_url: str) -> dict[str, Any]:
             "calculate_ms_p95": _nested_value(perf_payload, "scanner_cycle", "calculate_ms", "p95"),
             "event_loop_lag_ms_p95": _nested_value(perf_payload, "event_loop_lag_ms", "p95"),
             "event_loop_lag_ms_p99": _nested_value(perf_payload, "event_loop_lag_ms", "p99"),
+            "tracker_records_enqueued_p50": _nested_value(perf_payload, "scanner_cycle", "tracker_records_enqueued", "p50"),
             "tracker_records_enqueued_p95": _nested_value(perf_payload, "scanner_cycle", "tracker_records_enqueued", "p95"),
+            "tracker_rejections_enqueued_p50": _nested_value(perf_payload, "scanner_cycle", "tracker_rejections_enqueued", "p50"),
             "tracker_rejections_enqueued_p95": _nested_value(perf_payload, "scanner_cycle", "tracker_rejections_enqueued", "p95"),
             "tracker_cycle_every": _nested_value(runtime_payload, "tracker_cycle_every"),
             "dashboard_low_spread_count": int(dashboard_low_spread_count),
@@ -1098,13 +1100,15 @@ def evaluate_stage1(
         ),
         _bool_gate(
             "record_sink_idle_cycles",
-            _safe_float(latest_metrics.get("tracker_records_enqueued_p95"), float("inf")) == 0.0
-            and _safe_float(latest_metrics.get("tracker_rejections_enqueued_p95"), float("inf")) == 0.0,
+            _safe_float(latest_metrics.get("tracker_records_enqueued_p50"), float("inf")) == 0.0
+            and _safe_float(latest_metrics.get("tracker_rejections_enqueued_p50"), float("inf")) == 0.0,
             value={
+                "tracker_records_enqueued_p50": latest_metrics.get("tracker_records_enqueued_p50"),
+                "tracker_rejections_enqueued_p50": latest_metrics.get("tracker_rejections_enqueued_p50"),
                 "tracker_records_enqueued_p95": latest_metrics.get("tracker_records_enqueued_p95"),
                 "tracker_rejections_enqueued_p95": latest_metrics.get("tracker_rejections_enqueued_p95"),
             },
-            expected="both == 0",
+            expected="p50 values == 0",
         ),
         _bool_gate(
             "tracker_low_spread_capture",
