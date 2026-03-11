@@ -38,6 +38,28 @@ def _stage_output_dir(base_dir: Path, stage: str) -> Path:
     return base_dir / str(stage)
 
 
+def _normalize_stage_arg(raw_stage: str) -> str:
+    normalized = str(raw_stage or "").strip().lower()
+    mapping = {
+        "1": "stage1",
+        "stage1": "stage1",
+        "2": "stage2",
+        "stage2": "stage2",
+        "both": "both",
+    }
+    if normalized not in mapping:
+        raise ValueError(f"unsupported stage: {raw_stage}")
+    return mapping[normalized]
+
+
+def _resolve_duration_override(duration_sec: int, duration_hours: float, stage: str) -> int:
+    if float(duration_hours or 0.0) > 0.0:
+        return max(int(round(float(duration_hours) * 3600.0)), 1)
+    if int(duration_sec or 0) > 0:
+        return int(duration_sec)
+    return default_duration_for_stage(stage)
+
+
 def _run_stage(
     *,
     stage: str,
@@ -104,8 +126,9 @@ def _run_stage(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the ArbML v2 soak runbook.")
-    parser.add_argument("--stage", choices=("stage1", "stage2", "both"), default="stage1")
+    parser.add_argument("--stage", default="stage1", help="stage1|stage2|both or aliases 1|2")
     parser.add_argument("--duration-sec", type=int, default=0, help="Override stage duration.")
+    parser.add_argument("--duration-hours", type=float, default=0.0, help="Override stage duration in hours.")
     parser.add_argument("--interval-sec", type=int, default=0, help="Override checkpoint interval.")
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--output-dir", default="")
@@ -113,6 +136,10 @@ def main() -> None:
     parser.add_argument("--artifact-root", default="")
     parser.add_argument("--runtime-audit-dir", default="")
     args = parser.parse_args()
+    try:
+        stage_arg = _normalize_stage_arg(args.stage)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     paths = resolve_soak_paths(
         ROOT_DIR,
@@ -123,12 +150,12 @@ def main() -> None:
     )
     paths.output_dir.mkdir(parents=True, exist_ok=True)
 
-    stages = ["stage1", "stage2"] if args.stage == "both" else [args.stage]
+    stages = ["stage1", "stage2"] if stage_arg == "both" else [stage_arg]
     results: dict[str, dict] = {}
     for stage in stages:
         stage_dir = _stage_output_dir(paths.output_dir, stage)
         stage_dir.mkdir(parents=True, exist_ok=True)
-        duration_sec = int(args.duration_sec) if int(args.duration_sec) > 0 else default_duration_for_stage(stage)
+        duration_sec = _resolve_duration_override(args.duration_sec, args.duration_hours, stage)
         interval_sec = int(args.interval_sec) if int(args.interval_sec) > 0 else default_interval_for_stage(stage)
         results[stage] = _run_stage(
             stage=stage,

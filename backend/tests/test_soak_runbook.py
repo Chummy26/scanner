@@ -1,6 +1,7 @@
 import math
 from pathlib import Path
 
+from tests.run_arbml_v2_soak import _normalize_stage_arg, _resolve_duration_override
 from src.spread.feature_contracts import DEFAULT_FEATURE_CONTRACT_VERSION, V2_MULTISCALE_FEATURE_NAMES
 from src.spread.runtime_audit import RuntimeAuditCollector
 from src.spread.soak_runbook import (
@@ -65,6 +66,14 @@ def _record_series(
 def _persist_tracker(tracker: SpreadTracker, *, ended_at: float) -> None:
     assert tracker.flush_to_storage(now_ts=ended_at, force=True)
     tracker.close_active_session(ended_at=ended_at)
+
+
+def test_soak_runner_cli_accepts_numeric_stage_aliases_and_duration_hours():
+    assert _normalize_stage_arg("1") == "stage1"
+    assert _normalize_stage_arg("2") == "stage2"
+    assert _normalize_stage_arg("both") == "both"
+    assert _resolve_duration_override(0, 3.0, "stage1") == 3 * 60 * 60
+    assert _resolve_duration_override(900, 0.0, "stage1") == 900
 
 
 def test_collect_tracker_sql_checks_and_feature_history_harness_cover_low_spread_and_multiscale_features(tmp_path: Path):
