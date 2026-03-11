@@ -225,6 +225,27 @@ def _placeholders(values: list[int]) -> str:
     return ",".join("?" for _ in values)
 
 
+def _safe_in(
+    conn: sqlite3.Connection,
+    column_expr: str,
+    values: Iterable[int],
+    *,
+    temp_table_prefix: str,
+) -> tuple[str, list[int]]:
+    normalized = sorted({int(value) for value in values if int(value) > 0})
+    if not normalized:
+        return "", []
+    if len(normalized) <= 999:
+        return f"{column_expr} IN ({_placeholders(normalized)})", normalized
+    temp_table_name = f"temp_{temp_table_prefix}_{time.time_ns()}"
+    conn.execute(f"CREATE TEMP TABLE {temp_table_name} (id INTEGER PRIMARY KEY)")
+    conn.executemany(
+        f"INSERT OR IGNORE INTO {temp_table_name}(id) VALUES (?)",
+        ((value,) for value in normalized),
+    )
+    return f"{column_expr} IN (SELECT id FROM {temp_table_name})", []
+
+
 def _fetch_scope_ids(
     conn: sqlite3.Connection,
     *,
@@ -275,15 +296,21 @@ def _fetch_scope_ids(
     if selected_block_ids:
         normalized_block_ids = sorted({int(block_id) for block_id in selected_block_ids if int(block_id) > 0})
         if normalized_block_ids:
+            where_clause, where_params = _safe_in(
+                conn,
+                "id",
+                normalized_block_ids,
+                temp_table_prefix="selected_blocks",
+            )
             block_rows = list(
                 conn.execute(
                     f"""
                     SELECT id, session_id
                     FROM tracker_pair_blocks
-                    WHERE id IN ({_placeholders(normalized_block_ids)})
+                    WHERE {where_clause}
                     ORDER BY id ASC
                     """,
-                    normalized_block_ids,
+                    where_params,
                 )
             )
             effective_block_ids = [int(row["id"]) for row in block_rows]
@@ -378,17 +405,34 @@ def collect_sqlite_integrity(
         normalized_session_ids = sorted({int(value) for value in selected_session_ids or [] if int(value) > 0})
         normalized_block_ids = sorted({int(value) for value in selected_block_ids or [] if int(value) > 0})
         if normalized_session_ids:
-            block_filters.append(f"b.session_id IN ({_placeholders(normalized_session_ids)})")
-            block_params.extend(normalized_session_ids)
+            clause, params = _safe_in(
+                conn,
+                "b.session_id",
+                normalized_session_ids,
+                temp_table_prefix="scope_sessions",
+            )
+            block_filters.append(clause)
+            block_params.extend(params)
         if normalized_block_ids:
-            block_filters.append(f"b.id IN ({_placeholders(normalized_block_ids)})")
-            block_params.extend(normalized_block_ids)
+            clause, params = _safe_in(
+                conn,
+                "b.id",
+                normalized_block_ids,
+                temp_table_prefix="scope_blocks",
+            )
+            block_filters.append(clause)
+            block_params.extend(params)
         where_clause = f"WHERE {' AND '.join(block_filters)}" if block_filters else ""
         block_rows = list(conn.execute(f"SELECT b.id, b.session_id FROM tracker_pair_blocks b {where_clause}", block_params)) if table_counts.get("tracker_pair_blocks", 0) else []
         scope_block_ids = [int(row["id"]) for row in block_rows]
         scope_session_ids = sorted({int(row["session_id"]) for row in block_rows if int(row["session_id"]) > 0})
-        block_where = f"WHERE b.id IN ({_placeholders(scope_block_ids)})" if scope_block_ids else ""
-        block_where_params: list[Any] = list(scope_block_ids)
+        block_where_clause, block_where_params = _safe_in(
+            conn,
+            "b.id",
+            scope_block_ids,
+            temp_table_prefix="integrity_blocks",
+        )
+        block_where = f"WHERE {block_where_clause}" if block_where_clause else ""
 
         zero_record_blocks = int(
             conn.execute(
@@ -432,11 +476,23 @@ def collect_sqlite_integrity(
             event_filters: list[str] = []
             event_params: list[Any] = []
             if scope_session_ids:
-                event_filters.append(f"e.session_id IN ({_placeholders(scope_session_ids)})")
-                event_params.extend(scope_session_ids)
+                clause, params = _safe_in(
+                    conn,
+                    "e.session_id",
+                    scope_session_ids,
+                    temp_table_prefix="event_sessions",
+                )
+                event_filters.append(clause)
+                event_params.extend(params)
             if scope_block_ids:
-                event_filters.append(f"(e.block_id IS NULL OR e.block_id IN ({_placeholders(scope_block_ids)}))")
-                event_params.extend(scope_block_ids)
+                clause, params = _safe_in(
+                    conn,
+                    "e.block_id",
+                    scope_block_ids,
+                    temp_table_prefix="event_blocks",
+                )
+                event_filters.append(f"(e.block_id IS NULL OR {clause})")
+                event_params.extend(params)
             event_where = f"WHERE {' AND '.join(event_filters)}" if event_filters else ""
             missing_event_blocks = int(
                 conn.execute(

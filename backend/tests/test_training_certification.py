@@ -332,3 +332,77 @@ def test_run_clean_training_cycle_propagates_certification_id_to_report_and_meta
     assert report["certification_id"] == "cert-123"
     assert report["artifact_metadata"]["training_config"]["certification_id"] == "cert-123"
     assert metadata["training_config"]["certification_id"] == "cert-123"
+
+
+def test_scope_and_integrity_handle_more_than_999_block_ids(tmp_path: Path):
+    db_path = tmp_path / "large_scope.sqlite"
+    block_count = 1205
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE tracker_meta (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute(
+            """
+            CREATE TABLE tracker_capture_sessions (
+                id INTEGER PRIMARY KEY,
+                started_at REAL,
+                ended_at REAL,
+                status TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE tracker_pair_blocks (
+                id INTEGER PRIMARY KEY,
+                session_id INTEGER,
+                record_count INTEGER,
+                start_ts REAL,
+                end_ts REAL,
+                is_open INTEGER
+            )
+            """
+        )
+        conn.execute("CREATE TABLE tracker_records (block_id INTEGER, ts REAL)")
+        conn.execute("CREATE TABLE tracker_events (session_id INTEGER, block_id INTEGER, ts REAL)")
+        conn.execute(
+            "INSERT INTO tracker_capture_sessions (id, started_at, ended_at, status) VALUES (101, 1000.0, 4600.0, 'closed')"
+        )
+        conn.execute("INSERT INTO tracker_meta (key, value) VALUES ('quality_fix_activated_at', '0')")
+        block_rows = [
+            (block_id, 101, 1, float(1000 + block_id), float(1001 + block_id), 0)
+            for block_id in range(1, block_count + 1)
+        ]
+        conn.executemany(
+            "INSERT INTO tracker_pair_blocks (id, session_id, record_count, start_ts, end_ts, is_open) VALUES (?, ?, ?, ?, ?, ?)",
+            block_rows,
+        )
+        conn.executemany(
+            "INSERT INTO tracker_records (block_id, ts) VALUES (?, ?)",
+            [(block_id, float(1000 + block_id)) for block_id in range(1, block_count + 1)],
+        )
+        conn.executemany(
+            "INSERT INTO tracker_events (session_id, block_id, ts) VALUES (?, ?, ?)",
+            [(101, block_id, float(1000 + block_id)) for block_id in range(1, block_count + 1)],
+        )
+        conn.commit()
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        scope = tc._fetch_scope_ids(
+            conn,
+            selected_session_ids=None,
+            selected_block_ids=list(range(1, block_count + 1)),
+            allow_legacy_sessions=False,
+        )
+
+    integrity = tc.collect_sqlite_integrity(
+        db_path,
+        selected_session_ids=scope["effective_session_ids"],
+        selected_block_ids=scope["effective_block_ids"],
+    )
+
+    assert len(scope["effective_block_ids"]) == block_count
+    assert scope["effective_session_ids"] == [101]
+    assert integrity["scope"]["session_ids"] == [101]
+    assert len(integrity["scope"]["block_ids"]) == block_count
+    assert integrity["anomalies"]["record_count_mismatches"] == 0
+    assert integrity["anomalies"]["missing_event_blocks"] == 0
