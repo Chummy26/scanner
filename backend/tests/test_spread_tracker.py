@@ -149,6 +149,92 @@ def test_tracker_prune_removes_stale_pairs_from_sqlite(tmp_path: Path):
     assert restored.get_pair_stats(*stale_pair) is None
 
 
+def test_tracker_restart_preserves_existing_last_flush_at(tmp_path: Path):
+    db_path = tmp_path / "tracker_history.sqlite"
+    tracker = SpreadTracker(
+        window_sec=120,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=db_path,
+    )
+
+    pair = ("BTC", "mexc", "spot", "gate", "futures")
+    tracker.record_spread(*pair, 0.42, -0.30, now_ts=0.0)
+    tracker.record_spread(*pair, -0.15, 0.12, now_ts=15.0)
+    assert tracker.flush_to_storage(now_ts=15.0, force=True)
+
+    with sqlite3.connect(db_path, timeout=30.0) as conn:
+        expected = float(conn.execute("SELECT value FROM tracker_meta WHERE key = 'last_flush_at'").fetchone()[0])
+
+    restarted = SpreadTracker(
+        window_sec=120,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=db_path,
+    )
+
+    assert restarted._last_flush_at == pytest.approx(expected)
+    with sqlite3.connect(db_path, timeout=30.0) as conn:
+        persisted = float(conn.execute("SELECT value FROM tracker_meta WHERE key = 'last_flush_at'").fetchone()[0])
+    assert persisted == pytest.approx(expected)
+
+
+def test_tracker_zero_last_flush_only_rewrites_current_memory_window(tmp_path: Path):
+    db_path = tmp_path / "tracker_history.sqlite"
+    tracker = SpreadTracker(
+        window_sec=1_000,
+        memory_window_sec=30,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=db_path,
+    )
+
+    pair = ("ETH", "mexc", "spot", "gate", "futures")
+    tracker.record_spread(*pair, 0.40, -0.20, now_ts=0.0)
+    tracker.record_spread(*pair, 0.45, -0.18, now_ts=15.0)
+    assert tracker.flush_to_storage(now_ts=15.0, force=True)
+
+    restarted = SpreadTracker(
+        window_sec=1_000,
+        memory_window_sec=30,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=db_path,
+    )
+    assert restarted.load_from_storage(now_ts=100.0) == 1
+
+    restarted._last_flush_at = 0.0
+    restarted.record_spread(*pair, 0.55, -0.10, now_ts=100.0)
+    assert restarted.flush_to_storage(now_ts=100.0)
+
+    with sqlite3.connect(db_path, timeout=30.0) as conn:
+        rows = conn.execute(
+            """
+            SELECT ts, entry_spread_pct, exit_spread_pct
+            FROM tracker_records
+            ORDER BY ts ASC
+            """
+        ).fetchall()
+
+    assert rows == [
+        (0.0, 0.4, -0.2),
+        (15.0, 0.45, -0.18),
+        (100.0, 0.55, -0.1),
+    ]
+
+
 def test_tracker_creates_new_block_when_gap_exceeds_threshold(tmp_path: Path):
     db_path = tmp_path / "tracker_history.sqlite"
     tracker = SpreadTracker(
@@ -638,6 +724,34 @@ def test_tracker_rejects_invalid_numeric_records_before_persistence_and_tracks_a
     assert storage["rejection_rate_by_exchange"]["mexc"] == pytest.approx(0.5)
     assert storage["rejection_rate_by_exchange"]["gate"] == pytest.approx(0.5)
     assert any(event.get("kind") == "tracker_rejection_stats" for event in captured_events)
+
+
+def test_tracker_hot_path_stats_update_incrementally_before_flush(tmp_path: Path):
+    tracker = SpreadTracker(
+        window_sec=3600,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=tmp_path / "tracker.sqlite",
+    )
+    pair = ("BTC", "mexc", "spot", "gate", "futures")
+
+    tracker.record_spread(*pair, 0.25, float("nan"), now_ts=15.0)
+    tracker.record_spread(*pair, 0.30, -0.10, now_ts=30.0)
+
+    stats = tracker._hot_path_rejection_stats
+    pair_id = "BTC|mexc|spot|gate|futures"
+
+    assert stats["attempted_records_total"] == 2
+    assert stats["invalid_record_rejections_total"] == 1
+    assert stats["pair_attempts"][pair_id] == 2
+    assert stats["pair_rejections"][pair_id] == 1
+    assert stats["rejection_rate_total"] == pytest.approx(0.5)
+    assert stats["rejection_rate_by_pair"][pair_id] == pytest.approx(0.5)
+    assert stats["rejection_rate_by_exchange"]["mexc"] == pytest.approx(0.5)
+    assert stats["rejection_rate_by_exchange"]["gate"] == pytest.approx(0.5)
 
 
 def test_tracker_rejects_invalid_numeric_records_before_persistence(tmp_path: Path):

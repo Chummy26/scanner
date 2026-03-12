@@ -52,6 +52,7 @@ _DEFAULT_CLEAN_SEQUENCE_LENGTH = 15
 _DEFAULT_CLEAN_PREDICTION_HORIZON_SEC = 14_400
 _BURN_IN_CHECKPOINT_SEC = 30 * 60
 _BURN_IN_MIN_SEC = 60 * 60
+_FLUSH_PAIR_BATCH_MAX = 512
 
 
 @dataclass(slots=True)
@@ -732,18 +733,32 @@ class SpreadTracker:
     def _record_hot_path_attempt_locked(self, key: PairKey, *, count: int = 1) -> None:
         increment = max(int(count), 1)
         pair_id = self._pair_id(key)
-        stats = dict(self._hot_path_rejection_stats)
+        stats = self._hot_path_rejection_stats
+        if not isinstance(stats, dict):
+            stats = self._empty_hot_path_rejection_stats()
+            self._hot_path_rejection_stats = stats
         stats["attempted_records_total"] = int(stats.get("attempted_records_total", 0) or 0) + increment
-        pair_attempts = dict(stats.get("pair_attempts") or {})
+        pair_attempts = stats.setdefault("pair_attempts", {})
         pair_attempts[pair_id] = int(pair_attempts.get(pair_id, 0) or 0) + increment
-        stats["pair_attempts"] = pair_attempts
-        exchange_attempts = dict(stats.get("exchange_attempts") or {})
+        exchange_attempts = stats.setdefault("exchange_attempts", {})
         for exchange in {str(key[1] or ""), str(key[3] or "")}:
             if not exchange:
                 continue
             exchange_attempts[exchange] = int(exchange_attempts.get(exchange, 0) or 0) + increment
-        stats["exchange_attempts"] = exchange_attempts
-        self._hot_path_rejection_stats = self._normalized_hot_path_rejection_stats(stats)
+        pair_rates = stats.setdefault("rejection_rate_by_pair", {})
+        pair_rejections = stats.setdefault("pair_rejections", {})
+        pair_attempt_total = int(pair_attempts.get(pair_id, 0) or 0)
+        pair_rates[pair_id] = float(int(pair_rejections.get(pair_id, 0) or 0) / pair_attempt_total) if pair_attempt_total > 0 else 0.0
+        exchange_rates = stats.setdefault("rejection_rate_by_exchange", {})
+        exchange_rejections = stats.setdefault("exchange_rejections", {})
+        for exchange in {str(key[1] or ""), str(key[3] or "")}:
+            if not exchange:
+                continue
+            exchange_attempt_total = int(exchange_attempts.get(exchange, 0) or 0)
+            exchange_rates[exchange] = float(int(exchange_rejections.get(exchange, 0) or 0) / exchange_attempt_total) if exchange_attempt_total > 0 else 0.0
+        attempted_total = int(stats.get("attempted_records_total", 0) or 0)
+        rejected_total = int(stats.get("invalid_record_rejections_total", 0) or 0)
+        stats["rejection_rate_total"] = float(rejected_total / attempted_total) if attempted_total > 0 else 0.0
         self._hot_path_rejection_stats_dirty = True
 
     def _record_hot_path_rejection_locked(
@@ -754,7 +769,10 @@ class SpreadTracker:
         count: int = 1,
     ) -> None:
         increment = max(int(count), 1)
-        stats = dict(self._hot_path_rejection_stats)
+        stats = self._hot_path_rejection_stats
+        if not isinstance(stats, dict):
+            stats = self._empty_hot_path_rejection_stats()
+            self._hot_path_rejection_stats = stats
         fields = {str(field) for field in invalid_fields}
         pair_id = self._pair_id(key)
         stats["invalid_record_rejections_total"] = int(stats.get("invalid_record_rejections_total", 0) or 0) + increment
@@ -762,16 +780,27 @@ class SpreadTracker:
             stats["invalid_entry_rejections_total"] = int(stats.get("invalid_entry_rejections_total", 0) or 0) + increment
         if "exit" in fields:
             stats["invalid_exit_rejections_total"] = int(stats.get("invalid_exit_rejections_total", 0) or 0) + increment
-        pair_rejections = dict(stats.get("pair_rejections") or {})
+        pair_rejections = stats.setdefault("pair_rejections", {})
         pair_rejections[pair_id] = int(pair_rejections.get(pair_id, 0) or 0) + increment
-        stats["pair_rejections"] = pair_rejections
-        exchange_rejections = dict(stats.get("exchange_rejections") or {})
+        exchange_rejections = stats.setdefault("exchange_rejections", {})
         for exchange in {str(key[1] or ""), str(key[3] or "")}:
             if not exchange:
                 continue
             exchange_rejections[exchange] = int(exchange_rejections.get(exchange, 0) or 0) + increment
-        stats["exchange_rejections"] = exchange_rejections
-        self._hot_path_rejection_stats = self._normalized_hot_path_rejection_stats(stats)
+        pair_rates = stats.setdefault("rejection_rate_by_pair", {})
+        pair_attempts = stats.setdefault("pair_attempts", {})
+        pair_attempt_total = int(pair_attempts.get(pair_id, 0) or 0)
+        pair_rates[pair_id] = float(int(pair_rejections.get(pair_id, 0) or 0) / pair_attempt_total) if pair_attempt_total > 0 else 0.0
+        exchange_rates = stats.setdefault("rejection_rate_by_exchange", {})
+        exchange_attempts = stats.setdefault("exchange_attempts", {})
+        for exchange in {str(key[1] or ""), str(key[3] or "")}:
+            if not exchange:
+                continue
+            exchange_attempt_total = int(exchange_attempts.get(exchange, 0) or 0)
+            exchange_rates[exchange] = float(int(exchange_rejections.get(exchange, 0) or 0) / exchange_attempt_total) if exchange_attempt_total > 0 else 0.0
+        attempted_total = int(stats.get("attempted_records_total", 0) or 0)
+        rejected_total = int(stats.get("invalid_record_rejections_total", 0) or 0)
+        stats["rejection_rate_total"] = float(rejected_total / attempted_total) if attempted_total > 0 else 0.0
         self._hot_path_rejection_stats_dirty = True
 
     def _load_hot_path_rejection_stats(self, meta_rows: dict[str, str]) -> None:
@@ -1082,16 +1111,21 @@ class SpreadTracker:
                 """
             )
             now = time.time()
+            existing_meta = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM tracker_meta")}
+            if "last_flush_at" in existing_meta:
+                self._last_flush_at = self._coerce_float(existing_meta.get("last_flush_at"), self._last_flush_at)
+            meta_updates = {
+                "record_interval_sec": self.record_interval_sec,
+                "tracking_window_sec": self.storage_window_sec,
+                "tracker_memory_window_sec": self.memory_window_sec,
+                "gap_threshold_sec": self.gap_threshold_sec,
+                "min_total_spread_pct": self.min_total_spread_pct,
+            }
+            if "last_flush_at" not in existing_meta:
+                meta_updates["last_flush_at"] = self._last_flush_at
             self._write_meta(
                 conn,
-                {
-                    "record_interval_sec": self.record_interval_sec,
-                    "tracking_window_sec": self.storage_window_sec,
-                    "tracker_memory_window_sec": self.memory_window_sec,
-                    "gap_threshold_sec": self.gap_threshold_sec,
-                    "min_total_spread_pct": self.min_total_spread_pct,
-                    "last_flush_at": self._last_flush_at,
-                },
+                meta_updates,
             )
             conn.execute(
                 "INSERT INTO tracker_meta(key, value) VALUES('created_at', ?) "
@@ -1549,6 +1583,11 @@ class SpreadTracker:
             for block_id, meta in ps.block_meta.items()
             if bool(meta.is_open) or float(meta.end_ts) >= state_cutoff
         ]
+        episodes = [
+            self._episode_payload(episode)
+            for episode in ps.episodes
+            if bool(episode.is_closed) and float(episode.end_ts) >= state_cutoff
+        ]
         return {
             "key": key,
             "storage_pair_id": int(ps.storage_pair_id),
@@ -1561,6 +1600,7 @@ class SpreadTracker:
             "exit_events": ext,
             "records": recs,
             "blocks": blocks,
+            "episodes": episodes,
         }
 
     @staticmethod
@@ -2241,13 +2281,24 @@ class SpreadTracker:
         ts = float(now_ts) if now_ts is not None else time.time()
         memory_cutoff = self._memory_cutoff(ts)
         storage_cutoff = self._storage_cutoff(ts)
-        record_rewrite_cutoff = min(memory_cutoff, float(self._last_flush_at)) if self._last_flush_at > 0.0 else -1e18
+        record_rewrite_cutoff = min(memory_cutoff, float(self._last_flush_at)) if self._last_flush_at > 0.0 else None
+        snapshot_record_cutoff = float(record_rewrite_cutoff) if record_rewrite_cutoff is not None else float("-inf")
         with self._lock:
             rejection_stats_payload = self._hot_path_rejection_snapshot_locked()
             rejection_stats_dirty = bool(self._hot_path_rejection_stats_dirty)
             if not force and not self._dirty_pairs and not self._deleted_pairs and not rejection_stats_dirty:
                 return True
-            dirty_keys = list(self._pairs.keys()) if force else list(self._dirty_pairs)
+            total_dirty_pairs = len(self._dirty_pairs)
+            if force:
+                dirty_keys = list(self._pairs.keys())
+            else:
+                dirty_keys = sorted(
+                    self._dirty_pairs,
+                    key=lambda item: float(self._pairs.get(item).last_seen_ts if self._pairs.get(item) is not None else 0.0),
+                    reverse=True,
+                )
+                if len(dirty_keys) > _FLUSH_PAIR_BATCH_MAX:
+                    dirty_keys = dirty_keys[:_FLUSH_PAIR_BATCH_MAX]
             deleted_keys = list(self._deleted_pairs)
             snapshots = []
             for key in dirty_keys:
@@ -2259,20 +2310,28 @@ class SpreadTracker:
                 ps._prune_records(memory_cutoff, preserve_after_ts=preserve_after_ts)
                 ps._prune_block_meta(storage_cutoff)
                 ps._prune_episodes(storage_cutoff)
+                self._ensure_episode_cache_locked(ps)
                 snapshots.append(
                     self._pair_snapshot(
                         key,
                         ps,
                         state_cutoff=storage_cutoff,
-                        record_cutoff=record_rewrite_cutoff,
+                        record_cutoff=snapshot_record_cutoff,
                     )
                 )
+        if force or total_dirty_pairs > _FLUSH_PAIR_BATCH_MAX:
+            logger.info(
+                "[Tracker] Flush start: force=%s dirty_pairs=%s batch_pairs=%s deleted_pairs=%s",
+                force,
+                total_dirty_pairs,
+                len(dirty_keys),
+                len(deleted_keys),
+            )
 
         started_at = time.perf_counter()
         snapshot_rebindings: list[tuple[PairKey, int, dict[int, int]]] = []
         try:
             with self._connect() as conn:
-                reconciled_pair_ids: set[int] = set()
                 conn.execute("BEGIN")
                 if deleted_keys:
                     self._delete_pairs_from_storage(conn, deleted_keys)
@@ -2335,13 +2394,14 @@ class SpreadTracker:
                                 storage_pair_id,
                             ),
                             )
-                    if storage_pair_id > 0:
-                        reconciled_pair_ids.add(int(storage_pair_id))
+                    pair_record_rewrite_cutoff = record_rewrite_cutoff
+                    if pair_record_rewrite_cutoff is None:
+                        pair_record_rewrite_cutoff = min((float(record[0]) for record in records), default=float("inf"))
                     self._delete_pair_storage_range(
                         conn,
                         pair_id=storage_pair_id,
                         storage_cutoff=storage_cutoff,
-                        record_rewrite_cutoff=record_rewrite_cutoff,
+                        record_rewrite_cutoff=pair_record_rewrite_cutoff,
                     )
                     if not has_payload:
                         continue
@@ -2484,6 +2544,45 @@ class SpreadTracker:
                             """,
                             mapped_records,
                         )
+                    episodes = snapshot.get("episodes", [])
+                    conn.execute(
+                        """
+                        DELETE FROM tracker_pair_episodes
+                        WHERE pair_id = ? AND end_ts >= ?
+                        """,
+                        (storage_pair_id, float(storage_cutoff)),
+                    )
+                    if episodes:
+                        conn.executemany(
+                            """
+                            INSERT INTO tracker_pair_episodes(
+                                pair_id, session_id, block_id, start_ts, peak_ts, end_ts, duration_sec,
+                                peak_entry_spread, exit_spread_at_close, baseline_median, baseline_mad,
+                                activation_threshold, release_threshold, source_version, is_closed
+                            )
+                            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            [
+                                (
+                                    storage_pair_id,
+                                    int(item["session_id"]),
+                                    int(runtime_to_storage_block_id.get(int(item["block_id"]), int(item["block_id"]))),
+                                    float(item["start_ts"]),
+                                    float(item["peak_ts"]),
+                                    float(item["end_ts"]),
+                                    float(item["duration_sec"]),
+                                    float(item["peak_entry_spread"]),
+                                    float(item["exit_spread_at_close"]),
+                                    float(item["baseline_median"]),
+                                    float(item["baseline_mad"]),
+                                    float(item["activation_threshold"]),
+                                    float(item["release_threshold"]),
+                                    str(item["source_version"]),
+                                    1 if bool(item["is_closed"]) else 0,
+                                )
+                                for item in episodes
+                            ],
+                        )
                     conn.execute(
                         """
                         DELETE FROM tracker_pair_blocks
@@ -2497,8 +2596,6 @@ class SpreadTracker:
                         (storage_pair_id, storage_pair_id),
                     )
                     snapshot_rebindings.append((key, storage_pair_id, runtime_to_storage_block_id))
-                if reconciled_pair_ids:
-                    self._reconcile_storage_conn(conn, pair_ids=sorted(reconciled_pair_ids))
                 self._last_flush_at = ts
                 self._write_meta(
                     conn,
@@ -2569,6 +2666,8 @@ class SpreadTracker:
             {
                 "kind": "tracker_flush",
                 "duration_ms": (time.perf_counter() - started_at) * 1000.0,
+                "pairs_flushed": len(dirty_keys),
+                "force": bool(force),
                 "storage_stats": self.get_storage_stats(),
             }
         )
@@ -2596,6 +2695,9 @@ class SpreadTracker:
                     if row["key"] in _TRACKER_META_KEYS
                 }
                 self._last_flush_at = float(meta.get("last_flush_at", 0.0) or 0.0)
+                if self._last_flush_at <= 0.0:
+                    max_record_row = conn.execute("SELECT MAX(ts) FROM tracker_records").fetchone()
+                    self._last_flush_at = self._coerce_float(max_record_row[0] if max_record_row is not None else 0.0, 0.0)
                 self.quality_fix_activated_at = self._coerce_float(meta.get("quality_fix_activated_at"), self.quality_fix_activated_at)
                 meta_with_rejection_stats = {
                     row["key"]: row["value"]
@@ -4681,6 +4783,8 @@ class SpreadTracker:
             "quality_fix_activated_at": self.quality_fix_activated_at,
             "last_flush_at": self._last_flush_at,
             "pairs_in_memory": len(self._pairs),
+            "dirty_pairs_pending": len(self._dirty_pairs),
+            "deleted_pairs_pending": len(self._deleted_pairs),
             "db_size_bytes": self.db_path.stat().st_size if self.db_path is not None and self.db_path.exists() else 0,
             "pairs_persisted": 0,
             "records_total": 0,

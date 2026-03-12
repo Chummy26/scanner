@@ -12,7 +12,15 @@ from typing import Any, Callable, Iterable
 
 import numpy as np
 
-from .ml_dataset import FEATURE_NAMES, build_dataset_bundle, _load_blocks_from_sqlite
+from .ml_dataset import (
+    FEATURE_NAMES,
+    _block_threshold_counts,
+    _build_block_diagnostics,
+    _load_blocks_from_sqlite,
+    _quantile_summary,
+    _sqlite_has_blocks,
+    build_dataset_bundle,
+)
 from .spread_tracker import SpreadRecord, compute_closed_episodes
 
 CHECKPOINT_WINDOW_SEC = 30 * 60
@@ -585,6 +593,328 @@ def _scope_episodes(blocks: list[dict[str, Any]]) -> list[Any]:
     return sorted(episodes, key=lambda item: (float(item.end_ts), float(item.start_ts)))
 
 
+def _build_block_scope_clause(
+    conn: sqlite3.Connection,
+    *,
+    selected_session_ids: list[int] | None,
+    selected_block_ids: list[int] | None,
+    selected_only: bool,
+    closed_only: bool,
+    block_alias: str = "b",
+) -> tuple[str, list[Any]]:
+    block_filter: list[str] = []
+    params: list[Any] = []
+    if selected_only:
+        block_filter.append(f"{block_alias}.selected_for_training = 1")
+    if closed_only:
+        block_filter.append(f"{block_alias}.is_open = 0")
+    if selected_session_ids is not None:
+        normalized_session_ids = sorted({int(session_id) for session_id in selected_session_ids if int(session_id) > 0})
+        if not normalized_session_ids:
+            return "WHERE 1 = 0", []
+        clause, clause_params = _safe_in(
+            conn,
+            f"{block_alias}.session_id",
+            normalized_session_ids,
+            temp_table_prefix=f"{block_alias}_scope_sessions",
+        )
+        block_filter.append(clause)
+        params.extend(clause_params)
+    if selected_block_ids is not None:
+        normalized_block_ids = sorted({int(block_id) for block_id in selected_block_ids if int(block_id) > 0})
+        if not normalized_block_ids:
+            return "WHERE 1 = 0", []
+        clause, clause_params = _safe_in(
+            conn,
+            f"{block_alias}.id",
+            normalized_block_ids,
+            temp_table_prefix=f"{block_alias}_scope_blocks",
+        )
+        block_filter.append(clause)
+        params.extend(clause_params)
+    return (f"WHERE {' AND '.join(block_filter)}" if block_filter else ""), params
+
+
+def _stream_quick_sqlite_metrics(
+    state_path: Path,
+    *,
+    selected_session_ids: list[int] | None,
+    selected_block_ids: list[int] | None,
+    selected_only: bool,
+    closed_only: bool,
+    sequence_length: int,
+) -> dict[str, Any] | None:
+    if Path(state_path).suffix.lower() == ".json" or not Path(state_path).exists():
+        return None
+
+    with sqlite3.connect(state_path, timeout=30.0) as conn:
+        conn.row_factory = sqlite3.Row
+        if not _sqlite_has_blocks(conn):
+            return None
+
+        where_clause, params = _build_block_scope_clause(
+            conn,
+            selected_session_ids=selected_session_ids,
+            selected_block_ids=selected_block_ids,
+            selected_only=selected_only,
+            closed_only=closed_only,
+        )
+
+        summary_row = conn.execute(
+            f"""
+            SELECT MIN(r.ts) AS min_ts, MAX(r.ts) AS max_ts, COUNT(r.ts) AS record_count
+            FROM tracker_pair_blocks b
+            JOIN tracker_records r ON r.block_id = b.id
+            {where_clause}
+            """,
+            params,
+        ).fetchone()
+        min_ts = float(summary_row["min_ts"] or 0.0) if summary_row is not None else 0.0
+        max_ts = float(summary_row["max_ts"] or 0.0) if summary_row is not None else 0.0
+        total_records = int(summary_row["record_count"] or 0) if summary_row is not None else 0
+
+        record_counts: list[int] = []
+        durations: list[float] = []
+        median_intervals: list[float] = []
+        max_to_median_ratios: list[float] = []
+        irregular_block_count = 0
+        session_metrics: dict[int, dict[str, list[float]]] = defaultdict(
+            lambda: {
+                "record_counts": [],
+                "durations": [],
+                "median_intervals": [],
+                "max_to_median_ratios": [],
+                "irregular_flags": [],
+            }
+        )
+        pair_ids: set[str] = set()
+        pair_checkpoint_presence: dict[str, set[int]] = defaultdict(set)
+        episode_total_spreads: list[float] = []
+        episode_durations: list[float] = []
+        episode_peaks: list[float] = []
+        episode_exits: list[float] = []
+        pair_hour_records: dict[tuple[str, int], list[tuple[float, float, float]]] = defaultdict(list)
+        bilateral_zero_count = 0
+
+        def _finalize_block(current_meta: dict[str, Any] | None, current_records: list[tuple[float, float, float]]) -> None:
+            nonlocal irregular_block_count
+            if current_meta is None:
+                return
+            record_count = int(current_meta.get("record_count") or len(current_records))
+            start_ts = float(current_meta.get("start_ts") or 0.0)
+            end_ts = float(current_meta.get("end_ts") or 0.0)
+            if current_records and (start_ts <= 0.0 or end_ts <= 0.0):
+                start_ts = float(current_records[0][0])
+                end_ts = float(current_records[-1][0])
+            block_duration = max(0.0, end_ts - start_ts)
+            intervals = [
+                float(curr[0]) - float(prev[0])
+                for prev, curr in zip(current_records, current_records[1:])
+            ]
+            median_interval = float(np.median(np.asarray(intervals, dtype=float))) if intervals else 0.0
+            max_interval = max(intervals) if intervals else 0.0
+            max_to_median_ratio = (
+                float(max_interval) / max(float(median_interval), 1e-6)
+                if intervals and median_interval > 0.0
+                else 0.0
+            )
+            is_irregular = bool(intervals and max_to_median_ratio > 3.0)
+            if is_irregular:
+                irregular_block_count += 1
+            record_counts.append(record_count)
+            durations.append(block_duration)
+            if median_interval > 0.0:
+                median_intervals.append(float(median_interval))
+            if max_to_median_ratio > 0.0:
+                max_to_median_ratios.append(float(max_to_median_ratio))
+            session_id = int(current_meta.get("session_id") or 0)
+            bucket = session_metrics[session_id]
+            bucket["record_counts"].append(record_count)
+            bucket["durations"].append(block_duration)
+            if median_interval > 0.0:
+                bucket["median_intervals"].append(float(median_interval))
+            if max_to_median_ratio > 0.0:
+                bucket["max_to_median_ratios"].append(float(max_to_median_ratio))
+            bucket["irregular_flags"].append(1.0 if is_irregular else 0.0)
+            if not current_records:
+                return
+            spread_records = [
+                SpreadRecord(
+                    timestamp=float(timestamp),
+                    entry_spread_pct=float(entry_spread),
+                    exit_spread_pct=float(exit_spread),
+                    session_id=session_id,
+                    block_id=int(current_meta.get("block_id") or 0),
+                )
+                for timestamp, entry_spread, exit_spread in current_records
+            ]
+            for episode in compute_closed_episodes(spread_records):
+                episode_total_spreads.append(float(getattr(episode, "total_spread", 0.0) or 0.0))
+                episode_durations.append(float(getattr(episode, "duration_sec", 0.0) or 0.0))
+                episode_peaks.append(float(getattr(episode, "peak_entry_spread", 0.0) or 0.0))
+                episode_exits.append(float(getattr(episode, "exit_spread_at_close", 0.0) or 0.0))
+
+        block_cursor = conn.execute(
+            f"""
+            SELECT
+                b.id AS block_id,
+                b.session_id,
+                b.start_ts,
+                b.end_ts,
+                b.record_count,
+                p.symbol,
+                p.buy_ex,
+                p.buy_mt,
+                p.sell_ex,
+                p.sell_mt,
+                r.ts,
+                r.entry_spread_pct,
+                r.exit_spread_pct
+            FROM tracker_pair_blocks b
+            JOIN tracker_pairs p ON p.id = b.pair_id
+            LEFT JOIN tracker_records r ON r.block_id = b.id
+            {where_clause}
+            ORDER BY b.id ASC, r.ts ASC
+            """,
+            params,
+        )
+
+        current_block_id = 0
+        current_meta: dict[str, Any] | None = None
+        current_records: list[tuple[float, float, float]] = []
+        for row in block_cursor:
+            block_id = int(row["block_id"] or 0)
+            if current_block_id and block_id != current_block_id:
+                _finalize_block(current_meta, current_records)
+                current_records = []
+                current_meta = None
+            if current_meta is None:
+                pair_key = f"{row['symbol']}|{row['buy_ex']}|{row['buy_mt']}|{row['sell_ex']}|{row['sell_mt']}"
+                current_meta = {
+                    "block_id": block_id,
+                    "session_id": int(row["session_id"] or 0),
+                    "pair_id": pair_key,
+                    "start_ts": float(row["start_ts"] or 0.0),
+                    "end_ts": float(row["end_ts"] or 0.0),
+                    "record_count": int(row["record_count"] or 0),
+                }
+                current_block_id = block_id
+            if row["ts"] is None:
+                continue
+            ts_value = float(row["ts"] or 0.0)
+            entry_value = float(row["entry_spread_pct"] or 0.0)
+            exit_value = float(row["exit_spread_pct"] or 0.0)
+            current_records.append((ts_value, entry_value, exit_value))
+            pair_id = str(current_meta["pair_id"])
+            pair_ids.add(pair_id)
+            if min_ts > 0.0:
+                pair_checkpoint_presence[pair_id].add(int((ts_value - min_ts) // CHECKPOINT_WINDOW_SEC))
+            pair_hour_records[(pair_id, int(ts_value // 3600))].append((ts_value, entry_value, exit_value))
+            if abs(entry_value) <= 1e-12 and abs(exit_value) <= 1e-12:
+                bilateral_zero_count += 1
+        _finalize_block(current_meta, current_records)
+
+        pair_hour_counts: Counter[str] = Counter()
+        frozen_entry_hours: Counter[str] = Counter()
+        frozen_exit_hours: Counter[str] = Counter()
+        unresponsive_exit_hours: Counter[str] = Counter()
+        entry_outlier_hours: Counter[str] = Counter()
+        exit_outlier_hours: Counter[str] = Counter()
+        pearson_by_pair: dict[str, float] = {}
+        def _finalize_pair_hour(
+            pair_id: str | None,
+            entry_values: list[float],
+            exit_values: list[float],
+        ) -> None:
+            if not pair_id:
+                return
+            pair_hour_counts[pair_id] += 1
+            entry_std = float(np.std(np.asarray(entry_values, dtype=float))) if entry_values else 0.0
+            exit_std = float(np.std(np.asarray(exit_values, dtype=float))) if exit_values else 0.0
+            if entry_std <= 1e-4 or _zero_return_ratio(entry_values) >= 0.80:
+                frozen_entry_hours[pair_id] += 1
+            if exit_std <= 1e-4 or _zero_return_ratio(exit_values) >= 0.80:
+                frozen_exit_hours[pair_id] += 1
+            if entry_std > 1e-4 and exit_std <= 1e-4:
+                unresponsive_exit_hours[pair_id] += 1
+            entry_median = _median(entry_values)
+            exit_median = _median(exit_values)
+            entry_mad = max(_mad(entry_values, entry_median), 0.01)
+            exit_mad = max(_mad(exit_values, exit_median), 0.01)
+            if entry_values and sum(1 for value in entry_values if abs(value - entry_median) > 10.0 * entry_mad) / len(entry_values) > 0.05:
+                entry_outlier_hours[pair_id] += 1
+            if exit_values and sum(1 for value in exit_values if abs(value - exit_median) > 10.0 * exit_mad) / len(exit_values) > 0.05:
+                exit_outlier_hours[pair_id] += 1
+            if len(entry_values) >= 2 and len(exit_values) >= 2:
+                if float(np.std(np.asarray(entry_values, dtype=float))) <= 1e-12 or float(np.std(np.asarray(exit_values, dtype=float))) <= 1e-12:
+                    pearson_by_pair[pair_id] = 0.0
+                else:
+                    pearson_by_pair[pair_id] = float(np.corrcoef(np.asarray(entry_values), np.asarray(exit_values))[0, 1])
+
+        for (pair_id, _hour_bucket), bucket_records in pair_hour_records.items():
+            bucket_records.sort(key=lambda item: item[0])
+            _finalize_pair_hour(
+                pair_id,
+                [float(item[1]) for item in bucket_records],
+                [float(item[2]) for item in bucket_records],
+            )
+
+    session_summaries: dict[str, Any] = {}
+    eligible_sessions = 0
+    for session_id, metrics in sorted(session_metrics.items()):
+        session_record_counts = [int(value) for value in metrics["record_counts"]]
+        session_threshold_counts = _block_threshold_counts(session_record_counts)
+        eligible_block_count = int(sum(1 for record_count in session_record_counts if record_count >= int(sequence_length)))
+        if eligible_block_count > 0:
+            eligible_sessions += 1
+        session_summaries[str(session_id)] = {
+            "num_blocks": len(session_record_counts),
+            "record_count_quantiles": _quantile_summary(session_record_counts),
+            "duration_sec_quantiles": _quantile_summary([float(value) for value in metrics["durations"]]),
+            "inter_record_interval_sec_quantiles": _quantile_summary([float(value) for value in metrics["median_intervals"]]),
+            "max_to_median_interval_ratio_quantiles": _quantile_summary([float(value) for value in metrics["max_to_median_ratios"]]),
+            "irregular_block_count": int(sum(1 for value in metrics["irregular_flags"] if value > 0.0)),
+            "max_record_count": max(session_record_counts) if session_record_counts else 0,
+            "record_count_threshold_counts": session_threshold_counts,
+            "eligible_blocks_for_sequence_length": eligible_block_count,
+        }
+
+    checkpoint_count = int(((max_ts - min_ts) // CHECKPOINT_WINDOW_SEC) + 1) if total_records > 0 and max_ts >= min_ts else 0
+    return {
+        "pair_ids": sorted(pair_ids),
+        "pair_checkpoint_presence": pair_checkpoint_presence,
+        "checkpoint_count": int(checkpoint_count),
+        "records_total": int(total_records),
+        "episode_total_spreads": episode_total_spreads,
+        "episode_durations": episode_durations,
+        "episode_peaks": episode_peaks,
+        "episode_exits": episode_exits,
+        "pair_hour_counts": pair_hour_counts,
+        "frozen_entry_hours": frozen_entry_hours,
+        "frozen_exit_hours": frozen_exit_hours,
+        "unresponsive_exit_hours": unresponsive_exit_hours,
+        "entry_outlier_hours": entry_outlier_hours,
+        "exit_outlier_hours": exit_outlier_hours,
+        "pearson_by_pair": pearson_by_pair,
+        "bilateral_zero_rate": float(bilateral_zero_count / max(total_records, 1)),
+        "num_blocks": int(len(record_counts)),
+        "block_diagnostics": {
+            "record_count_quantiles": _quantile_summary(record_counts),
+            "duration_sec_quantiles": _quantile_summary(durations),
+            "inter_record_interval_sec_quantiles": _quantile_summary(median_intervals),
+            "max_to_median_interval_ratio_quantiles": _quantile_summary(max_to_median_ratios),
+            "irregular_block_count": int(irregular_block_count),
+            "record_count_threshold_counts": _block_threshold_counts(record_counts),
+            "feature_window_feasibility": {
+                "sequence_length": int(sequence_length),
+                "eligible_blocks_for_sequence_length": int(sum(1 for value in record_counts if int(value) >= int(sequence_length))),
+                "eligible_sessions_with_any_eligible_block": int(eligible_sessions),
+            },
+            "session_summaries": session_summaries,
+        },
+    }
+
+
 def _session_duration_hours(session_rows: list[dict[str, Any]], records: list[dict[str, Any]]) -> float:
     total_sec = 0.0
     for row in session_rows:
@@ -738,19 +1068,44 @@ def run_training_certification(
     effective_block_ids = list(scope["effective_block_ids"])
     runtime_session_rows = list(scope["runtime_session_rows"])
     rejection_stats = dict(scope["hot_path_rejection_stats"])
-    runtime_package = _find_runtime_audit_package(runtime_audit_dir, state_path=state_path)
-    blocks, _, _ = _load_blocks_from_sqlite(
-        state_path,
-        selected_block_ids=effective_block_ids or None,
-        selected_session_ids=effective_session_ids or None,
-        selected_only=False,
-        closed_only=True,
+    runtime_package = (
+        {"path": "", "summary": {}, "events": [], "alerts": [], "samples": []}
+        if str(certification_mode).lower() == "quick"
+        else _find_runtime_audit_package(runtime_audit_dir, state_path=state_path)
     )
-    records = _scope_records(blocks)
-    episodes = _scope_episodes(blocks)
-    checkpoint_buckets = _checkpoint_buckets(records)
+    quick_sqlite_metrics = (
+        _stream_quick_sqlite_metrics(
+            state_path,
+            selected_block_ids=effective_block_ids or None,
+            selected_session_ids=effective_session_ids or None,
+            selected_only=False,
+            closed_only=True,
+            sequence_length=sequence_length,
+        )
+        if str(certification_mode).lower() == "quick"
+        else None
+    )
+    if quick_sqlite_metrics is None:
+        blocks, _, _ = _load_blocks_from_sqlite(
+            state_path,
+            selected_block_ids=effective_block_ids or None,
+            selected_session_ids=effective_session_ids or None,
+            selected_only=False,
+            closed_only=True,
+        )
+        records = _scope_records(blocks)
+        episodes = _scope_episodes(blocks)
+        checkpoint_buckets = _checkpoint_buckets(records)
+        pair_ids = sorted({str(record["pair_id"]) for record in records if str(record["pair_id"])})
+        block_diagnostics = _build_block_diagnostics(blocks, sequence_length=sequence_length)
+    else:
+        blocks = []
+        records = []
+        episodes = []
+        checkpoint_buckets = []
+        pair_ids = list(quick_sqlite_metrics["pair_ids"])
+        block_diagnostics = dict(quick_sqlite_metrics["block_diagnostics"])
     session_hours = _session_duration_hours(runtime_session_rows, records)
-    pair_ids = sorted({str(record["pair_id"]) for record in records if str(record["pair_id"])})
     gate_results: dict[str, Any] = {}
     dataset_fingerprints: dict[str, str] = {}
 
@@ -772,55 +1127,81 @@ def run_training_certification(
         _persist_gate(_build_gate("gate_01_sqlite_integrity", "SQLite integrity", status="FAIL" if any(int(value) > 0 for value in anomalies.values()) else "PASS", failure_reasons=["integrity_anomaly"] if any(int(value) > 0 for value in anomalies.values()) else [], details=integrity))
 
         _check_timeout()
-        bundle = build_dataset_bundle(
-            state_path=state_path,
-            sequence_length=sequence_length,
-            prediction_horizon_sec=prediction_horizon_sec,
-            selected_block_ids=effective_block_ids or None,
-            selected_session_ids=effective_session_ids or None,
-            selected_only=False,
-            closed_only=True,
-            allow_cross_session_merge=allow_cross_session_merge,
-            max_session_gap_sec=max_session_gap_sec,
-            regime_shift_score_threshold=regime_shift_score_threshold,
-            **_dataset_build_kwargs_for_label_config(
-                {
-                    "threshold": operational_min_total_spread_pct,
-                    "cost_floor_pct": operational_min_total_spread_pct,
-                    "label_percentile": (
-                        max(effective_label_percentiles)
-                        if adaptive_label_mode and effective_label_percentiles
-                        else None
-                    ),
-                    "label_episode_window_days": int(max(label_episode_window_days, 1)) if adaptive_label_mode else None,
-                    "label_threshold_mode": "rolling_pair_percentile" if adaptive_label_mode else "fixed_threshold",
-                }
-            ),
-        ) if records else None
-        block_diagnostics = dict(bundle.summary.get("block_diagnostics", {})) if bundle is not None else {}
-        total_blocks = max(len(blocks), 1)
+        bundle = (
+            build_dataset_bundle(
+                state_path=state_path,
+                sequence_length=sequence_length,
+                prediction_horizon_sec=prediction_horizon_sec,
+                selected_block_ids=effective_block_ids or None,
+                selected_session_ids=effective_session_ids or None,
+                selected_only=False,
+                closed_only=True,
+                allow_cross_session_merge=allow_cross_session_merge,
+                max_session_gap_sec=max_session_gap_sec,
+                regime_shift_score_threshold=regime_shift_score_threshold,
+                **_dataset_build_kwargs_for_label_config(
+                    {
+                        "threshold": operational_min_total_spread_pct,
+                        "cost_floor_pct": operational_min_total_spread_pct,
+                        "label_percentile": (
+                            max(effective_label_percentiles)
+                            if adaptive_label_mode and effective_label_percentiles
+                            else None
+                        ),
+                        "label_episode_window_days": int(max(label_episode_window_days, 1)) if adaptive_label_mode else None,
+                        "label_threshold_mode": "rolling_pair_percentile" if adaptive_label_mode else "fixed_threshold",
+                    }
+                ),
+            )
+            if records and str(certification_mode).lower() != "quick"
+            else None
+        )
+        if bundle is not None:
+            block_diagnostics = dict(bundle.summary.get("block_diagnostics", {}))
+        total_blocks = max(
+            int(quick_sqlite_metrics["num_blocks"]) if quick_sqlite_metrics is not None else len(blocks),
+            1,
+        )
         interval_p50 = float(block_diagnostics.get("inter_record_interval_sec_quantiles", {}).get("p50", 0.0))
         ratio_p90 = float(block_diagnostics.get("max_to_median_interval_ratio_quantiles", {}).get("p90", 0.0))
         irregular_rate = float(block_diagnostics.get("irregular_block_count", 0) / total_blocks)
-        _persist_gate(_build_gate("gate_02_intra_block_temporal_regularity", "Intra-block temporal regularity", status="FAIL" if (interval_p50 < 12.0 or interval_p50 > 20.0 or ratio_p90 > 3.0 or irregular_rate >= 0.10) else "PASS", failure_reasons=["excessive_intra_block_irregularity"] if (interval_p50 < 12.0 or interval_p50 > 20.0 or ratio_p90 > 3.0 or irregular_rate >= 0.10) else [], details={"total_blocks": len(blocks), "median_interval_p50_sec": interval_p50, "max_to_median_ratio_p90": ratio_p90, "irregular_block_rate": irregular_rate, "block_diagnostics": block_diagnostics}))
+        _persist_gate(_build_gate("gate_02_intra_block_temporal_regularity", "Intra-block temporal regularity", status="FAIL" if (interval_p50 < 12.0 or interval_p50 > 20.0 or ratio_p90 > 3.0 or irregular_rate >= 0.10) else "PASS", failure_reasons=["excessive_intra_block_irregularity"] if (interval_p50 < 12.0 or interval_p50 > 20.0 or ratio_p90 > 3.0 or irregular_rate >= 0.10) else [], details={"total_blocks": total_blocks, "median_interval_p50_sec": interval_p50, "max_to_median_ratio_p90": ratio_p90, "irregular_block_rate": irregular_rate, "block_diagnostics": block_diagnostics}))
 
         _check_timeout()
-        pair_presence = {pair_id: [pair_id in set(bucket["pairs"]) for bucket in checkpoint_buckets] for pair_id in pair_ids}
         disappeared_pairs = []
         intermittent_pairs = []
-        for pair_id, presence in pair_presence.items():
-            if not any(presence):
-                continue
-            first = presence.index(True)
-            last = len(presence) - 1 - presence[::-1].index(True)
-            if last < len(presence) - 1:
-                disappeared_pairs.append(pair_id)
-            if any(not value for value in presence[first:last + 1]):
-                intermittent_pairs.append(pair_id)
+        if quick_sqlite_metrics is not None:
+            checkpoint_count = int(quick_sqlite_metrics["checkpoint_count"])
+            pair_presence_sets = dict(quick_sqlite_metrics["pair_checkpoint_presence"])
+            for pair_id in pair_ids:
+                presence_set = {int(value) for value in pair_presence_sets.get(pair_id, set())}
+                if not presence_set:
+                    continue
+                first = min(presence_set)
+                last = max(presence_set)
+                if checkpoint_count > 0 and last < checkpoint_count - 1:
+                    disappeared_pairs.append(pair_id)
+                if len(presence_set) < (last - first + 1):
+                    intermittent_pairs.append(pair_id)
+            records_per_pair_per_hour = float(
+                int(quick_sqlite_metrics["records_total"])
+                / max(len(pair_ids) * max(session_hours, 1.0 / 3600.0), 1.0)
+            )
+        else:
+            pair_presence = {pair_id: [pair_id in set(bucket["pairs"]) for bucket in checkpoint_buckets] for pair_id in pair_ids}
+            for pair_id, presence in pair_presence.items():
+                if not any(presence):
+                    continue
+                first = presence.index(True)
+                last = len(presence) - 1 - presence[::-1].index(True)
+                if last < len(presence) - 1:
+                    disappeared_pairs.append(pair_id)
+                if any(not value for value in presence[first:last + 1]):
+                    intermittent_pairs.append(pair_id)
+            records_per_pair_per_hour = float(len(records) / max(len(pair_ids) * max(session_hours, 1.0 / 3600.0), 1.0))
         active_pair_count = max(len(pair_ids), 1)
         disappeared_rate = float(len(disappeared_pairs) / active_pair_count)
         intermittent_rate = float(len(intermittent_pairs) / active_pair_count)
-        records_per_pair_per_hour = float(len(records) / max(len(pair_ids) * max(session_hours, 1.0 / 3600.0), 1.0))
         recommendations: list[str] = []
         if rejection_stats and (disappeared_rate >= 0.05 or intermittent_rate >= 0.03 or records_per_pair_per_hour < 100.0):
             top_pair = next(iter(dict(rejection_stats.get("rejection_rate_by_pair") or {}).items()), None)
@@ -832,7 +1213,7 @@ def run_training_certification(
             completeness_failures.append("pair_completeness_degraded")
         if records_per_pair_per_hour < 100.0:
             completeness_failures.append("insufficient_record_density")
-        _persist_gate(_build_gate("gate_03_completeness", "Completeness", status="FAIL" if completeness_failures else "PASS", failure_reasons=completeness_failures, recommendations=recommendations, details={"active_pair_count": len(pair_ids), "checkpoint_count": len(checkpoint_buckets), "records_per_pair_per_hour": records_per_pair_per_hour, "disappeared_pairs": disappeared_pairs[:50], "intermittent_pairs": intermittent_pairs[:50], "disappeared_pair_rate": disappeared_rate, "intermittent_pair_rate": intermittent_rate, "hot_path_rejection_stats": rejection_stats}))
+        _persist_gate(_build_gate("gate_03_completeness", "Completeness", status="FAIL" if completeness_failures else "PASS", failure_reasons=completeness_failures, recommendations=recommendations, details={"active_pair_count": len(pair_ids), "checkpoint_count": int(quick_sqlite_metrics["checkpoint_count"]) if quick_sqlite_metrics is not None else len(checkpoint_buckets), "records_per_pair_per_hour": records_per_pair_per_hour, "disappeared_pairs": disappeared_pairs[:50], "intermittent_pairs": intermittent_pairs[:50], "disappeared_pair_rate": disappeared_rate, "intermittent_pair_rate": intermittent_rate, "hot_path_rejection_stats": rejection_stats}))
 
         _check_timeout()
         if certification_mode == "quick":
@@ -863,12 +1244,21 @@ def run_training_certification(
             _persist_gate(_build_gate("gate_05_intra_soak_feature_drift", "Intra-soak feature drift", status=gate05_status, failure_reasons=["intra_soak_feature_drift"] if len(drifted_features) > 3 else [], warnings=["intra_soak_feature_drift"] if 0 < len(drifted_features) <= 3 else [], details={"drifted_features": drifted_features, "feature_count": len(getattr(bundle, "feature_names", FEATURE_NAMES)) if bundle is not None else len(FEATURE_NAMES)}))
 
         _check_timeout()
-        total_spreads = [float(getattr(item, "total_spread", 0.0) or 0.0) for item in episodes]
-        durations = [float(getattr(item, "duration_sec", 0.0) or 0.0) for item in episodes]
-        episodes_per_hour = float(len(episodes) / max(session_hours, 1.0 / 3600.0))
+        total_spreads = (
+            [float(value) for value in quick_sqlite_metrics["episode_total_spreads"]]
+            if quick_sqlite_metrics is not None
+            else [float(getattr(item, "total_spread", 0.0) or 0.0) for item in episodes]
+        )
+        durations = (
+            [float(value) for value in quick_sqlite_metrics["episode_durations"]]
+            if quick_sqlite_metrics is not None
+            else [float(getattr(item, "duration_sec", 0.0) or 0.0) for item in episodes]
+        )
+        episode_count = len(total_spreads)
+        episodes_per_hour = float(episode_count / max(session_hours, 1.0 / 3600.0))
         gate06_failures = []
         gate06_warnings = []
-        if len(episodes) <= 0:
+        if episode_count <= 0:
             gate06_failures.append("no_qualified_episodes")
         elif episodes_per_hour < 0.5:
             gate06_failures.append("insufficient_episode_yield")
@@ -876,7 +1266,7 @@ def run_training_certification(
             gate06_warnings.append("insufficient_episode_yield")
         if total_spreads and (_percentile(total_spreads, 50.0) < operational_min_total_spread_pct or _percentile(durations, 50.0) <= 60.0 or _percentile(durations, 50.0) >= float(prediction_horizon_sec)):
             gate06_failures.append("episode_quality_degraded")
-        _persist_gate(_build_gate("gate_06_episode_yield", "Episode yield", status="FAIL" if gate06_failures else ("WARNING" if gate06_warnings else "PASS"), failure_reasons=gate06_failures, warnings=gate06_warnings, details={"episode_count": len(episodes), "episodes_per_hour": episodes_per_hour, "total_spread_quantiles": {"p50": _percentile(total_spreads, 50.0), "p90": _percentile(total_spreads, 90.0)}, "duration_sec_quantiles": {"p50": _percentile(durations, 50.0), "p90": _percentile(durations, 90.0)}}))
+        _persist_gate(_build_gate("gate_06_episode_yield", "Episode yield", status="FAIL" if gate06_failures else ("WARNING" if gate06_warnings else "PASS"), failure_reasons=gate06_failures, warnings=gate06_warnings, details={"episode_count": episode_count, "episodes_per_hour": episodes_per_hour, "total_spread_quantiles": {"p50": _percentile(total_spreads, 50.0), "p90": _percentile(total_spreads, 90.0)}, "duration_sec_quantiles": {"p50": _percentile(durations, 50.0), "p90": _percentile(durations, 90.0)}}))
 
         _check_timeout()
         if certification_mode == "quick":
@@ -986,139 +1376,165 @@ def run_training_certification(
             _persist_gate(_build_gate("gate_08_reconnection_stress", "Reconnection stress", status="FAIL" if disconnects > reconnects else "PASS", failure_reasons=["reconnection_stress_failed"] if disconnects > reconnects else [], details={"executed": True, "disconnect_count": disconnects, "reconnect_count": reconnects}))
 
         _check_timeout()
-        dual_summary: list[dict[str, Any]] = []
-        qualifying_configs: list[str] = []
-        failure_counter: Counter[str] = Counter()
-        for config in DEFAULT_DUAL_PREFLIGHT_CONFIGS:
-            config_entry: dict[str, Any] = {"sequence_length": int(config["sequence_length"]), "prediction_horizon_sec": int(config["prediction_horizon_sec"])}
-            for merge_enabled, key in ((False, "merge_off"), (True, "merge_on")):
-                preflight = preflight_fn(
-                    state_file=state_path,
-                    sequence_length=int(config["sequence_length"]),
-                    prediction_horizon_sec=int(config["prediction_horizon_sec"]),
-                    thresholds=list(threshold_values),
-                    label_percentiles=list(effective_label_percentiles) if adaptive_label_mode else None,
-                    label_episode_window_days=int(max(label_episode_window_days, 1)),
-                    selected_session_ids=effective_session_ids or None,
-                    selected_block_ids=effective_block_ids or None,
-                    allow_cross_session_merge=merge_enabled,
-                    max_session_gap_sec=max_session_gap_sec,
-                    regime_shift_score_threshold=regime_shift_score_threshold,
-                    min_train_positive_samples=1,
-                    min_val_positive_samples=1,
-                    min_test_positive_samples=1,
+        if str(certification_mode).lower() == "quick":
+            _persist_gate(
+                _build_gate(
+                    "gate_10_dual_mode_preflight",
+                    "Dual-mode preflight",
+                    status="SKIPPED",
+                    warnings=["dual_preflight_skipped_in_quick_mode"],
+                    details={"executed": False, "reason": "quick_mode"},
                 )
-                fingerprint_threshold = float(preflight.get("selected_threshold") or operational_min_total_spread_pct)
-                selected_label_config = _label_config_payload(preflight.get("selected_label_config"))
-                try:
-                    config_bundle = build_dataset_bundle(
-                        state_path=state_path,
+            )
+        else:
+            dual_summary: list[dict[str, Any]] = []
+            qualifying_configs: list[str] = []
+            failure_counter: Counter[str] = Counter()
+            for config in DEFAULT_DUAL_PREFLIGHT_CONFIGS:
+                config_entry: dict[str, Any] = {"sequence_length": int(config["sequence_length"]), "prediction_horizon_sec": int(config["prediction_horizon_sec"])}
+                for merge_enabled, key in ((False, "merge_off"), (True, "merge_on")):
+                    preflight = preflight_fn(
+                        state_file=state_path,
                         sequence_length=int(config["sequence_length"]),
                         prediction_horizon_sec=int(config["prediction_horizon_sec"]),
-                        selected_block_ids=effective_block_ids or None,
-                        selected_session_ids=effective_session_ids or None,
-                        selected_only=False,
-                        closed_only=True,
-                        allow_cross_session_merge=merge_enabled,
-                        max_session_gap_sec=max_session_gap_sec,
-                        regime_shift_score_threshold=regime_shift_score_threshold,
-                        **_dataset_build_kwargs_for_label_config(
-                            selected_label_config or {
-                                "threshold": fingerprint_threshold,
-                                "cost_floor_pct": fingerprint_threshold,
-                                "label_percentile": None,
-                                "label_episode_window_days": None,
-                                "label_threshold_mode": "fixed_threshold",
-                            }
-                        ),
-                    )
-                    fingerprint = dataset_fingerprint_fn(
-                        state_path=state_path,
-                        bundle=config_bundle,
-                        min_total_spread_pct=fingerprint_threshold,
-                        label_cost_floor_pct=(
-                            float(selected_label_config["cost_floor_pct"])
-                            if selected_label_config
-                            and selected_label_config.get("label_threshold_mode") == "rolling_pair_percentile"
-                            else None
-                        ),
-                        label_percentile=(
-                            int(selected_label_config["label_percentile"])
-                            if selected_label_config and selected_label_config.get("label_percentile") is not None
-                            else None
-                        ),
-                        label_episode_window_days=(
-                            int(selected_label_config["label_episode_window_days"])
-                            if selected_label_config and selected_label_config.get("label_episode_window_days") is not None
-                            else None
-                        ),
-                        label_threshold_mode=str(selected_label_config.get("label_threshold_mode") or "fixed_threshold"),
+                        thresholds=list(threshold_values),
+                        label_percentiles=list(effective_label_percentiles) if adaptive_label_mode else None,
+                        label_episode_window_days=int(max(label_episode_window_days, 1)),
                         selected_session_ids=effective_session_ids or None,
                         selected_block_ids=effective_block_ids or None,
                         allow_cross_session_merge=merge_enabled,
                         max_session_gap_sec=max_session_gap_sec,
                         regime_shift_score_threshold=regime_shift_score_threshold,
+                        min_train_positive_samples=1,
+                        min_val_positive_samples=1,
+                        min_test_positive_samples=1,
                     )
-                except Exception:
-                    fingerprint = ""
-                fingerprint_key = f"seq{config['sequence_length']}_h{config['prediction_horizon_sec']}_{key}"
-                if fingerprint:
-                    dataset_fingerprints[fingerprint_key] = fingerprint
-                reason_list = [
-                    reason
-                    for threshold_entry in dict(preflight.get("thresholds", {})).values()
-                    if isinstance(threshold_entry, dict)
-                    for reason in list(threshold_entry.get("failure_reasons") or [])
-                ]
-                config_entry[key] = {
-                    "qualifies_for_training": bool(preflight.get("qualifies_for_training")),
-                    "selected_threshold": preflight.get("selected_threshold"),
-                    "selected_label_config": dict(selected_label_config),
-                    "selection_mode": preflight.get("selection_mode"),
-                    "failure_reasons": reason_list,
-                    "dataset_fingerprint": fingerprint,
-                }
-                if bool(preflight.get("qualifies_for_training")):
-                    qualifying_configs.append(f"{fingerprint_key}:{preflight.get('selected_threshold')}")
-                else:
-                    failure_counter.update(reason_list)
-            dual_summary.append(config_entry)
-        _persist_gate(_build_gate("gate_10_dual_mode_preflight", "Dual-mode preflight", status="PASS" if qualifying_configs else "FAIL", failure_reasons=list(failure_counter.keys()) if not qualifying_configs else [], details={"qualifying_configs": qualifying_configs, "configs": dual_summary, "dataset_fingerprints": dataset_fingerprints}))
+                    fingerprint_threshold = float(preflight.get("selected_threshold") or operational_min_total_spread_pct)
+                    selected_label_config = _label_config_payload(preflight.get("selected_label_config"))
+                    try:
+                        config_bundle = build_dataset_bundle(
+                            state_path=state_path,
+                            sequence_length=int(config["sequence_length"]),
+                            prediction_horizon_sec=int(config["prediction_horizon_sec"]),
+                            selected_block_ids=effective_block_ids or None,
+                            selected_session_ids=effective_session_ids or None,
+                            selected_only=False,
+                            closed_only=True,
+                            allow_cross_session_merge=merge_enabled,
+                            max_session_gap_sec=max_session_gap_sec,
+                            regime_shift_score_threshold=regime_shift_score_threshold,
+                            **_dataset_build_kwargs_for_label_config(
+                                selected_label_config or {
+                                    "threshold": fingerprint_threshold,
+                                    "cost_floor_pct": fingerprint_threshold,
+                                    "label_percentile": None,
+                                    "label_episode_window_days": None,
+                                    "label_threshold_mode": "fixed_threshold",
+                                }
+                            ),
+                        )
+                        fingerprint = dataset_fingerprint_fn(
+                            state_path=state_path,
+                            bundle=config_bundle,
+                            min_total_spread_pct=fingerprint_threshold,
+                            label_cost_floor_pct=(
+                                float(selected_label_config["cost_floor_pct"])
+                                if selected_label_config
+                                and selected_label_config.get("label_threshold_mode") == "rolling_pair_percentile"
+                                else None
+                            ),
+                            label_percentile=(
+                                int(selected_label_config["label_percentile"])
+                                if selected_label_config and selected_label_config.get("label_percentile") is not None
+                                else None
+                            ),
+                            label_episode_window_days=(
+                                int(selected_label_config["label_episode_window_days"])
+                                if selected_label_config and selected_label_config.get("label_episode_window_days") is not None
+                                else None
+                            ),
+                            label_threshold_mode=str(selected_label_config.get("label_threshold_mode") or "fixed_threshold"),
+                            selected_session_ids=effective_session_ids or None,
+                            selected_block_ids=effective_block_ids or None,
+                            allow_cross_session_merge=merge_enabled,
+                            max_session_gap_sec=max_session_gap_sec,
+                            regime_shift_score_threshold=regime_shift_score_threshold,
+                        )
+                    except Exception:
+                        fingerprint = ""
+                    fingerprint_key = f"seq{config['sequence_length']}_h{config['prediction_horizon_sec']}_{key}"
+                    if fingerprint:
+                        dataset_fingerprints[fingerprint_key] = fingerprint
+                    reason_list = [
+                        reason
+                        for threshold_entry in dict(preflight.get("thresholds", {})).values()
+                        if isinstance(threshold_entry, dict)
+                        for reason in list(threshold_entry.get("failure_reasons") or [])
+                    ]
+                    config_entry[key] = {
+                        "qualifies_for_training": bool(preflight.get("qualifies_for_training")),
+                        "selected_threshold": preflight.get("selected_threshold"),
+                        "selected_label_config": dict(selected_label_config),
+                        "selection_mode": preflight.get("selection_mode"),
+                        "failure_reasons": reason_list,
+                        "dataset_fingerprint": fingerprint,
+                    }
+                    if bool(preflight.get("qualifies_for_training")):
+                        qualifying_configs.append(f"{fingerprint_key}:{preflight.get('selected_threshold')}")
+                    else:
+                        failure_counter.update(reason_list)
+                dual_summary.append(config_entry)
+            _persist_gate(_build_gate("gate_10_dual_mode_preflight", "Dual-mode preflight", status="PASS" if qualifying_configs else "FAIL", failure_reasons=list(failure_counter.keys()) if not qualifying_configs else [], details={"qualifying_configs": qualifying_configs, "configs": dual_summary, "dataset_fingerprints": dataset_fingerprints}))
 
         _check_timeout()
-        pair_hour_buckets = _pair_hour_buckets(records)
-        pair_hour_counts: Counter[str] = Counter()
-        frozen_entry_hours: Counter[str] = Counter()
-        frozen_exit_hours: Counter[str] = Counter()
-        unresponsive_exit_hours: Counter[str] = Counter()
-        entry_outlier_hours: Counter[str] = Counter()
-        exit_outlier_hours: Counter[str] = Counter()
-        pearson_by_pair: dict[str, float] = {}
-        for (pair_id, _hour_bucket), bucket_records in pair_hour_buckets.items():
-            pair_hour_counts[pair_id] += 1
-            entry_values = [float(item["entry_spread"]) for item in bucket_records]
-            exit_values = [float(item["exit_spread"]) for item in bucket_records]
-            entry_std = float(np.std(np.asarray(entry_values, dtype=float))) if entry_values else 0.0
-            exit_std = float(np.std(np.asarray(exit_values, dtype=float))) if exit_values else 0.0
-            if entry_std <= 1e-4 or _zero_return_ratio(entry_values) >= 0.80:
-                frozen_entry_hours[pair_id] += 1
-            if exit_std <= 1e-4 or _zero_return_ratio(exit_values) >= 0.80:
-                frozen_exit_hours[pair_id] += 1
-            if entry_std > 1e-4 and exit_std <= 1e-4:
-                unresponsive_exit_hours[pair_id] += 1
-            entry_median = _median(entry_values)
-            exit_median = _median(exit_values)
-            entry_mad = max(_mad(entry_values, entry_median), 0.01)
-            exit_mad = max(_mad(exit_values, exit_median), 0.01)
-            if entry_values and sum(1 for value in entry_values if abs(value - entry_median) > 10.0 * entry_mad) / len(entry_values) > 0.05:
-                entry_outlier_hours[pair_id] += 1
-            if exit_values and sum(1 for value in exit_values if abs(value - exit_median) > 10.0 * exit_mad) / len(exit_values) > 0.05:
-                exit_outlier_hours[pair_id] += 1
-            if len(entry_values) >= 2 and len(exit_values) >= 2:
-                if float(np.std(np.asarray(entry_values, dtype=float))) <= 1e-12 or float(np.std(np.asarray(exit_values, dtype=float))) <= 1e-12:
-                    pearson_by_pair[pair_id] = 0.0
-                else:
-                    pearson_by_pair[pair_id] = float(np.corrcoef(np.asarray(entry_values), np.asarray(exit_values))[0, 1])
+        if quick_sqlite_metrics is not None:
+            pair_hour_counts = Counter(quick_sqlite_metrics["pair_hour_counts"])
+            frozen_entry_hours = Counter(quick_sqlite_metrics["frozen_entry_hours"])
+            frozen_exit_hours = Counter(quick_sqlite_metrics["frozen_exit_hours"])
+            unresponsive_exit_hours = Counter(quick_sqlite_metrics["unresponsive_exit_hours"])
+            entry_outlier_hours = Counter(quick_sqlite_metrics["entry_outlier_hours"])
+            exit_outlier_hours = Counter(quick_sqlite_metrics["exit_outlier_hours"])
+            pearson_by_pair = dict(quick_sqlite_metrics["pearson_by_pair"])
+            episode_peaks = [float(value) for value in quick_sqlite_metrics["episode_peaks"]]
+            episode_exits = [float(value) for value in quick_sqlite_metrics["episode_exits"]]
+            bilateral_zero_rate = float(quick_sqlite_metrics["bilateral_zero_rate"])
+        else:
+            pair_hour_buckets = _pair_hour_buckets(records)
+            pair_hour_counts = Counter()
+            frozen_entry_hours = Counter()
+            frozen_exit_hours = Counter()
+            unresponsive_exit_hours = Counter()
+            entry_outlier_hours = Counter()
+            exit_outlier_hours = Counter()
+            pearson_by_pair: dict[str, float] = {}
+            for (pair_id, _hour_bucket), bucket_records in pair_hour_buckets.items():
+                pair_hour_counts[pair_id] += 1
+                entry_values = [float(item["entry_spread"]) for item in bucket_records]
+                exit_values = [float(item["exit_spread"]) for item in bucket_records]
+                entry_std = float(np.std(np.asarray(entry_values, dtype=float))) if entry_values else 0.0
+                exit_std = float(np.std(np.asarray(exit_values, dtype=float))) if exit_values else 0.0
+                if entry_std <= 1e-4 or _zero_return_ratio(entry_values) >= 0.80:
+                    frozen_entry_hours[pair_id] += 1
+                if exit_std <= 1e-4 or _zero_return_ratio(exit_values) >= 0.80:
+                    frozen_exit_hours[pair_id] += 1
+                if entry_std > 1e-4 and exit_std <= 1e-4:
+                    unresponsive_exit_hours[pair_id] += 1
+                entry_median = _median(entry_values)
+                exit_median = _median(exit_values)
+                entry_mad = max(_mad(entry_values, entry_median), 0.01)
+                exit_mad = max(_mad(exit_values, exit_median), 0.01)
+                if entry_values and sum(1 for value in entry_values if abs(value - entry_median) > 10.0 * entry_mad) / len(entry_values) > 0.05:
+                    entry_outlier_hours[pair_id] += 1
+                if exit_values and sum(1 for value in exit_values if abs(value - exit_median) > 10.0 * exit_mad) / len(exit_values) > 0.05:
+                    exit_outlier_hours[pair_id] += 1
+                if len(entry_values) >= 2 and len(exit_values) >= 2:
+                    if float(np.std(np.asarray(entry_values, dtype=float))) <= 1e-12 or float(np.std(np.asarray(exit_values, dtype=float))) <= 1e-12:
+                        pearson_by_pair[pair_id] = 0.0
+                    else:
+                        pearson_by_pair[pair_id] = float(np.corrcoef(np.asarray(entry_values), np.asarray(exit_values))[0, 1])
+            episode_peaks = [float(getattr(item, "peak_entry_spread", 0.0) or 0.0) for item in episodes]
+            episode_exits = [float(getattr(item, "exit_spread_at_close", 0.0) or 0.0) for item in episodes]
+            bilateral_zero_rate = float(sum(1 for item in records if abs(float(item["entry_spread"])) <= 1e-12 and abs(float(item["exit_spread"])) <= 1e-12) / max(len(records), 1))
         pair_count = max(len(pair_hour_counts), 1)
         frozen_entry_pairs = [pair_id for pair_id, total_hours in pair_hour_counts.items() if float(frozen_entry_hours.get(pair_id, 0) / max(total_hours, 1)) > 0.50]
         frozen_exit_pairs = [pair_id for pair_id, total_hours in pair_hour_counts.items() if float(frozen_exit_hours.get(pair_id, 0) / max(total_hours, 1)) > 0.50]
@@ -1127,7 +1543,6 @@ def run_training_certification(
         unresponsive_pairs = [pair_id for pair_id in eligible_pairs if float(unresponsive_exit_hours.get(pair_id, 0) / max(pair_hour_counts.get(pair_id, 0), 1)) > 0.05]
         entry_outlier_pairs = [pair_id for pair_id, total_hours in pair_hour_counts.items() if float(entry_outlier_hours.get(pair_id, 0) / max(total_hours, 1)) > 0.05]
         exit_outlier_pairs = [pair_id for pair_id, total_hours in pair_hour_counts.items() if float(exit_outlier_hours.get(pair_id, 0) / max(total_hours, 1)) > 0.05]
-        bilateral_zero_rate = float(sum(1 for item in records if abs(float(item["entry_spread"])) <= 1e-12 and abs(float(item["exit_spread"])) <= 1e-12) / max(len(records), 1))
         gate12_failures = []
         if len(frozen_pairs) / pair_count > 0.05:
             if len(frozen_entry_pairs) / pair_count > 0.05:
@@ -1143,8 +1558,6 @@ def run_training_certification(
             gate12_failures.append("exit_outliers_unfiltered")
         if bilateral_zero_rate >= 0.001:
             gate12_failures.append("bilateral_zero_quote_records")
-        episode_peaks = [float(getattr(item, "peak_entry_spread", 0.0) or 0.0) for item in episodes]
-        episode_exits = [float(getattr(item, "exit_spread_at_close", 0.0) or 0.0) for item in episodes]
         entry_episode_median = _median(episode_peaks)
         exit_episode_median = _median(episode_exits)
         entry_episode_mad = max(_mad(episode_peaks, entry_episode_median), 0.01)
@@ -1157,7 +1570,7 @@ def run_training_certification(
             gate12_failures.append("episode_entry_corrupted")
         if any(abs(value) <= 1e-12 or abs(value - exit_episode_median) > 10.0 * exit_episode_mad for value in episode_exits):
             gate12_failures.append("episode_exit_corrupted")
-        _persist_gate(_build_gate("gate_12_entry_exit_quality", "Entry and exit quality", status="FAIL" if gate12_failures else "PASS", failure_reasons=gate12_failures, details={"pair_count": len(pair_hour_counts), "frozen_entry_pairs": frozen_entry_pairs[:50], "frozen_exit_pairs": frozen_exit_pairs[:50], "eligible_pairs_for_responsiveness": len(eligible_pairs), "unresponsive_exit_pairs": unresponsive_pairs[:50], "entry_outlier_pairs": entry_outlier_pairs[:50], "exit_outlier_pairs": exit_outlier_pairs[:50], "bilateral_zero_rate": bilateral_zero_rate, "pearson_correlation_by_pair": pearson_by_pair, "episode_count": len(episodes)}))
+        _persist_gate(_build_gate("gate_12_entry_exit_quality", "Entry and exit quality", status="FAIL" if gate12_failures else "PASS", failure_reasons=gate12_failures, details={"pair_count": len(pair_hour_counts), "frozen_entry_pairs": frozen_entry_pairs[:50], "frozen_exit_pairs": frozen_exit_pairs[:50], "eligible_pairs_for_responsiveness": len(eligible_pairs), "unresponsive_exit_pairs": unresponsive_pairs[:50], "entry_outlier_pairs": entry_outlier_pairs[:50], "exit_outlier_pairs": exit_outlier_pairs[:50], "bilateral_zero_rate": bilateral_zero_rate, "pearson_correlation_by_pair": pearson_by_pair, "episode_count": episode_count}))
     except TimeoutError:
         pass
 

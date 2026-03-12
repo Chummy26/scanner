@@ -334,6 +334,234 @@ def test_run_clean_training_cycle_propagates_certification_id_to_report_and_meta
     assert metadata["training_config"]["certification_id"] == "cert-123"
 
 
+def test_certification_quick_mode_skips_dual_preflight(tmp_path: Path, monkeypatch):
+    state_path = _install_base_mocks(
+        monkeypatch,
+        tmp_path,
+        records=_make_records("PAIR_A"),
+        episodes=[DummyEpisode(1.20, 0.20, 120.0)],
+    )
+
+    def _unexpected_preflight(**kwargs):
+        raise AssertionError("quick mode should skip dual preflight")
+
+    payload = tc.run_training_certification(
+        state_file=state_path,
+        artifact_dir=tmp_path / "artifacts",
+        sequence_length=4,
+        prediction_horizon_sec=240,
+        thresholds=[0.8],
+        selected_session_ids=None,
+        selected_block_ids=None,
+        allow_cross_session_merge=False,
+        max_session_gap_sec=None,
+        regime_shift_score_threshold=3.0,
+        certification_mode="quick",
+        max_certification_duration_sec=300,
+        allow_legacy_sessions=False,
+        runtime_audit_dir=None,
+        run_reconnection_stress=False,
+        preflight_fn=_unexpected_preflight,
+        dataset_fingerprint_fn=_fingerprint,
+    )
+
+    gate10 = payload["gate_results"]["gate_10_dual_mode_preflight"]
+    assert gate10["status"] == "SKIPPED"
+    assert gate10["warnings"] == ["dual_preflight_skipped_in_quick_mode"]
+    assert gate10["details"]["executed"] is False
+
+
+def test_certification_quick_mode_avoids_building_dataset_bundle(tmp_path: Path, monkeypatch):
+    state_path = _install_base_mocks(
+        monkeypatch,
+        tmp_path,
+        records=_make_records("PAIR_A"),
+        episodes=[DummyEpisode(1.20, 0.20, 120.0)],
+    )
+    monkeypatch.setattr(
+        tc,
+        "_build_block_diagnostics",
+        lambda blocks, sequence_length: {
+            "inter_record_interval_sec_quantiles": {"p50": 15.0},
+            "max_to_median_interval_ratio_quantiles": {"p90": 1.2},
+            "irregular_block_count": 0,
+        },
+    )
+    monkeypatch.setattr(
+        tc,
+        "build_dataset_bundle",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("quick mode should not build dataset bundle")),
+    )
+
+    payload = tc.run_training_certification(
+        state_file=state_path,
+        artifact_dir=tmp_path / "artifacts",
+        sequence_length=4,
+        prediction_horizon_sec=240,
+        thresholds=[0.8],
+        selected_session_ids=None,
+        selected_block_ids=None,
+        allow_cross_session_merge=False,
+        max_session_gap_sec=None,
+        regime_shift_score_threshold=3.0,
+        certification_mode="quick",
+        max_certification_duration_sec=300,
+        allow_legacy_sessions=False,
+        runtime_audit_dir=None,
+        run_reconnection_stress=False,
+        preflight_fn=_preflight_ok,
+        dataset_fingerprint_fn=_fingerprint,
+    )
+
+    assert payload["gate_results"]["gate_02_intra_block_temporal_regularity"]["status"] == "PASS"
+    assert payload["gate_results"]["gate_10_dual_mode_preflight"]["status"] == "SKIPPED"
+
+
+def test_certification_quick_mode_streams_sqlite_blocks_without_legacy_loader(tmp_path: Path, monkeypatch):
+    state_path = tmp_path / "quick_stream.sqlite"
+    with sqlite3.connect(state_path) as conn:
+        conn.execute("CREATE TABLE tracker_meta (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO tracker_meta (key, value) VALUES ('quality_fix_activated_at', '0')")
+        conn.execute(
+            """
+            CREATE TABLE tracker_capture_sessions (
+                id INTEGER PRIMARY KEY,
+                started_at REAL,
+                ended_at REAL,
+                status TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE tracker_pairs (
+                id INTEGER PRIMARY KEY,
+                symbol TEXT,
+                buy_ex TEXT,
+                buy_mt TEXT,
+                sell_ex TEXT,
+                sell_mt TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE tracker_pair_blocks (
+                id INTEGER PRIMARY KEY,
+                pair_id INTEGER,
+                session_id INTEGER,
+                start_ts REAL,
+                end_ts REAL,
+                record_count INTEGER,
+                boundary_reason TEXT,
+                selected_for_training INTEGER,
+                is_open INTEGER
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE tracker_records (
+                block_id INTEGER,
+                ts REAL,
+                entry_spread_pct REAL,
+                exit_spread_pct REAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE tracker_events (
+                session_id INTEGER,
+                block_id INTEGER,
+                event_type TEXT,
+                ts REAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE tracker_hourly_health (
+                hour_start_ts REAL,
+                hour_end_ts REAL,
+                records_total INTEGER,
+                records_rejected INTEGER,
+                rejection_rate_pct REAL,
+                exchanges_active INTEGER,
+                exchanges_circuit_open_json TEXT,
+                pairs_with_records INTEGER,
+                pairs_with_gaps INTEGER,
+                cross_exchange_flags INTEGER,
+                avg_book_age_json TEXT,
+                episode_count INTEGER,
+                quality_verdict TEXT,
+                created_at REAL
+            )
+            """
+        )
+        conn.execute("INSERT INTO tracker_capture_sessions (id, started_at, ended_at, status) VALUES (101, 1000.0, 4600.0, 'closed')")
+        conn.execute("INSERT INTO tracker_pairs (id, symbol, buy_ex, buy_mt, sell_ex, sell_mt) VALUES (1, 'PAIR', 'a', 'spot', 'b', 'spot')")
+        conn.execute(
+            """
+            INSERT INTO tracker_pair_blocks (
+                id, pair_id, session_id, start_ts, end_ts, record_count, boundary_reason, selected_for_training, is_open
+            ) VALUES (1001, 1, 101, 1000.0, 1060.0, 3, 'closed', 1, 0)
+            """
+        )
+        conn.executemany(
+            "INSERT INTO tracker_records (block_id, ts, entry_spread_pct, exit_spread_pct) VALUES (?, ?, ?, ?)",
+            [
+                (1001, 1000.0, 0.20, -0.10),
+                (1001, 1015.0, 0.21, -0.09),
+                (1001, 1030.0, 0.22, -0.08),
+            ],
+        )
+        conn.execute(
+            """
+            INSERT INTO tracker_hourly_health (
+                hour_start_ts, hour_end_ts, records_total, records_rejected, rejection_rate_pct, exchanges_active,
+                exchanges_circuit_open_json, pairs_with_records, pairs_with_gaps, cross_exchange_flags,
+                avg_book_age_json, episode_count, quality_verdict, created_at
+            ) VALUES (1000.0, 4600.0, 3, 0, 0.0, 2, '[]', 1, 0, 0, '{}', 0, 'healthy', 4600.0)
+            """
+        )
+        conn.commit()
+
+    monkeypatch.setattr(
+        tc,
+        "_load_blocks_from_sqlite",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("quick sqlite mode should stream directly from sqlite")),
+    )
+    monkeypatch.setattr(
+        tc,
+        "build_dataset_bundle",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("quick sqlite mode should not build dataset bundle")),
+    )
+
+    payload = tc.run_training_certification(
+        state_file=state_path,
+        artifact_dir=tmp_path / "artifacts",
+        sequence_length=3,
+        prediction_horizon_sec=240,
+        thresholds=[0.8],
+        selected_session_ids=None,
+        selected_block_ids=None,
+        allow_cross_session_merge=False,
+        max_session_gap_sec=None,
+        regime_shift_score_threshold=3.0,
+        certification_mode="quick",
+        max_certification_duration_sec=300,
+        allow_legacy_sessions=False,
+        runtime_audit_dir=None,
+        run_reconnection_stress=False,
+        preflight_fn=_preflight_ok,
+        dataset_fingerprint_fn=_fingerprint,
+    )
+
+    assert payload["gate_results"]["gate_10_dual_mode_preflight"]["status"] == "SKIPPED"
+    assert payload["gate_results"]["gate_02_intra_block_temporal_regularity"]["details"]["total_blocks"] == 1
+
+
 def test_scope_and_integrity_handle_more_than_999_block_ids(tmp_path: Path):
     db_path = tmp_path / "large_scope.sqlite"
     block_count = 1205

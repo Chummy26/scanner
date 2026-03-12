@@ -1855,7 +1855,9 @@ class WSManager:
             await asyncio.sleep(60)
             try:
                 started = time.perf_counter()
-                await asyncio.to_thread(self.tracker.flush_to_storage)
+                flushed = await asyncio.to_thread(self.tracker.flush_to_storage)
+                if not flushed:
+                    logger.warning("[WSManager] Tracker SQLite flush returned False")
                 logger.debug("[WSManager] Tracker SQLite flushed")
                 if self.perf_monitor is not None:
                     self.perf_monitor.record_cache_state(
