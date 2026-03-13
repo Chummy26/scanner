@@ -88,6 +88,7 @@ class XtWS(BaseExchangeWS):
 
         async with websockets.connect(
             ws_url, ping_interval=None, ping_timeout=None,
+            proxy=None,
             max_size=16 * 1024 * 1024,
         ) as ws:
             # XT futures WS silently drops ALL subscriptions if >10 topics per
@@ -173,14 +174,10 @@ class XtWS(BaseExchangeWS):
 
         _fallback_count = 0
         while not self.shutdown.is_set():
-            data = None
-            try:
-                data = await asyncio.to_thread(
-                    _fetch_json_sync, XT_FUTURES_AGG_TICKERS)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
+            data = await self._fetch_json_fallback(
+                XT_FUTURES_AGG_TICKERS,
+                "futures_ticker_fallback",
+            )
 
             if isinstance(data, dict) and data.get("returnCode") == 0:
                 _cycle_updated = 0
@@ -237,14 +234,10 @@ class XtWS(BaseExchangeWS):
 
         _cycle = 0
         while not self.shutdown.is_set():
-            data = None
-            try:
-                data = await asyncio.to_thread(
-                    _fetch_json_sync, XT_SPOT_BOOK_TICKERS)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
+            data = await self._fetch_json_fallback(
+                XT_SPOT_BOOK_TICKERS,
+                "spot_ticker_fallback",
+            )
 
             if isinstance(data, dict) and data.get("rc") == 0:
                 _updated = 0

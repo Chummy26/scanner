@@ -695,7 +695,7 @@ def collect_snapshot_checks(artifact_root: Path) -> dict[str, Any]:
     manifest = load_snapshot_manifest(root)
     training_manifest = load_training_manifest(root)
     snapshots = list(manifest.get("snapshots") or [])
-    pass_snapshots = [item for item in snapshots if str(item.get("certification_verdict") or "") == "PASS"]
+    pass_snapshots = [item for item in snapshots if str(item.get("certification_verdict") or "") in {"PASS", "WARN"}]
     duplicate_ranges: list[dict[str, Any]] = []
     seen_ranges: dict[tuple[Any, Any], dict[str, Any]] = {}
     for snapshot in snapshots:

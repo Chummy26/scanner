@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,7 +40,13 @@ def _make_records(pair_id: str, *, points: int = 120, start_ts: float = 0.0, ste
     ]
 
 
-def _make_bundle(num_samples: int = 48, *, irregular_blocks: int = 0) -> SimpleNamespace:
+def _make_bundle(
+    num_samples: int = 48,
+    *,
+    irregular_blocks: int = 0,
+    interval_p50: float = 15.0,
+    ratio_p90: float = 1.2,
+) -> SimpleNamespace:
     feature_count = 10
     rows = torch.full((num_samples, 2, feature_count), 0.25, dtype=torch.float32)
     return SimpleNamespace(
@@ -50,8 +57,8 @@ def _make_bundle(num_samples: int = 48, *, irregular_blocks: int = 0) -> SimpleN
         summary={
             "num_samples": num_samples,
             "block_diagnostics": {
-                "inter_record_interval_sec_quantiles": {"p50": 15.0},
-                "max_to_median_interval_ratio_quantiles": {"p90": 1.2},
+                "inter_record_interval_sec_quantiles": {"p50": interval_p50},
+                "max_to_median_interval_ratio_quantiles": {"p90": ratio_p90},
                 "irregular_block_count": irregular_blocks,
             },
         },
@@ -68,6 +75,7 @@ def _install_base_mocks(
     rejection_stats: dict | None = None,
     runtime_package: dict | None = None,
     bundle: SimpleNamespace | None = None,
+    integrity_anomalies: dict | None = None,
 ):
     state_path = tmp_path / "tracker.sqlite"
     sqlite3.connect(state_path).close()
@@ -100,6 +108,7 @@ def _install_base_mocks(
                 "range_mismatches": 0,
                 "missing_event_blocks": 0,
                 "open_blocks_after_close": 0,
+                **(integrity_anomalies or {}),
             },
         },
     )
@@ -165,6 +174,77 @@ def test_certification_missing_runtime_audit_is_non_blocking_and_writes_artifact
     assert payload["gate_results"]["gate_11_runtime_audit_health"]["warnings"] == ["runtime_audit_unavailable"]
 
 
+def test_certification_gate1_treats_missing_event_blocks_as_warning(tmp_path: Path, monkeypatch):
+    state_path = _install_base_mocks(
+        monkeypatch,
+        tmp_path,
+        records=_make_records("PAIR_A") + _make_records("PAIR_B", start_ts=15.0),
+        episodes=[DummyEpisode(1.20, 0.20, 120.0), DummyEpisode(1.15, 0.18, 140.0)],
+        integrity_anomalies={"missing_event_blocks": 7},
+    )
+
+    payload = tc.run_training_certification(
+        state_file=state_path,
+        artifact_dir=tmp_path / "artifacts",
+        sequence_length=4,
+        prediction_horizon_sec=240,
+        thresholds=[0.8],
+        selected_session_ids=None,
+        selected_block_ids=None,
+        allow_cross_session_merge=False,
+        max_session_gap_sec=None,
+        regime_shift_score_threshold=3.0,
+        certification_mode="full",
+        max_certification_duration_sec=300,
+        allow_legacy_sessions=False,
+        runtime_audit_dir=None,
+        run_reconnection_stress=False,
+        preflight_fn=_preflight_ok,
+        dataset_fingerprint_fn=_fingerprint,
+    )
+
+    gate01 = payload["gate_results"]["gate_01_sqlite_integrity"]
+    assert gate01["status"] == "WARNING"
+    assert gate01["failure_reasons"] == []
+    assert gate01["warnings"] == ["missing_event_blocks"]
+    assert gate01["details"]["structural_integrity_failures"] == []
+
+
+def test_certification_gate2_accepts_runtime_interval_near_30_seconds(tmp_path: Path, monkeypatch):
+    state_path = _install_base_mocks(
+        monkeypatch,
+        tmp_path,
+        records=_make_records("PAIR_A") + _make_records("PAIR_B", start_ts=15.0),
+        episodes=[DummyEpisode(1.20, 0.20, 120.0), DummyEpisode(1.15, 0.18, 140.0)],
+        bundle=_make_bundle(interval_p50=32.0, ratio_p90=1.9),
+    )
+
+    payload = tc.run_training_certification(
+        state_file=state_path,
+        artifact_dir=tmp_path / "artifacts",
+        sequence_length=4,
+        prediction_horizon_sec=240,
+        thresholds=[0.8],
+        selected_session_ids=None,
+        selected_block_ids=None,
+        allow_cross_session_merge=False,
+        max_session_gap_sec=None,
+        regime_shift_score_threshold=3.0,
+        certification_mode="full",
+        max_certification_duration_sec=300,
+        allow_legacy_sessions=False,
+        runtime_audit_dir=None,
+        run_reconnection_stress=False,
+        preflight_fn=_preflight_ok,
+        dataset_fingerprint_fn=_fingerprint,
+    )
+
+    gate02 = payload["gate_results"]["gate_02_intra_block_temporal_regularity"]
+    assert gate02["status"] == "PASS"
+    assert gate02["details"]["median_interval_p50_sec"] == pytest.approx(32.0)
+    assert gate02["details"]["expected_interval_ceiling_sec"] == pytest.approx(40.0)
+
+
 def test_certification_gate3_reports_hot_path_rejection_context(tmp_path: Path, monkeypatch):
     sparse_records = _make_records("PAIR_A", points=8, step_sec=600.0) + _make_records("PAIR_B", points=8, start_ts=1800.0, step_sec=600.0)
     state_path = _install_base_mocks(
@@ -204,6 +284,155 @@ def test_certification_gate3_reports_hot_path_rejection_context(tmp_path: Path, 
     assert "top_pair" in gate03["recommendations"][0]
 
 
+def test_certification_gate3_scales_density_and_filters_sparse_pairs_in_quick_mode(tmp_path: Path, monkeypatch):
+    state_path = _install_base_mocks(
+        monkeypatch,
+        tmp_path,
+        records=[],
+        episodes=[],
+        runtime_hours=2.0,
+        rejection_stats={
+            "rejection_rate_by_pair": {"PAIR_0000": 0.42},
+            "rejection_rate_by_exchange": {"gate": 0.35},
+        },
+    )
+    pair_ids = [f"PAIR_{index:04d}" for index in range(400)]
+    pair_record_counts = Counter({pair_id: 24 for pair_id in pair_ids})
+    pair_checkpoint_presence = {pair_id: {0, 1, 2, 3} for pair_id in pair_ids}
+    for pair_id in pair_ids[:80]:
+        pair_checkpoint_presence[pair_id] = {0, 1, 2}
+    for pair_id in pair_ids[80:140]:
+        pair_checkpoint_presence[pair_id] = {0, 1, 3}
+
+    monkeypatch.setattr(
+        tc,
+        "_stream_quick_sqlite_metrics",
+        lambda *args, **kwargs: {
+            "pair_ids": pair_ids,
+            "pair_record_counts": pair_record_counts,
+            "pair_checkpoint_presence": pair_checkpoint_presence,
+            "checkpoint_count": 4,
+            "records_total": 9_600,
+            "episode_total_spreads": [0.15, 0.20, 0.25, 0.30, 0.35, 0.40],
+            "episode_durations": [45.0, 50.0, 55.0, 60.0, 65.0, 70.0],
+            "episode_peaks": [1.0 + (index % 7) * 0.01 for index in range(60)],
+            "episode_exits": [0.2 + (index % 5) * 0.01 for index in range(60)],
+            "pair_hour_counts": Counter({pair_id: 2 for pair_id in pair_ids}),
+            "frozen_entry_hours": Counter(),
+            "frozen_exit_hours": Counter(),
+            "unresponsive_exit_hours": Counter(),
+            "entry_outlier_hours": Counter(),
+            "exit_outlier_hours": Counter(),
+            "pearson_by_pair": {},
+            "bilateral_zero_rate": 0.0,
+            "num_blocks": 800,
+            "block_diagnostics": {
+                "inter_record_interval_sec_quantiles": {"p50": 31.0},
+                "max_to_median_interval_ratio_quantiles": {"p90": 1.8},
+                "irregular_block_count": 0,
+            },
+        },
+    )
+
+    payload = tc.run_training_certification(
+        state_file=state_path,
+        artifact_dir=tmp_path / "artifacts",
+        sequence_length=4,
+        prediction_horizon_sec=240,
+        thresholds=[0.8],
+        selected_session_ids=None,
+        selected_block_ids=None,
+        allow_cross_session_merge=False,
+        max_session_gap_sec=None,
+        regime_shift_score_threshold=3.0,
+        certification_mode="quick",
+        max_certification_duration_sec=300,
+        allow_legacy_sessions=False,
+        runtime_audit_dir=None,
+        run_reconnection_stress=False,
+        preflight_fn=_preflight_ok,
+        dataset_fingerprint_fn=_fingerprint,
+    )
+
+    gate03 = payload["gate_results"]["gate_03_completeness"]
+    assert gate03["status"] == "WARNING"
+    assert gate03["failure_reasons"] == []
+    assert gate03["warnings"] == ["pair_completeness_degraded"]
+    assert gate03["details"]["completeness_pair_count"] == 400
+    assert gate03["details"]["records_per_pair_per_hour_threshold"] == pytest.approx(10.0)
+    assert gate03["details"]["records_per_pair_per_hour"] == pytest.approx(12.0)
+
+
+def test_certification_gate3_treats_route_ephemerality_as_warning_not_fail(tmp_path: Path, monkeypatch):
+    state_path = _install_base_mocks(
+        monkeypatch,
+        tmp_path,
+        records=[],
+        episodes=[],
+        runtime_hours=2.0,
+    )
+    pair_ids = [f"PAIR_{index:02d}" for index in range(10)]
+    pair_record_counts = Counter({pair_id: 20 for pair_id in pair_ids})
+    pair_checkpoint_presence = {pair_id: {0} for pair_id in pair_ids}
+    pair_checkpoint_presence[pair_ids[-1]] = {0, 1, 2, 3}
+
+    monkeypatch.setattr(
+        tc,
+        "_stream_quick_sqlite_metrics",
+        lambda *args, **kwargs: {
+            "pair_ids": pair_ids,
+            "pair_record_counts": pair_record_counts,
+            "pair_checkpoint_presence": pair_checkpoint_presence,
+            "checkpoint_count": 4,
+            "records_total": 2_000,
+            "episode_total_spreads": [0.20, 0.25, 0.30, 0.35],
+            "episode_durations": [45.0, 50.0, 55.0, 60.0],
+            "episode_peaks": [1.0, 1.1, 1.2, 1.3],
+            "episode_exits": [0.2, 0.3, 0.4, 0.5],
+            "pair_hour_counts": Counter({pair_id: 2 for pair_id in pair_ids}),
+            "frozen_entry_hours": Counter(),
+            "frozen_exit_hours": Counter(),
+            "unresponsive_exit_hours": Counter(),
+            "entry_outlier_hours": Counter(),
+            "exit_outlier_hours": Counter(),
+            "pearson_by_pair": {},
+            "bilateral_zero_rate": 0.0,
+            "num_blocks": 20,
+            "block_diagnostics": {
+                "inter_record_interval_sec_quantiles": {"p50": 31.0},
+                "max_to_median_interval_ratio_quantiles": {"p90": 1.8},
+                "irregular_block_count": 0,
+            },
+        },
+    )
+
+    payload = tc.run_training_certification(
+        state_file=state_path,
+        artifact_dir=tmp_path / "artifacts",
+        sequence_length=4,
+        prediction_horizon_sec=240,
+        thresholds=[0.8],
+        selected_session_ids=None,
+        selected_block_ids=None,
+        allow_cross_session_merge=False,
+        max_session_gap_sec=None,
+        regime_shift_score_threshold=3.0,
+        certification_mode="quick",
+        max_certification_duration_sec=300,
+        allow_legacy_sessions=False,
+        runtime_audit_dir=None,
+        run_reconnection_stress=False,
+        preflight_fn=_preflight_ok,
+        dataset_fingerprint_fn=_fingerprint,
+    )
+
+    gate03 = payload["gate_results"]["gate_03_completeness"]
+    assert gate03["status"] == "WARNING"
+    assert gate03["failure_reasons"] == []
+    assert gate03["warnings"] == ["pair_completeness_degraded"]
+    assert gate03["details"]["disappeared_pair_rate"] == pytest.approx(0.9)
+
+
 @pytest.mark.parametrize(("runtime_hours", "expected_status"), [(1.5, "WARNING"), (4.0, "FAIL")])
 def test_certification_gate6_distinguishes_warning_from_fail(tmp_path: Path, monkeypatch, runtime_hours: float, expected_status: str):
     state_path = _install_base_mocks(
@@ -236,6 +465,45 @@ def test_certification_gate6_distinguishes_warning_from_fail(tmp_path: Path, mon
 
     gate06 = payload["gate_results"]["gate_06_episode_yield"]
     assert gate06["status"] == expected_status
+
+
+def test_certification_gate6_no_longer_requires_spread_median_above_threshold(tmp_path: Path, monkeypatch):
+    state_path = _install_base_mocks(
+        monkeypatch,
+        tmp_path,
+        records=_make_records("PAIR_A"),
+        episodes=[
+            DummyEpisode(0.05, -0.02, 45.0),
+            DummyEpisode(0.04, -0.01, 50.0),
+            DummyEpisode(0.03, -0.01, 55.0),
+        ],
+        runtime_hours=1.0,
+    )
+
+    payload = tc.run_training_certification(
+        state_file=state_path,
+        artifact_dir=tmp_path / "artifacts",
+        sequence_length=4,
+        prediction_horizon_sec=240,
+        thresholds=[0.8],
+        selected_session_ids=None,
+        selected_block_ids=None,
+        allow_cross_session_merge=False,
+        max_session_gap_sec=None,
+        regime_shift_score_threshold=3.0,
+        certification_mode="full",
+        max_certification_duration_sec=300,
+        allow_legacy_sessions=False,
+        runtime_audit_dir=None,
+        run_reconnection_stress=False,
+        preflight_fn=_preflight_ok,
+        dataset_fingerprint_fn=_fingerprint,
+    )
+
+    gate06 = payload["gate_results"]["gate_06_episode_yield"]
+    assert gate06["status"] == "PASS"
+    assert gate06["failure_reasons"] == []
+    assert gate06["details"]["total_spread_quantiles"]["p50"] < 0.8
 
 
 def test_certification_gate12b_excludes_pairs_failed_by_12a(tmp_path: Path, monkeypatch):
@@ -278,6 +546,236 @@ def test_certification_gate12b_excludes_pairs_failed_by_12a(tmp_path: Path, monk
     assert gate12["details"]["eligible_pairs_for_responsiveness"] == 0
     assert gate12["details"]["unresponsive_exit_pairs"] == []
     assert "entry_or_exit_stale_quotes" in gate12["failure_reasons"]
+
+
+def test_certification_gate12_uses_active_pairs_and_episode_outlier_rates(tmp_path: Path, monkeypatch):
+    records: list[dict] = []
+    for pair_index in range(20):
+        pair_id = f"ACTIVE_{pair_index:02d}"
+        for minute in range(12):
+            records.append(
+                {
+                    "pair_id": pair_id,
+                    "session_id": 101,
+                    "block_id": 1001 + pair_index,
+                    "timestamp": float(minute * 60),
+                    "entry_spread": 0.20 + pair_index * 0.001 + minute * 0.002,
+                    "exit_spread": -0.12 + (minute % 4) * 0.01,
+                }
+            )
+    for pair_index in range(3):
+        pair_id = f"ACTIVE_FROZEN_{pair_index:02d}"
+        for minute in range(12):
+            records.append(
+                {
+                    "pair_id": pair_id,
+                    "session_id": 101,
+                    "block_id": 2001 + pair_index,
+                    "timestamp": float(minute * 60),
+                    "entry_spread": 0.25,
+                    "exit_spread": -0.10,
+                }
+            )
+    for pair_index in range(30):
+        pair_id = f"SPARSE_{pair_index:02d}"
+        for minute in range(3):
+            records.append(
+                {
+                    "pair_id": pair_id,
+                    "session_id": 101,
+                    "block_id": 3001 + pair_index,
+                    "timestamp": float(minute * 60),
+                    "entry_spread": 0.22,
+                    "exit_spread": -0.11,
+                }
+            )
+
+    episodes = [
+        DummyEpisode(1.0 + (index % 7) * 0.01, 0.20 + (index % 5) * 0.01, 120.0 + (index % 3) * 10.0)
+        for index in range(98)
+    ]
+    episodes.extend([DummyEpisode(0.0, 0.0, 120.0), DummyEpisode(0.0, 0.0, 130.0)])
+
+    state_path = _install_base_mocks(
+        monkeypatch,
+        tmp_path,
+        records=records,
+        episodes=episodes,
+    )
+
+    payload = tc.run_training_certification(
+        state_file=state_path,
+        artifact_dir=tmp_path / "artifacts",
+        sequence_length=4,
+        prediction_horizon_sec=240,
+        thresholds=[0.8],
+        selected_session_ids=None,
+        selected_block_ids=None,
+        allow_cross_session_merge=False,
+        max_session_gap_sec=None,
+        regime_shift_score_threshold=3.0,
+        certification_mode="full",
+        max_certification_duration_sec=300,
+        allow_legacy_sessions=False,
+        runtime_audit_dir=None,
+        run_reconnection_stress=False,
+        preflight_fn=_preflight_ok,
+        dataset_fingerprint_fn=_fingerprint,
+    )
+
+    gate12 = payload["gate_results"]["gate_12_entry_exit_quality"]
+    assert gate12["status"] == "PASS"
+    assert gate12["failure_reasons"] == []
+    assert gate12["details"]["active_quality_pair_count"] == 23
+    assert gate12["details"]["eligible_pairs_for_responsiveness"] == 20
+    assert gate12["details"]["episode_entry_outlier_rate"] == pytest.approx(0.0)
+    assert gate12["details"]["episode_entry_zero_rate"] == pytest.approx(0.02)
+
+
+def test_certification_gate12_ignores_sparse_outlier_hours_below_pair_threshold(tmp_path: Path, monkeypatch):
+    state_path = _install_base_mocks(
+        monkeypatch,
+        tmp_path,
+        records=[],
+        episodes=[DummyEpisode(1.0, 0.2, 120.0) for _ in range(40)],
+        runtime_hours=4.0,
+    )
+    pair_ids = [f"PAIR_{index:02d}" for index in range(20)]
+    pair_record_counts = Counter({pair_id: 100 for pair_id in pair_ids})
+    pair_hour_counts = Counter({pair_id: 10 for pair_id in pair_ids})
+    entry_outlier_hours = Counter({pair_id: 1 for pair_id in pair_ids[:4]})
+    exit_outlier_hours = Counter({pair_id: 1 for pair_id in pair_ids[4:8]})
+
+    monkeypatch.setattr(
+        tc,
+        "_stream_quick_sqlite_metrics",
+        lambda *args, **kwargs: {
+            "pair_ids": pair_ids,
+            "pair_record_counts": pair_record_counts,
+            "pair_checkpoint_presence": {pair_id: {0, 1, 2, 3} for pair_id in pair_ids},
+            "checkpoint_count": 4,
+            "records_total": sum(pair_record_counts.values()),
+            "episode_total_spreads": [0.2, 0.3, 0.4, 0.5],
+            "episode_durations": [60.0, 75.0, 90.0, 105.0],
+            "episode_peaks": [1.0 + (index % 5) * 0.02 for index in range(40)],
+            "episode_exits": [0.2 + (index % 5) * 0.01 for index in range(40)],
+            "pair_hour_counts": pair_hour_counts,
+            "frozen_entry_hours": Counter(),
+            "frozen_exit_hours": Counter(),
+            "unresponsive_exit_hours": Counter(),
+            "entry_outlier_hours": entry_outlier_hours,
+            "exit_outlier_hours": exit_outlier_hours,
+            "pearson_by_pair": {},
+            "bilateral_zero_rate": 0.0,
+            "num_blocks": 200,
+            "block_diagnostics": {
+                "inter_record_interval_sec_quantiles": {"p50": 31.0},
+                "max_to_median_interval_ratio_quantiles": {"p90": 1.8},
+                "irregular_block_count": 0,
+            },
+        },
+    )
+
+    payload = tc.run_training_certification(
+        state_file=state_path,
+        artifact_dir=tmp_path / "artifacts",
+        sequence_length=4,
+        prediction_horizon_sec=240,
+        thresholds=[0.8],
+        selected_session_ids=None,
+        selected_block_ids=None,
+        allow_cross_session_merge=False,
+        max_session_gap_sec=None,
+        regime_shift_score_threshold=3.0,
+        certification_mode="quick",
+        max_certification_duration_sec=300,
+        allow_legacy_sessions=False,
+        runtime_audit_dir=None,
+        run_reconnection_stress=False,
+        preflight_fn=_preflight_ok,
+        dataset_fingerprint_fn=_fingerprint,
+    )
+
+    gate12 = payload["gate_results"]["gate_12_entry_exit_quality"]
+    assert gate12["status"] == "PASS"
+    assert gate12["failure_reasons"] == []
+    assert gate12["details"]["entry_outlier_pair_count"] == 0
+    assert gate12["details"]["exit_outlier_pair_count"] == 0
+    assert gate12["details"]["outlier_hour_rate_threshold"] == pytest.approx(0.15)
+
+
+def test_certification_gate12_fails_when_outlier_pair_rate_exceeds_threshold(tmp_path: Path, monkeypatch):
+    state_path = _install_base_mocks(
+        monkeypatch,
+        tmp_path,
+        records=[],
+        episodes=[DummyEpisode(1.0, 0.2, 120.0) for _ in range(40)],
+        runtime_hours=4.0,
+    )
+    pair_ids = [f"PAIR_{index:02d}" for index in range(20)]
+    pair_record_counts = Counter({pair_id: 100 for pair_id in pair_ids})
+    pair_hour_counts = Counter({pair_id: 10 for pair_id in pair_ids})
+    entry_outlier_hours = Counter({pair_id: 2 for pair_id in pair_ids[:4]})
+    exit_outlier_hours = Counter({pair_id: 2 for pair_id in pair_ids[4:8]})
+
+    monkeypatch.setattr(
+        tc,
+        "_stream_quick_sqlite_metrics",
+        lambda *args, **kwargs: {
+            "pair_ids": pair_ids,
+            "pair_record_counts": pair_record_counts,
+            "pair_checkpoint_presence": {pair_id: {0, 1, 2, 3} for pair_id in pair_ids},
+            "checkpoint_count": 4,
+            "records_total": sum(pair_record_counts.values()),
+            "episode_total_spreads": [0.2, 0.3, 0.4, 0.5],
+            "episode_durations": [60.0, 75.0, 90.0, 105.0],
+            "episode_peaks": [1.0 + (index % 5) * 0.02 for index in range(40)],
+            "episode_exits": [0.2 + (index % 5) * 0.01 for index in range(40)],
+            "pair_hour_counts": pair_hour_counts,
+            "frozen_entry_hours": Counter(),
+            "frozen_exit_hours": Counter(),
+            "unresponsive_exit_hours": Counter(),
+            "entry_outlier_hours": entry_outlier_hours,
+            "exit_outlier_hours": exit_outlier_hours,
+            "pearson_by_pair": {},
+            "bilateral_zero_rate": 0.0,
+            "num_blocks": 200,
+            "block_diagnostics": {
+                "inter_record_interval_sec_quantiles": {"p50": 31.0},
+                "max_to_median_interval_ratio_quantiles": {"p90": 1.8},
+                "irregular_block_count": 0,
+            },
+        },
+    )
+
+    payload = tc.run_training_certification(
+        state_file=state_path,
+        artifact_dir=tmp_path / "artifacts",
+        sequence_length=4,
+        prediction_horizon_sec=240,
+        thresholds=[0.8],
+        selected_session_ids=None,
+        selected_block_ids=None,
+        allow_cross_session_merge=False,
+        max_session_gap_sec=None,
+        regime_shift_score_threshold=3.0,
+        certification_mode="quick",
+        max_certification_duration_sec=300,
+        allow_legacy_sessions=False,
+        runtime_audit_dir=None,
+        run_reconnection_stress=False,
+        preflight_fn=_preflight_ok,
+        dataset_fingerprint_fn=_fingerprint,
+    )
+
+    gate12 = payload["gate_results"]["gate_12_entry_exit_quality"]
+    assert gate12["status"] == "FAIL"
+    assert "entry_outliers_unfiltered" in gate12["failure_reasons"]
+    assert "exit_outliers_unfiltered" in gate12["failure_reasons"]
+    assert gate12["details"]["entry_outlier_pair_count"] == 4
+    assert gate12["details"]["exit_outlier_pair_count"] == 4
+    assert gate12["details"]["entry_outlier_rate"] == pytest.approx(0.2)
+    assert gate12["details"]["exit_outlier_rate"] == pytest.approx(0.2)
 
 
 def test_run_clean_training_cycle_blocks_on_failed_certification(tmp_path: Path, monkeypatch):

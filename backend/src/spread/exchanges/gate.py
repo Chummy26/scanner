@@ -96,6 +96,7 @@ class GateWS(BaseExchangeWS):
 
         async with websockets.connect(
             GATE_SPOT_WS, ping_interval=20, ping_timeout=30,
+            proxy=None,
             max_size=16 * 1024 * 1024,
         ) as ws:
             # Subscribe in a background task while simultaneously reading
@@ -168,6 +169,7 @@ class GateWS(BaseExchangeWS):
 
         async with websockets.connect(
             GATE_FUTURES_WS, ping_interval=20, ping_timeout=30,
+            proxy=None,
             max_size=16 * 1024 * 1024,
         ) as ws:
             # Subscribe in background while reading messages (same pattern
@@ -257,14 +259,10 @@ class GateWS(BaseExchangeWS):
 
         _cycle = 0
         while not self.shutdown.is_set():
-            tickers = None
-            try:
-                tickers = await asyncio.to_thread(
-                    _fetch_json_sync, GATE_FUTURES_TICKERS)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
+            tickers = await self._fetch_json_fallback(
+                GATE_FUTURES_TICKERS,
+                "futures_ticker_fallback",
+            )
 
             if isinstance(tickers, list):
                 _updated = 0
@@ -317,14 +315,10 @@ class GateWS(BaseExchangeWS):
 
         _cycle = 0
         while not self.shutdown.is_set():
-            tickers = None
-            try:
-                tickers = await asyncio.to_thread(
-                    _fetch_json_sync, GATE_SPOT_TICKERS)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
+            tickers = await self._fetch_json_fallback(
+                GATE_SPOT_TICKERS,
+                "spot_ticker_fallback",
+            )
 
             if isinstance(tickers, list):
                 _updated = 0

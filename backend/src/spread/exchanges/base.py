@@ -6,6 +6,7 @@ import gzip
 import logging
 import threading
 import time
+import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Set, Callable, Any
@@ -33,7 +34,12 @@ def _fetch_json_sync(url: str, timeout: float = 10.0,
     if headers:
         for k, v in headers.items():
             req.add_header(k, v)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    # The scanner runs behind environments that sometimes export a local
+    # blackhole proxy (127.0.0.1:9) for generic shells. Public exchange
+    # endpoints must always bypass those proxies or the entire data plane
+    # goes dark while the process appears healthy.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=timeout) as resp:
         return json.loads(resp.read())
 
 # Max symbols per single WS connection (conservative default)
@@ -119,6 +125,7 @@ class BaseExchangeWS(ABC):
         self.spot_feed_mode: str = "depth_ws"
         self.futures_feed_mode: str = "depth_ws"
         self._reconnect_counts: Dict[str, int] = {"spot": 0, "futures": 0}
+        self._fallback_error_counts: Dict[str, int] = {}
 
     def get_feed_mode(self, market: str) -> str:
         if str(market).lower() == "futures":
@@ -140,7 +147,17 @@ class BaseExchangeWS(ABC):
         never received a WS message (no trading activity).
         """
         key = f"{self.name}:{symbol}:{market_type}"
-        return key in self._books
+        if key in self._books:
+            return True
+        declared = getattr(
+            self,
+            "_futures_symbols" if str(market_type).lower() == "futures" else "_spot_symbols",
+            None,
+        ) or []
+        if symbol in declared:
+            self.get_book(symbol, market_type)
+            return True
+        return False
 
     def get_book(self, symbol: str, market_type: str) -> OrderBook:
         key = f"{self.name}:{symbol}:{market_type}"
@@ -299,6 +316,36 @@ class BaseExchangeWS(ABC):
         asks = [[str(ask_price), str(ask_qty)]]
         if book.apply_snapshot(bids, asks):
             self.on_book_update(base, self.name, market, book)
+
+    async def _fetch_json_fallback(
+        self,
+        url: str,
+        label: str,
+        *,
+        timeout: float = 10.0,
+        headers: Optional[Dict[str, str]] = None,
+    ):
+        """Fetch fallback REST JSON with rate-limited warnings."""
+        try:
+            payload = await asyncio.to_thread(_fetch_json_sync, url, timeout, headers)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            count = int(self._fallback_error_counts.get(label, 0) or 0) + 1
+            self._fallback_error_counts[label] = count
+            if count <= 3 or count % 20 == 0:
+                detail = str(exc)
+                if isinstance(exc, urllib.error.HTTPError):
+                    detail = f"HTTP {exc.code} {exc.reason}"
+                logger.warning(
+                    f"[{self.name.upper()}] {label} fetch failed "
+                    f"(#{count}): {detail}"
+                )
+            return None
+        previous = int(self._fallback_error_counts.pop(label, 0) or 0)
+        if previous >= 3:
+            logger.info(f"[{self.name.upper()}] {label} fetch recovered after {previous} errors")
+        return payload
 
     def stop(self):
         self.shutdown.set()

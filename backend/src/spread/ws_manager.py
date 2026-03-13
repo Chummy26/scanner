@@ -1235,6 +1235,8 @@ class WSManager:
                 "next_in_sec": int(round(seconds_until_next_snapshot_slot())),
                 "total_7d": len(last_7d),
                 "pass_7d": sum(1 for item in last_7d if str(item.get("certification_verdict") or "") == "PASS"),
+                "warn_7d": sum(1 for item in last_7d if str(item.get("certification_verdict") or "") == "WARN"),
+                "certified_7d": sum(1 for item in last_7d if str(item.get("certification_verdict") or "") in {"PASS", "WARN"}),
                 "fail_7d": sum(1 for item in last_7d if str(item.get("certification_verdict") or "") == "FAIL"),
                 "recent": list(reversed(recent_snapshots[-10:])),
             },

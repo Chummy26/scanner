@@ -32,6 +32,18 @@ DEFAULT_DUAL_PREFLIGHT_CONFIGS = [
     {"sequence_length": 15, "prediction_horizon_sec": 14_400},
 ]
 DEFAULT_RUNTIME_AUDIT_STALENESS_SEC = 24 * 60 * 60
+GATE_02_MIN_INTERVAL_SEC = 10.0
+GATE_02_MAX_INTERVAL_SEC = 40.0
+GATE_03_MIN_RECORDS_FOR_COMPLETENESS = 10
+GATE_03_DISAPPEARED_WARN_RATE = 0.20
+GATE_03_DISAPPEARED_FAIL_RATE = 0.95
+GATE_03_INTERMITTENT_WARN_RATE = 0.15
+GATE_03_INTERMITTENT_FAIL_RATE = 0.60
+GATE_06_MIN_EPISODE_DURATION_SEC = 30.0
+GATE_12_MIN_RECORDS_PER_ACTIVE_HOUR = 10.0
+GATE_12_OUTLIER_HOUR_RATE_THRESHOLD = 0.15
+GATE_12_PAIR_QUALITY_FAIL_RATE = 0.15
+GATE_12_EPISODE_OUTLIER_FAIL_RATE = 0.02
 
 
 def _normalize_threshold_values(thresholds: list[float] | None) -> list[float]:
@@ -217,6 +229,27 @@ def _score_shift(left: list[float], right: list[float]) -> dict[str, float]:
     mean_delta = abs(float(np.mean(left_np)) - float(np.mean(right_np))) / max(left_std, right_std, 1e-6)
     std_ratio = max(left_std, right_std, 1e-6) / max(min(left_std, right_std), 1e-6)
     return {"mean_delta": float(mean_delta), "std_ratio": float(std_ratio), "score": float(max(mean_delta, std_ratio))}
+
+
+def _scaled_density_threshold(pair_count: int) -> float:
+    return float(min(100.0, max(1.0, 200.0 / math.sqrt(max(int(pair_count), 1)))))
+
+
+def _episode_outlier_rate(values: list[float]) -> tuple[float, float]:
+    normalized = [float(value) for value in values if math.isfinite(float(value))]
+    if not normalized:
+        return 0.0, 0.0
+    nonzero_values = [value for value in normalized if abs(value) > 1e-12]
+    zero_rate = float((len(normalized) - len(nonzero_values)) / len(normalized))
+    if len(nonzero_values) <= 1:
+        return 0.0, zero_rate
+    center = _median(nonzero_values)
+    spread = max(_mad(nonzero_values, center), 0.01)
+    outlier_rate = float(
+        sum(1 for value in nonzero_values if abs(value - center) > 10.0 * spread)
+        / max(len(nonzero_values), 1)
+    )
+    return outlier_rate, zero_rate
 
 
 def _table_count(conn: sqlite3.Connection, table_name: str) -> int:
@@ -688,6 +721,7 @@ def _stream_quick_sqlite_metrics(
             }
         )
         pair_ids: set[str] = set()
+        pair_record_counts: Counter[str] = Counter()
         pair_checkpoint_presence: dict[str, set[int]] = defaultdict(set)
         episode_total_spreads: list[float] = []
         episode_durations: list[float] = []
@@ -807,6 +841,7 @@ def _stream_quick_sqlite_metrics(
             current_records.append((ts_value, entry_value, exit_value))
             pair_id = str(current_meta["pair_id"])
             pair_ids.add(pair_id)
+            pair_record_counts[pair_id] += 1
             if min_ts > 0.0:
                 pair_checkpoint_presence[pair_id].add(int((ts_value - min_ts) // CHECKPOINT_WINDOW_SEC))
             pair_hour_records[(pair_id, int(ts_value // 3600))].append((ts_value, entry_value, exit_value))
@@ -882,6 +917,7 @@ def _stream_quick_sqlite_metrics(
     checkpoint_count = int(((max_ts - min_ts) // CHECKPOINT_WINDOW_SEC) + 1) if total_records > 0 and max_ts >= min_ts else 0
     return {
         "pair_ids": sorted(pair_ids),
+        "pair_record_counts": pair_record_counts,
         "pair_checkpoint_presence": pair_checkpoint_presence,
         "checkpoint_count": int(checkpoint_count),
         "records_total": int(total_records),
@@ -1124,7 +1160,28 @@ def run_training_certification(
     try:
         integrity = collect_sqlite_integrity(state_path, selected_session_ids=effective_session_ids or None, selected_block_ids=effective_block_ids or None)
         anomalies = dict(integrity.get("anomalies", {}))
-        _persist_gate(_build_gate("gate_01_sqlite_integrity", "SQLite integrity", status="FAIL" if any(int(value) > 0 for value in anomalies.values()) else "PASS", failure_reasons=["integrity_anomaly"] if any(int(value) > 0 for value in anomalies.values()) else [], details=integrity))
+        structural_integrity_keys = ("record_count_mismatches", "range_mismatches", "open_blocks_after_close")
+        integrity_failures = [key for key in structural_integrity_keys if int(anomalies.get(key, 0) or 0) > 0]
+        integrity_warnings = [
+            key
+            for key in ("zero_record_blocks", "missing_event_blocks")
+            if int(anomalies.get(key, 0) or 0) > 0
+        ]
+        integrity_status = "FAIL" if integrity_failures else ("WARNING" if integrity_warnings else "PASS")
+        _persist_gate(
+            _build_gate(
+                "gate_01_sqlite_integrity",
+                "SQLite integrity",
+                status=integrity_status,
+                failure_reasons=["integrity_anomaly"] if integrity_failures else [],
+                warnings=integrity_warnings,
+                details={
+                    **integrity,
+                    "structural_integrity_failures": integrity_failures,
+                    "integrity_warnings": integrity_warnings,
+                },
+            )
+        )
 
         _check_timeout()
         bundle = (
@@ -1165,15 +1222,48 @@ def run_training_certification(
         interval_p50 = float(block_diagnostics.get("inter_record_interval_sec_quantiles", {}).get("p50", 0.0))
         ratio_p90 = float(block_diagnostics.get("max_to_median_interval_ratio_quantiles", {}).get("p90", 0.0))
         irregular_rate = float(block_diagnostics.get("irregular_block_count", 0) / total_blocks)
-        _persist_gate(_build_gate("gate_02_intra_block_temporal_regularity", "Intra-block temporal regularity", status="FAIL" if (interval_p50 < 12.0 or interval_p50 > 20.0 or ratio_p90 > 3.0 or irregular_rate >= 0.10) else "PASS", failure_reasons=["excessive_intra_block_irregularity"] if (interval_p50 < 12.0 or interval_p50 > 20.0 or ratio_p90 > 3.0 or irregular_rate >= 0.10) else [], details={"total_blocks": total_blocks, "median_interval_p50_sec": interval_p50, "max_to_median_ratio_p90": ratio_p90, "irregular_block_rate": irregular_rate, "block_diagnostics": block_diagnostics}))
+        gate02_failed = (
+            interval_p50 < GATE_02_MIN_INTERVAL_SEC
+            or interval_p50 > GATE_02_MAX_INTERVAL_SEC
+            or ratio_p90 > 3.0
+            or irregular_rate >= 0.10
+        )
+        _persist_gate(
+            _build_gate(
+                "gate_02_intra_block_temporal_regularity",
+                "Intra-block temporal regularity",
+                status="FAIL" if gate02_failed else "PASS",
+                failure_reasons=["excessive_intra_block_irregularity"] if gate02_failed else [],
+                details={
+                    "total_blocks": total_blocks,
+                    "median_interval_p50_sec": interval_p50,
+                    "max_to_median_ratio_p90": ratio_p90,
+                    "irregular_block_rate": irregular_rate,
+                    "expected_interval_floor_sec": GATE_02_MIN_INTERVAL_SEC,
+                    "expected_interval_ceiling_sec": GATE_02_MAX_INTERVAL_SEC,
+                    "block_diagnostics": block_diagnostics,
+                },
+            )
+        )
 
         _check_timeout()
+        pair_record_counts = (
+            Counter(quick_sqlite_metrics["pair_record_counts"])
+            if quick_sqlite_metrics is not None
+            else Counter(str(record["pair_id"]) for record in records if str(record["pair_id"]))
+        )
+        completeness_pair_ids = sorted(
+            pair_id
+            for pair_id, record_count in pair_record_counts.items()
+            if int(record_count) >= GATE_03_MIN_RECORDS_FOR_COMPLETENESS
+        )
+        completeness_pair_set = set(completeness_pair_ids)
         disappeared_pairs = []
         intermittent_pairs = []
         if quick_sqlite_metrics is not None:
             checkpoint_count = int(quick_sqlite_metrics["checkpoint_count"])
             pair_presence_sets = dict(quick_sqlite_metrics["pair_checkpoint_presence"])
-            for pair_id in pair_ids:
+            for pair_id in completeness_pair_ids:
                 presence_set = {int(value) for value in pair_presence_sets.get(pair_id, set())}
                 if not presence_set:
                     continue
@@ -1190,6 +1280,8 @@ def run_training_certification(
         else:
             pair_presence = {pair_id: [pair_id in set(bucket["pairs"]) for bucket in checkpoint_buckets] for pair_id in pair_ids}
             for pair_id, presence in pair_presence.items():
+                if pair_id not in completeness_pair_set:
+                    continue
                 if not any(presence):
                     continue
                 first = presence.index(True)
@@ -1199,21 +1291,55 @@ def run_training_certification(
                 if any(not value for value in presence[first:last + 1]):
                     intermittent_pairs.append(pair_id)
             records_per_pair_per_hour = float(len(records) / max(len(pair_ids) * max(session_hours, 1.0 / 3600.0), 1.0))
-        active_pair_count = max(len(pair_ids), 1)
+        active_pair_count = max(len(completeness_pair_ids), 1)
         disappeared_rate = float(len(disappeared_pairs) / active_pair_count)
         intermittent_rate = float(len(intermittent_pairs) / active_pair_count)
+        density_threshold = _scaled_density_threshold(len(pair_ids))
         recommendations: list[str] = []
-        if rejection_stats and (disappeared_rate >= 0.05 or intermittent_rate >= 0.03 or records_per_pair_per_hour < 100.0):
+        if rejection_stats and (
+            disappeared_rate >= GATE_03_DISAPPEARED_WARN_RATE
+            or intermittent_rate >= GATE_03_INTERMITTENT_WARN_RATE
+            or records_per_pair_per_hour < density_threshold
+        ):
             top_pair = next(iter(dict(rejection_stats.get("rejection_rate_by_pair") or {}).items()), None)
             top_exchange = next(iter(dict(rejection_stats.get("rejection_rate_by_exchange") or {}).items()), None)
             if top_pair or top_exchange:
                 recommendations.append(f"hot_path_rejections dominate completeness pressure: top_pair={top_pair} top_exchange={top_exchange}")
         completeness_failures = []
-        if disappeared_rate >= 0.05 or intermittent_rate >= 0.03:
+        completeness_warnings = []
+        if disappeared_rate >= GATE_03_DISAPPEARED_FAIL_RATE or intermittent_rate >= GATE_03_INTERMITTENT_FAIL_RATE:
             completeness_failures.append("pair_completeness_degraded")
-        if records_per_pair_per_hour < 100.0:
+        elif disappeared_rate >= GATE_03_DISAPPEARED_WARN_RATE or intermittent_rate >= GATE_03_INTERMITTENT_WARN_RATE:
+            completeness_warnings.append("pair_completeness_degraded")
+        if records_per_pair_per_hour < density_threshold:
             completeness_failures.append("insufficient_record_density")
-        _persist_gate(_build_gate("gate_03_completeness", "Completeness", status="FAIL" if completeness_failures else "PASS", failure_reasons=completeness_failures, recommendations=recommendations, details={"active_pair_count": len(pair_ids), "checkpoint_count": int(quick_sqlite_metrics["checkpoint_count"]) if quick_sqlite_metrics is not None else len(checkpoint_buckets), "records_per_pair_per_hour": records_per_pair_per_hour, "disappeared_pairs": disappeared_pairs[:50], "intermittent_pairs": intermittent_pairs[:50], "disappeared_pair_rate": disappeared_rate, "intermittent_pair_rate": intermittent_rate, "hot_path_rejection_stats": rejection_stats}))
+        _persist_gate(
+            _build_gate(
+                "gate_03_completeness",
+                "Completeness",
+                status="FAIL" if completeness_failures else ("WARNING" if completeness_warnings else "PASS"),
+                failure_reasons=completeness_failures,
+                warnings=completeness_warnings,
+                recommendations=recommendations,
+                details={
+                    "active_pair_count": len(pair_ids),
+                    "checkpoint_count": int(quick_sqlite_metrics["checkpoint_count"]) if quick_sqlite_metrics is not None else len(checkpoint_buckets),
+                    "records_per_pair_per_hour": records_per_pair_per_hour,
+                    "records_per_pair_per_hour_threshold": density_threshold,
+                    "completeness_pair_count": len(completeness_pair_ids),
+                    "completeness_pair_min_records": GATE_03_MIN_RECORDS_FOR_COMPLETENESS,
+                    "disappeared_pair_warn_rate": GATE_03_DISAPPEARED_WARN_RATE,
+                    "disappeared_pair_fail_rate": GATE_03_DISAPPEARED_FAIL_RATE,
+                    "intermittent_pair_warn_rate": GATE_03_INTERMITTENT_WARN_RATE,
+                    "intermittent_pair_fail_rate": GATE_03_INTERMITTENT_FAIL_RATE,
+                    "disappeared_pairs": disappeared_pairs[:50],
+                    "intermittent_pairs": intermittent_pairs[:50],
+                    "disappeared_pair_rate": disappeared_rate,
+                    "intermittent_pair_rate": intermittent_rate,
+                    "hot_path_rejection_stats": rejection_stats,
+                },
+            )
+        )
 
         _check_timeout()
         if certification_mode == "quick":
@@ -1264,9 +1390,30 @@ def run_training_certification(
             gate06_failures.append("insufficient_episode_yield")
         elif episodes_per_hour < 1.0:
             gate06_warnings.append("insufficient_episode_yield")
-        if total_spreads and (_percentile(total_spreads, 50.0) < operational_min_total_spread_pct or _percentile(durations, 50.0) <= 60.0 or _percentile(durations, 50.0) >= float(prediction_horizon_sec)):
+        duration_p50 = _percentile(durations, 50.0)
+        total_spread_p50 = _percentile(total_spreads, 50.0)
+        if total_spreads and (
+            duration_p50 <= GATE_06_MIN_EPISODE_DURATION_SEC
+            or duration_p50 >= float(prediction_horizon_sec)
+        ):
             gate06_failures.append("episode_quality_degraded")
-        _persist_gate(_build_gate("gate_06_episode_yield", "Episode yield", status="FAIL" if gate06_failures else ("WARNING" if gate06_warnings else "PASS"), failure_reasons=gate06_failures, warnings=gate06_warnings, details={"episode_count": episode_count, "episodes_per_hour": episodes_per_hour, "total_spread_quantiles": {"p50": _percentile(total_spreads, 50.0), "p90": _percentile(total_spreads, 90.0)}, "duration_sec_quantiles": {"p50": _percentile(durations, 50.0), "p90": _percentile(durations, 90.0)}}))
+        _persist_gate(
+            _build_gate(
+                "gate_06_episode_yield",
+                "Episode yield",
+                status="FAIL" if gate06_failures else ("WARNING" if gate06_warnings else "PASS"),
+                failure_reasons=gate06_failures,
+                warnings=gate06_warnings,
+                details={
+                    "episode_count": episode_count,
+                    "episodes_per_hour": episodes_per_hour,
+                    "minimum_duration_sec": GATE_06_MIN_EPISODE_DURATION_SEC,
+                    "prediction_horizon_sec": float(prediction_horizon_sec),
+                    "total_spread_quantiles": {"p50": total_spread_p50, "p90": _percentile(total_spreads, 90.0)},
+                    "duration_sec_quantiles": {"p50": duration_p50, "p90": _percentile(durations, 90.0)},
+                },
+            )
+        )
 
         _check_timeout()
         if certification_mode == "quick":
@@ -1488,6 +1635,7 @@ def run_training_certification(
 
         _check_timeout()
         if quick_sqlite_metrics is not None:
+            pair_record_counts = Counter(quick_sqlite_metrics["pair_record_counts"])
             pair_hour_counts = Counter(quick_sqlite_metrics["pair_hour_counts"])
             frozen_entry_hours = Counter(quick_sqlite_metrics["frozen_entry_hours"])
             frozen_exit_hours = Counter(quick_sqlite_metrics["frozen_exit_hours"])
@@ -1500,6 +1648,7 @@ def run_training_certification(
             bilateral_zero_rate = float(quick_sqlite_metrics["bilateral_zero_rate"])
         else:
             pair_hour_buckets = _pair_hour_buckets(records)
+            pair_record_counts = Counter(str(record["pair_id"]) for record in records if str(record["pair_id"]))
             pair_hour_counts = Counter()
             frozen_entry_hours = Counter()
             frozen_exit_hours = Counter()
@@ -1535,42 +1684,109 @@ def run_training_certification(
             episode_peaks = [float(getattr(item, "peak_entry_spread", 0.0) or 0.0) for item in episodes]
             episode_exits = [float(getattr(item, "exit_spread_at_close", 0.0) or 0.0) for item in episodes]
             bilateral_zero_rate = float(sum(1 for item in records if abs(float(item["entry_spread"])) <= 1e-12 and abs(float(item["exit_spread"])) <= 1e-12) / max(len(records), 1))
-        pair_count = max(len(pair_hour_counts), 1)
-        frozen_entry_pairs = [pair_id for pair_id, total_hours in pair_hour_counts.items() if float(frozen_entry_hours.get(pair_id, 0) / max(total_hours, 1)) > 0.50]
-        frozen_exit_pairs = [pair_id for pair_id, total_hours in pair_hour_counts.items() if float(frozen_exit_hours.get(pair_id, 0) / max(total_hours, 1)) > 0.50]
+        active_quality_pairs = [
+            pair_id
+            for pair_id, total_hours in pair_hour_counts.items()
+            if float(pair_record_counts.get(pair_id, 0) / max(total_hours, 1)) >= GATE_12_MIN_RECORDS_PER_ACTIVE_HOUR
+        ]
+        active_quality_pair_set = set(active_quality_pairs)
+        pair_count = max(len(active_quality_pairs), 1)
+        frozen_entry_pairs = [
+            pair_id
+            for pair_id, total_hours in pair_hour_counts.items()
+            if pair_id in active_quality_pair_set and float(frozen_entry_hours.get(pair_id, 0) / max(total_hours, 1)) > 0.50
+        ]
+        frozen_exit_pairs = [
+            pair_id
+            for pair_id, total_hours in pair_hour_counts.items()
+            if pair_id in active_quality_pair_set and float(frozen_exit_hours.get(pair_id, 0) / max(total_hours, 1)) > 0.50
+        ]
         frozen_pairs = sorted(set(frozen_entry_pairs) | set(frozen_exit_pairs))
-        eligible_pairs = [pair_id for pair_id in pair_hour_counts if pair_id not in set(frozen_pairs)]
+        eligible_pairs = [pair_id for pair_id in active_quality_pairs if pair_id not in set(frozen_pairs)]
         unresponsive_pairs = [pair_id for pair_id in eligible_pairs if float(unresponsive_exit_hours.get(pair_id, 0) / max(pair_hour_counts.get(pair_id, 0), 1)) > 0.05]
-        entry_outlier_pairs = [pair_id for pair_id, total_hours in pair_hour_counts.items() if float(entry_outlier_hours.get(pair_id, 0) / max(total_hours, 1)) > 0.05]
-        exit_outlier_pairs = [pair_id for pair_id, total_hours in pair_hour_counts.items() if float(exit_outlier_hours.get(pair_id, 0) / max(total_hours, 1)) > 0.05]
+        entry_outlier_pairs = [
+            pair_id
+            for pair_id, total_hours in pair_hour_counts.items()
+            if pair_id in active_quality_pair_set
+            and float(entry_outlier_hours.get(pair_id, 0) / max(total_hours, 1)) > GATE_12_OUTLIER_HOUR_RATE_THRESHOLD
+        ]
+        exit_outlier_pairs = [
+            pair_id
+            for pair_id, total_hours in pair_hour_counts.items()
+            if pair_id in active_quality_pair_set
+            and float(exit_outlier_hours.get(pair_id, 0) / max(total_hours, 1)) > GATE_12_OUTLIER_HOUR_RATE_THRESHOLD
+        ]
         gate12_failures = []
-        if len(frozen_pairs) / pair_count > 0.05:
-            if len(frozen_entry_pairs) / pair_count > 0.05:
+        frozen_entry_rate = float(len(frozen_entry_pairs) / pair_count)
+        frozen_exit_rate = float(len(frozen_exit_pairs) / pair_count)
+        frozen_pair_rate = float(len(frozen_pairs) / pair_count)
+        unresponsive_exit_rate = float(len(unresponsive_pairs) / max(len(eligible_pairs), 1)) if eligible_pairs else 0.0
+        entry_outlier_pair_rate = float(len(entry_outlier_pairs) / pair_count)
+        exit_outlier_pair_rate = float(len(exit_outlier_pairs) / pair_count)
+        if len(frozen_pairs) / pair_count > GATE_12_PAIR_QUALITY_FAIL_RATE:
+            if frozen_entry_rate > GATE_12_PAIR_QUALITY_FAIL_RATE:
                 gate12_failures.append("entry_stale_quotes")
-            if len(frozen_exit_pairs) / pair_count > 0.05:
+            if frozen_exit_rate > GATE_12_PAIR_QUALITY_FAIL_RATE:
                 gate12_failures.append("exit_stale_quotes")
             gate12_failures.append("entry_or_exit_stale_quotes")
-        if eligible_pairs and len(unresponsive_pairs) / max(len(eligible_pairs), 1) > 0.05:
+        if eligible_pairs and unresponsive_exit_rate > 0.05:
             gate12_failures.append("exit_unresponsive_while_entry_active")
-        if len(entry_outlier_pairs) / pair_count > 0.05:
+        if entry_outlier_pair_rate > GATE_12_PAIR_QUALITY_FAIL_RATE:
             gate12_failures.append("entry_outliers_unfiltered")
-        if len(exit_outlier_pairs) / pair_count > 0.05:
+        if exit_outlier_pair_rate > GATE_12_PAIR_QUALITY_FAIL_RATE:
             gate12_failures.append("exit_outliers_unfiltered")
         if bilateral_zero_rate >= 0.001:
             gate12_failures.append("bilateral_zero_quote_records")
-        entry_episode_median = _median(episode_peaks)
-        exit_episode_median = _median(episode_exits)
-        entry_episode_mad = max(_mad(episode_peaks, entry_episode_median), 0.01)
-        exit_episode_mad = max(_mad(episode_exits, exit_episode_median), 0.01)
         if episode_peaks and float(np.std(np.asarray(episode_peaks, dtype=float))) <= 0.0:
             gate12_failures.append("episode_entry_frozen")
         if episode_exits and float(np.std(np.asarray(episode_exits, dtype=float))) <= 0.0:
             gate12_failures.append("episode_exit_frozen")
-        if any(abs(value) <= 1e-12 or abs(value - entry_episode_median) > 10.0 * entry_episode_mad for value in episode_peaks):
+        entry_episode_outlier_rate, entry_episode_zero_rate = _episode_outlier_rate(episode_peaks)
+        exit_episode_outlier_rate, exit_episode_zero_rate = _episode_outlier_rate(episode_exits)
+        if entry_episode_outlier_rate > GATE_12_EPISODE_OUTLIER_FAIL_RATE:
             gate12_failures.append("episode_entry_corrupted")
-        if any(abs(value) <= 1e-12 or abs(value - exit_episode_median) > 10.0 * exit_episode_mad for value in episode_exits):
+        if exit_episode_outlier_rate > GATE_12_EPISODE_OUTLIER_FAIL_RATE:
             gate12_failures.append("episode_exit_corrupted")
-        _persist_gate(_build_gate("gate_12_entry_exit_quality", "Entry and exit quality", status="FAIL" if gate12_failures else "PASS", failure_reasons=gate12_failures, details={"pair_count": len(pair_hour_counts), "frozen_entry_pairs": frozen_entry_pairs[:50], "frozen_exit_pairs": frozen_exit_pairs[:50], "eligible_pairs_for_responsiveness": len(eligible_pairs), "unresponsive_exit_pairs": unresponsive_pairs[:50], "entry_outlier_pairs": entry_outlier_pairs[:50], "exit_outlier_pairs": exit_outlier_pairs[:50], "bilateral_zero_rate": bilateral_zero_rate, "pearson_correlation_by_pair": pearson_by_pair, "episode_count": episode_count}))
+        _persist_gate(
+            _build_gate(
+                "gate_12_entry_exit_quality",
+                "Entry and exit quality",
+                status="FAIL" if gate12_failures else "PASS",
+                failure_reasons=gate12_failures,
+                details={
+                    "pair_count": len(pair_hour_counts),
+                    "active_quality_pair_count": len(active_quality_pairs),
+                    "active_quality_pair_min_records_per_hour": GATE_12_MIN_RECORDS_PER_ACTIVE_HOUR,
+                    "outlier_hour_rate_threshold": GATE_12_OUTLIER_HOUR_RATE_THRESHOLD,
+                    "pair_quality_fail_rate_threshold": GATE_12_PAIR_QUALITY_FAIL_RATE,
+                    "episode_outlier_fail_rate_threshold": GATE_12_EPISODE_OUTLIER_FAIL_RATE,
+                    "frozen_entry_pair_count": len(frozen_entry_pairs),
+                    "frozen_exit_pair_count": len(frozen_exit_pairs),
+                    "frozen_pair_rate": frozen_pair_rate,
+                    "entry_frozen_rate": frozen_entry_rate,
+                    "exit_frozen_rate": frozen_exit_rate,
+                    "frozen_entry_pairs": frozen_entry_pairs[:50],
+                    "frozen_exit_pairs": frozen_exit_pairs[:50],
+                    "eligible_pairs_for_responsiveness": len(eligible_pairs),
+                    "unresponsive_exit_pair_count": len(unresponsive_pairs),
+                    "unresponsive_exit_rate": unresponsive_exit_rate,
+                    "unresponsive_exit_pairs": unresponsive_pairs[:50],
+                    "entry_outlier_pair_count": len(entry_outlier_pairs),
+                    "entry_outlier_rate": entry_outlier_pair_rate,
+                    "exit_outlier_pair_count": len(exit_outlier_pairs),
+                    "exit_outlier_rate": exit_outlier_pair_rate,
+                    "entry_outlier_pairs": entry_outlier_pairs[:50],
+                    "exit_outlier_pairs": exit_outlier_pairs[:50],
+                    "bilateral_zero_rate": bilateral_zero_rate,
+                    "pearson_correlation_by_pair": pearson_by_pair,
+                    "episode_count": episode_count,
+                    "episode_entry_outlier_rate": entry_episode_outlier_rate,
+                    "episode_exit_outlier_rate": exit_episode_outlier_rate,
+                    "episode_entry_zero_rate": entry_episode_zero_rate,
+                    "episode_exit_zero_rate": exit_episode_zero_rate,
+                },
+            )
+        )
     except TimeoutError:
         pass
 

@@ -109,6 +109,7 @@ class BingxWS(BaseExchangeWS):
 
         async with websockets.connect(
             ws_url, ping_interval=None, ping_timeout=None,
+            proxy=None,
             max_size=16 * 1024 * 1024,
         ) as ws:
             # Subscribe all in one batch or small groups
@@ -193,14 +194,10 @@ class BingxWS(BaseExchangeWS):
 
         _cycle = 0
         while not self.shutdown.is_set():
-            payload = None
-            try:
-                payload = await asyncio.to_thread(
-                    _fetch_json_sync, BINGX_FUTURES_TICKERS)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
+            payload = await self._fetch_json_fallback(
+                BINGX_FUTURES_TICKERS,
+                "futures_ticker_fallback",
+            )
 
             if isinstance(payload, dict) and payload.get("data"):
                 _updated = 0
@@ -254,14 +251,10 @@ class BingxWS(BaseExchangeWS):
 
         _cycle = 0
         while not self.shutdown.is_set():
-            payload = None
-            try:
-                payload = await asyncio.to_thread(
-                    _fetch_json_sync, BINGX_SPOT_BOOK_TICKERS)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
+            payload = await self._fetch_json_fallback(
+                BINGX_SPOT_BOOK_TICKERS,
+                "spot_ticker_fallback",
+            )
 
             if isinstance(payload, dict) and payload.get("data"):
                 _updated = 0

@@ -87,6 +87,7 @@ class BitgetWS(BaseExchangeWS):
 
         async with websockets.connect(
             BITGET_WS_URL, ping_interval=None, ping_timeout=None,
+            proxy=None,
             max_size=16 * 1024 * 1024,
         ) as ws:
             # Subscribe in chunks of 30 args per message
@@ -171,14 +172,10 @@ class BitgetWS(BaseExchangeWS):
 
         _cycle = 0
         while not self.shutdown.is_set():
-            payload = None
-            try:
-                payload = await asyncio.to_thread(
-                    _fetch_json_sync, BITGET_SPOT_TICKERS)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
+            payload = await self._fetch_json_fallback(
+                BITGET_SPOT_TICKERS,
+                "spot_ticker_fallback",
+            )
 
             if isinstance(payload, dict) and payload.get("data"):
                 _updated = 0
@@ -233,14 +230,10 @@ class BitgetWS(BaseExchangeWS):
 
         _cycle = 0
         while not self.shutdown.is_set():
-            payload = None
-            try:
-                payload = await asyncio.to_thread(
-                    _fetch_json_sync, BITGET_FUTURES_TICKERS)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
+            payload = await self._fetch_json_fallback(
+                BITGET_FUTURES_TICKERS,
+                "futures_ticker_fallback",
+            )
 
             if isinstance(payload, dict) and payload.get("data"):
                 _updated = 0

@@ -53,7 +53,7 @@ class _FakeWSManager:
 
     def get_pipeline_status(self):
         return {
-            "snapshots": {"last": "2026-03-10_08h", "last_verdict": "PASS", "next_in_sec": 600, "total_7d": 3, "pass_7d": 3, "fail_7d": 0, "recent": []},
+            "snapshots": {"last": "2026-03-10_08h", "last_verdict": "PASS", "next_in_sec": 600, "total_7d": 3, "pass_7d": 3, "warn_7d": 0, "certified_7d": 3, "fail_7d": 0, "recent": []},
             "training": {"last_run": "run_1", "last_auc": 0.71, "model_version": "bundle-v2", "deployed_at": "2026-03-10T08:00:00Z", "retrain_trigger": None, "auto_state": {}, "run_count": 1},
             "hourly_health": {"last_24h": ["healthy"], "healthy_count": 1, "degraded_count": 0, "unhealthy_count": 0},
         }

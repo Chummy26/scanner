@@ -6,7 +6,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.spread.auto_retrain import (
+    certification_verdict_view,
     current_snapshot_slot,
+    is_trainable_snapshot,
     next_snapshot_slot,
     should_retrain,
     update_snapshot_manifest,
@@ -88,3 +90,19 @@ def test_should_retrain_uses_snapshot_and_training_manifests(tmp_path: Path):
             {"runs": [{"run_id": "run_1", "created_at_ts": base_ts, "finished_at_ts": base_ts}]},
         )
         assert should_retrain(base_path=base_path, model_dir=base_path / "config") == "new_data_available"
+
+
+def test_warn_snapshots_are_trainable_for_retrain_gating(tmp_path: Path):
+    base_path = tmp_path / "out"
+    base_ts = 20_000.0
+    snapshots = [
+        {"filename": f"snapshot_{index}.sqlite", "created_at_utc_ts": base_ts + index, "certification_verdict": "WARN"}
+        for index in range(3)
+    ]
+    write_json(base_path / "snapshots" / "manifest.json", {"snapshots": snapshots})
+
+    assert certification_verdict_view({"verdict": "CERTIFIED_WITH_WARNINGS"}) == "WARN"
+    assert all(is_trainable_snapshot(snapshot) for snapshot in snapshots)
+
+    with patch("src.spread.auto_retrain.time.time", return_value=base_ts + 10.0):
+        assert should_retrain(base_path=base_path, model_dir=base_path / "config") == "first_training"

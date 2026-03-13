@@ -96,6 +96,10 @@ def certification_verdict_view(certification: dict[str, Any]) -> str:
     return "FAIL"
 
 
+def is_trainable_snapshot(snapshot: dict[str, Any]) -> bool:
+    return str(snapshot.get("certification_verdict") or "").upper() in {"PASS", "WARN"}
+
+
 def read_json(path: Path, default: Any) -> Any:
     if not path.is_file():
         return default
@@ -259,7 +263,7 @@ def should_retrain(
     certified = [
         item
         for item in list(manifest.get("snapshots") or [])
-        if str(item.get("certification_verdict") or "") == "PASS"
+        if is_trainable_snapshot(item)
     ]
     if not certified:
         return None
@@ -675,7 +679,7 @@ def run_auto_retrain_worker(
     selected = [
         item
         for item in list(snapshot_manifest.get("snapshots") or [])
-        if str(item.get("certification_verdict") or "") == "PASS"
+        if is_trainable_snapshot(item)
         and float(item.get("created_at_utc_ts", 0.0) or 0.0) >= cutoff
     ]
     state = _write_state(

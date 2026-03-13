@@ -1569,7 +1569,7 @@ async def handle_ml_pipeline_status(request):
     if not ws_mgr:
         return web.json_response(
             {
-                "snapshots": {"last": "", "last_verdict": "unknown", "next_in_sec": 0, "total_7d": 0, "pass_7d": 0, "fail_7d": 0, "recent": []},
+                "snapshots": {"last": "", "last_verdict": "unknown", "next_in_sec": 0, "total_7d": 0, "pass_7d": 0, "warn_7d": 0, "certified_7d": 0, "fail_7d": 0, "recent": []},
                 "training": {"last_run": "", "last_auc": 0.0, "model_version": "unavailable", "deployed_at": "", "retrain_trigger": None, "auto_state": {}, "run_count": 0},
                 "hourly_health": {"last_24h": [], "healthy_count": 0, "degraded_count": 0, "unhealthy_count": 0},
             }

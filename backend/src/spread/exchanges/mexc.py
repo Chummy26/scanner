@@ -158,6 +158,7 @@ class MexcWS(BaseExchangeWS):
         async with websockets.connect(
             MEXC_SPOT_WS_URL,
             ping_interval=20, ping_timeout=10,
+            proxy=None,
             max_size=16 * 1024 * 1024,
         ) as ws:
             # Subscribe in chunks to avoid too-large messages
@@ -245,6 +246,7 @@ class MexcWS(BaseExchangeWS):
         async with websockets.connect(
             MEXC_FUTURES_WS_URL,
             ping_interval=None, ping_timeout=None,
+            proxy=None,
             max_size=16 * 1024 * 1024,
         ) as ws:
             # Subscribe all symbols
@@ -425,18 +427,16 @@ class MexcWS(BaseExchangeWS):
         _cycle = 0
         while not self.shutdown.is_set():
             tickers = None
-            try:
-                payload = await asyncio.to_thread(
-                    _fetch_json_sync, MEXC_FUTURES_TICKERS, 10.0,
-                    {"User-Agent": "Mozilla/5.0"})
-                if isinstance(payload, dict):
-                    tickers = payload.get("data") or []
-                elif isinstance(payload, list):
-                    tickers = payload
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
+            payload = await self._fetch_json_fallback(
+                MEXC_FUTURES_TICKERS,
+                "futures_ticker_fallback",
+                timeout=10.0,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if isinstance(payload, dict):
+                tickers = payload.get("data") or []
+            elif isinstance(payload, list):
+                tickers = payload
 
             if tickers:
                 _updated = 0
@@ -491,16 +491,12 @@ class MexcWS(BaseExchangeWS):
 
         _cycle = 0
         while not self.shutdown.is_set():
-            tickers = None
-            try:
-                tickers = await asyncio.to_thread(
-                    _fetch_json_sync,
-                    "https://api.mexc.com/api/v3/ticker/bookTicker",
-                    10.0, {"User-Agent": "Mozilla/5.0"})
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
+            tickers = await self._fetch_json_fallback(
+                "https://api.mexc.com/api/v3/ticker/bookTicker",
+                "spot_ticker_fallback",
+                timeout=10.0,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
 
             if isinstance(tickers, list):
                 _updated = 0
