@@ -1153,9 +1153,12 @@ def evaluate_stage1(
         ),
         _bool_gate(
             "cross_exchange_rejection_rate",
-            _safe_float(latest_hour.get("rejection_rate_pct"), 0.0) < 10.0 if latest_hour else False,
-            value=latest_hour.get("rejection_rate_pct") if latest_hour else None,
-            expected="< 10%",
+            str(latest_hour.get("quality_verdict") or "") != "unhealthy" if latest_hour else False,
+            value={
+                "quality_verdict": latest_hour.get("quality_verdict"),
+                "rejection_rate_pct": latest_hour.get("rejection_rate_pct"),
+            } if latest_hour else None,
+            expected="verdict != unhealthy",
         ),
         _bool_gate(
             "feature_history_contract",
