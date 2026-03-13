@@ -152,20 +152,42 @@ def _iter_ndjson(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _load_hourly_health_samples(state_path: Path) -> list[dict[str, Any]]:
+def _load_hourly_health_samples(
+    state_path: Path,
+    *,
+    scope_start_ts: float | None = None,
+    scope_end_ts: float | None = None,
+) -> list[dict[str, Any]]:
     if not Path(state_path).is_file():
         return []
+    where_clauses: list[str] = []
+    params: list[float] = []
+    scoped_start = float(scope_start_ts or 0.0)
+    scoped_end = float(scope_end_ts or 0.0)
+    if scoped_end > 0.0 and scoped_start > 0.0 and scoped_end >= scoped_start:
+        # Keep only hourly digests that intersect the certification scope window.
+        where_clauses.append("hour_end_ts >= ? AND hour_start_ts <= ?")
+        params.extend([scoped_start, scoped_end])
+    elif scoped_end > 0.0:
+        where_clauses.append("hour_start_ts <= ?")
+        params.append(scoped_end)
+    elif scoped_start > 0.0:
+        where_clauses.append("hour_end_ts >= ?")
+        params.append(scoped_start)
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
     try:
         with sqlite3.connect(state_path, timeout=30.0) as conn:
             rows = list(
                 conn.execute(
-                    """
+                    f"""
                     SELECT hour_start_ts, hour_end_ts, records_total, records_rejected, rejection_rate_pct,
                            exchanges_active, exchanges_circuit_open_json, pairs_with_records, pairs_with_gaps,
                            cross_exchange_flags, avg_book_age_json, episode_count, quality_verdict, created_at
                     FROM tracker_hourly_health
+                    {where_sql}
                     ORDER BY hour_start_ts ASC
-                    """
+                    """,
+                    params,
                 )
             )
     except sqlite3.Error:
@@ -916,6 +938,8 @@ def _stream_quick_sqlite_metrics(
 
     checkpoint_count = int(((max_ts - min_ts) // CHECKPOINT_WINDOW_SEC) + 1) if total_records > 0 and max_ts >= min_ts else 0
     return {
+        "min_ts": float(min_ts),
+        "max_ts": float(max_ts),
         "pair_ids": sorted(pair_ids),
         "pair_record_counts": pair_record_counts,
         "pair_checkpoint_presence": pair_checkpoint_presence,
@@ -1417,7 +1441,13 @@ def run_training_certification(
 
         _check_timeout()
         if certification_mode == "quick":
-            hourly_health = _load_hourly_health_samples(state_path)
+            quick_scope_start = float(quick_sqlite_metrics.get("min_ts", 0.0) or 0.0) if quick_sqlite_metrics is not None else 0.0
+            quick_scope_end = float(quick_sqlite_metrics.get("max_ts", 0.0) or 0.0) if quick_sqlite_metrics is not None else 0.0
+            hourly_health = _load_hourly_health_samples(
+                state_path,
+                scope_start_ts=quick_scope_start,
+                scope_end_ts=quick_scope_end,
+            )
             if not hourly_health:
                 _skip_gate("gate_07_book_health", "Book health", "quick_mode_skipped")
             else:

@@ -343,7 +343,7 @@ class BaseExchangeWS(ABC):
                 )
             return None
         previous = int(self._fallback_error_counts.pop(label, 0) or 0)
-        if previous >= 3:
+        if previous > 0:
             logger.info(f"[{self.name.upper()}] {label} fetch recovered after {previous} errors")
         return payload
 

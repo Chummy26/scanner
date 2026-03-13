@@ -1060,6 +1060,141 @@ def test_certification_quick_mode_streams_sqlite_blocks_without_legacy_loader(tm
     assert payload["gate_results"]["gate_02_intra_block_temporal_regularity"]["details"]["total_blocks"] == 1
 
 
+def test_certification_quick_mode_scopes_hourly_health_to_selected_window(tmp_path: Path, monkeypatch):
+    state_path = tmp_path / "tracker_history_hourly_scope.sqlite"
+    with sqlite3.connect(state_path) as conn:
+        conn.execute("CREATE TABLE tracker_meta (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute(
+            """
+            CREATE TABLE tracker_capture_sessions (
+                id INTEGER PRIMARY KEY,
+                started_at REAL,
+                ended_at REAL,
+                status TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE tracker_pairs (
+                id INTEGER PRIMARY KEY,
+                symbol TEXT,
+                buy_ex TEXT,
+                buy_mt TEXT,
+                sell_ex TEXT,
+                sell_mt TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE tracker_pair_blocks (
+                id INTEGER PRIMARY KEY,
+                pair_id INTEGER,
+                session_id INTEGER,
+                start_ts REAL,
+                end_ts REAL,
+                record_count INTEGER,
+                boundary_reason TEXT,
+                selected_for_training INTEGER,
+                is_open INTEGER
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE tracker_records (
+                block_id INTEGER,
+                ts REAL,
+                entry_spread_pct REAL,
+                exit_spread_pct REAL
+            )
+            """
+        )
+        conn.execute("CREATE TABLE tracker_events (session_id INTEGER, block_id INTEGER, event_type TEXT, ts REAL)")
+        conn.execute(
+            """
+            CREATE TABLE tracker_hourly_health (
+                hour_start_ts REAL,
+                hour_end_ts REAL,
+                records_total INTEGER,
+                records_rejected INTEGER,
+                rejection_rate_pct REAL,
+                exchanges_active INTEGER,
+                exchanges_circuit_open_json TEXT,
+                pairs_with_records INTEGER,
+                pairs_with_gaps INTEGER,
+                cross_exchange_flags INTEGER,
+                avg_book_age_json TEXT,
+                episode_count INTEGER,
+                quality_verdict TEXT,
+                created_at REAL
+            )
+            """
+        )
+        conn.execute("INSERT INTO tracker_capture_sessions (id, started_at, ended_at, status) VALUES (201, 1000.0, 1100.0, 'closed')")
+        conn.execute("INSERT INTO tracker_pairs (id, symbol, buy_ex, buy_mt, sell_ex, sell_mt) VALUES (1, 'PAIR', 'a', 'spot', 'b', 'spot')")
+        conn.execute(
+            """
+            INSERT INTO tracker_pair_blocks (
+                id, pair_id, session_id, start_ts, end_ts, record_count, boundary_reason, selected_for_training, is_open
+            ) VALUES (2001, 1, 201, 1000.0, 1030.0, 3, 'closed', 1, 0)
+            """
+        )
+        conn.executemany(
+            "INSERT INTO tracker_records (block_id, ts, entry_spread_pct, exit_spread_pct) VALUES (?, ?, ?, ?)",
+            [
+                (2001, 1000.0, 0.20, -0.10),
+                (2001, 1015.0, 0.21, -0.09),
+                (2001, 1030.0, 0.22, -0.08),
+            ],
+        )
+        conn.execute(
+            """
+            INSERT INTO tracker_hourly_health (
+                hour_start_ts, hour_end_ts, records_total, records_rejected, rejection_rate_pct, exchanges_active,
+                exchanges_circuit_open_json, pairs_with_records, pairs_with_gaps, cross_exchange_flags,
+                avg_book_age_json, episode_count, quality_verdict, created_at
+            ) VALUES (900.0, 1200.0, 3, 0, 0.0, 2, '[]', 1, 0, 0, '{}', 0, 'healthy', 1200.0)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO tracker_hourly_health (
+                hour_start_ts, hour_end_ts, records_total, records_rejected, rejection_rate_pct, exchanges_active,
+                exchanges_circuit_open_json, pairs_with_records, pairs_with_gaps, cross_exchange_flags,
+                avg_book_age_json, episode_count, quality_verdict, created_at
+            ) VALUES (7200.0, 10800.0, 0, 0, 0.0, 0, '[]', 0, 0, 0, '{}', 0, 'unhealthy', 10800.0)
+            """
+        )
+        conn.commit()
+
+    payload = tc.run_training_certification(
+        state_file=state_path,
+        artifact_dir=tmp_path / "artifacts",
+        sequence_length=3,
+        prediction_horizon_sec=240,
+        thresholds=[0.8],
+        selected_session_ids=[201],
+        selected_block_ids=None,
+        allow_cross_session_merge=False,
+        max_session_gap_sec=None,
+        regime_shift_score_threshold=3.0,
+        certification_mode="quick",
+        max_certification_duration_sec=300,
+        allow_legacy_sessions=False,
+        runtime_audit_dir=None,
+        run_reconnection_stress=False,
+        preflight_fn=_preflight_ok,
+        dataset_fingerprint_fn=_fingerprint,
+    )
+
+    gate07 = payload["gate_results"]["gate_07_book_health"]
+    assert gate07["status"] == "PASS"
+    assert gate07["failure_reasons"] == []
+    assert gate07["details"]["hourly_health_sample_count"] == 1
+
+
 def test_scope_and_integrity_handle_more_than_999_block_ids(tmp_path: Path):
     db_path = tmp_path / "large_scope.sqlite"
     block_count = 1205

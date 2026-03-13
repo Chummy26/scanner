@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -220,6 +221,31 @@ def _sqlite_has_blocks(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
+def _placeholders(values: list[int]) -> str:
+    return ",".join("?" for _ in values)
+
+
+def _safe_in(
+    conn: sqlite3.Connection,
+    column_expr: str,
+    values: list[int],
+    *,
+    temp_table_prefix: str,
+) -> tuple[str, list[int]]:
+    normalized = sorted({int(value) for value in values if int(value) > 0})
+    if not normalized:
+        return "", []
+    if len(normalized) <= 999:
+        return f"{column_expr} IN ({_placeholders(normalized)})", normalized
+    temp_table_name = f"temp_{temp_table_prefix}_{time.time_ns()}"
+    conn.execute(f"CREATE TEMP TABLE {temp_table_name} (id INTEGER PRIMARY KEY)")
+    conn.executemany(
+        f"INSERT OR IGNORE INTO {temp_table_name}(id) VALUES (?)",
+        ((value,) for value in normalized),
+    )
+    return f"{column_expr} IN (SELECT id FROM {temp_table_name})", []
+
+
 def _load_blocks_from_sqlite(
     state_path: Path,
     *,
@@ -280,9 +306,15 @@ def _load_blocks_from_sqlite(
                     "selected_only": selected_only,
                     "closed_only": closed_only,
                 }
-            placeholders = ",".join("?" for _ in normalized_session_ids)
-            block_filter.append(f"b.session_id IN ({placeholders})")
-            params.extend(normalized_session_ids)
+            clause, clause_params = _safe_in(
+                conn,
+                "b.session_id",
+                normalized_session_ids,
+                temp_table_prefix="session_ids",
+            )
+            if clause:
+                block_filter.append(clause)
+                params.extend(clause_params)
         if selected_block_ids is not None:
             normalized_ids = [int(block_id) for block_id in selected_block_ids if int(block_id) > 0]
             if not normalized_ids:
@@ -293,9 +325,15 @@ def _load_blocks_from_sqlite(
                     "selected_only": selected_only,
                     "closed_only": closed_only,
                 }
-            placeholders = ",".join("?" for _ in normalized_ids)
-            block_filter.append(f"b.id IN ({placeholders})")
-            params.extend(normalized_ids)
+            clause, clause_params = _safe_in(
+                conn,
+                "b.id",
+                normalized_ids,
+                temp_table_prefix="block_ids",
+            )
+            if clause:
+                block_filter.append(clause)
+                params.extend(clause_params)
         where_clause = f"WHERE {' AND '.join(block_filter)}" if block_filter else ""
         block_rows = list(
             conn.execute(

@@ -1537,3 +1537,46 @@ def test_build_dataset_bundle_restores_cross_block_windows_within_same_session(t
     assert bundle.summary["skipped_windows_right_censored"] > 0
     assert sorted(set(bundle.block_ids)) == bundle.summary["block_ids_used"]
     assert all(block_id > 0 for block_id in bundle.block_ids)
+
+
+def test_load_blocks_from_sqlite_supports_large_selected_scopes(tmp_path: Path):
+    sqlite_path = _write_multi_session_sqlite(tmp_path / "tracker_history_large_blocks.sqlite", num_sessions=2)
+
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        block_ids = [int(row[0]) for row in conn.execute("SELECT id FROM tracker_pair_blocks ORDER BY id ASC LIMIT 3")]
+        session_ids = [
+            int(row[0])
+            for row in conn.execute("SELECT DISTINCT session_id FROM tracker_pair_blocks ORDER BY session_id ASC")
+        ]
+    finally:
+        conn.close()
+
+    assert block_ids
+    assert session_ids
+
+    large_block_ids = block_ids + list(range(1000, 2300))
+    blocks, saved_at, summary = _load_blocks_from_sqlite(
+        sqlite_path,
+        selected_block_ids=large_block_ids,
+        selected_only=False,
+        closed_only=False,
+    )
+
+    assert saved_at > 0.0
+    assert summary["num_blocks"] >= len(block_ids)
+    loaded_block_ids = {block["block_id"] for block in blocks}
+    for block_id in block_ids:
+        assert block_id in loaded_block_ids
+
+    large_session_ids = session_ids + list(range(2000, 3200))
+    session_blocks, _, session_summary = _load_blocks_from_sqlite(
+        sqlite_path,
+        selected_session_ids=large_session_ids,
+        selected_only=False,
+        closed_only=False,
+    )
+    assert session_blocks
+    assert session_summary["num_blocks"] == len(session_blocks)
+    loaded_session_ids = {block["session_id"] for block in session_blocks}
+    assert loaded_session_ids.issubset(set(large_session_ids))
