@@ -936,7 +936,7 @@ def _build_signal_confirmations(
     events: list[dict[str, Any]],
     snapshot_path: Path | None,
     *,
-    min_total_spread_pct: float = 1.0,
+    min_total_spread_pct: float = 0.50,
 ) -> dict[str, Any]:
     signal_events = [event for event in events if str(event.get("kind") or "") == "signal"]
     if snapshot_path is None or not snapshot_path.is_file() or snapshot_path.suffix.lower() != ".sqlite":
@@ -1681,7 +1681,7 @@ def finalize_runtime_audit_package(
     snapshot_path = output_root / snapshot_name
     training_root = output_root / "training_artifacts"
     training_root.mkdir(parents=True, exist_ok=True)
-    min_total_spread_pct = 1.0
+    min_total_spread_pct = 0.50
     try:
         create_sqlite_snapshot(source_state, snapshot_path)
         dataset_bundle = build_dataset_bundle(

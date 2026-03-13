@@ -275,8 +275,8 @@ class SpreadConfig:
     tracker_max_records_per_pair: int = 0  # 0 = derive from tracker_memory_window_sec / tracker_record_interval_sec
     tracker_gap_threshold_sec: float = 0.0  # 0 = derive from record interval (max(60, 4 * interval))
     tracker_capture_mode: str = "continuous_all_pairs"
-    min_total_spread_pct: float = 1.0
-    label_cost_floor_pct: float = 1.0
+    min_total_spread_pct: float = 0.50
+    label_cost_floor_pct: float = 0.50
     label_percentile: int = 70
     label_episode_window_days: int = 5
     tracker_db_path: str = ""

@@ -74,11 +74,11 @@ class WSManager:
             max_pairs=10_000,
             db_path=tracker_db_path,
             gap_threshold_sec=getattr(self.config, "tracker_gap_threshold_sec", 0.0),
-            min_total_spread_pct=getattr(self.config, "min_total_spread_pct", 1.0),
+            min_total_spread_pct=getattr(self.config, "min_total_spread_pct", 0.50),
         )
         self.ml_analyzer = SpreadMLAnalyzer(
             sequence_length=15,
-            min_total_spread_pct=getattr(self.config, "min_total_spread_pct", 1.0),
+            min_total_spread_pct=getattr(self.config, "min_total_spread_pct", 0.50),
         )
         self.ml_analyzer.attach_tracker(self.tracker)
         self.runtime_audit = None

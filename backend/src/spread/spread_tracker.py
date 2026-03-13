@@ -222,12 +222,24 @@ def compute_closed_episodes(records: Iterable[SpreadRecord]) -> list[TrackerEpis
             current_block_id = block_id
             active = None
 
-        history_entries = list(baseline_entries)
-        baseline_median = _median(history_entries) if history_entries else float(record.entry_spread_pct)
-        baseline_mad = max(_mad(history_entries, baseline_median), 0.0)
+        current_entry = float(record.entry_spread_pct)
+        n = len(baseline_entries)
+        if n > 0:
+            # Sort once, compute median and MAD inline — avoids redundant
+            # list copies and re-sorts that _median/_mad would do
+            history_sorted = sorted(baseline_entries)
+            mid = n >> 1
+            baseline_median = history_sorted[mid] if (n & 1) else (history_sorted[mid - 1] + history_sorted[mid]) * 0.5
+            deviations_sorted = sorted(abs(v - baseline_median) for v in baseline_entries)
+            baseline_mad = max(
+                deviations_sorted[mid] if (n & 1) else (deviations_sorted[mid - 1] + deviations_sorted[mid]) * 0.5,
+                0.0,
+            )
+        else:
+            baseline_median = current_entry
+            baseline_mad = 0.0
         activation_threshold = baseline_median + max(1.0 * baseline_mad, 0.05)
         release_threshold = baseline_median + max(0.25 * baseline_mad, 0.02)
-        current_entry = float(record.entry_spread_pct)
 
         if active is None:
             if last_entry is not None and last_entry <= activation_threshold and current_entry > activation_threshold:

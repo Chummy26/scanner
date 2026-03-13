@@ -1254,6 +1254,7 @@ def certify_data_for_training(
     allow_legacy_sessions: bool = False,
     runtime_audit_dir: Path | None = None,
     run_reconnection_stress: bool = False,
+    _preloaded_blocks: tuple[list, float, dict] | None = None,
 ) -> dict[str, Any]:
     default_state = Path(__file__).resolve().parent.parent.parent / "out" / "config" / "tracker_history.sqlite"
     state_path = Path(state_file) if state_file is not None else default_state
@@ -1279,6 +1280,7 @@ def certify_data_for_training(
         run_reconnection_stress=run_reconnection_stress,
         preflight_fn=run_threshold_preflight,
         dataset_fingerprint_fn=_build_dataset_fingerprint,
+        _preloaded_blocks=_preloaded_blocks,
     )
 
 
@@ -1508,7 +1510,7 @@ def run_training_loop(
     artifact_dir: Path | None = None,
     sequence_length: int = 15,
     prediction_horizon_sec: int = 14_400,
-    min_total_spread_pct: float = 1.0,
+    min_total_spread_pct: float = 0.50,
     label_cost_floor_pct: float | None = None,
     label_percentile: int | None = None,
     label_episode_window_days: int | None = None,
@@ -2006,6 +2008,7 @@ def run_clean_training_cycle(
         allow_legacy_sessions=allow_legacy_sessions,
         runtime_audit_dir=runtime_audit_dir,
         run_reconnection_stress=run_reconnection_stress,
+        _preloaded_blocks=_cached_blocks,
     )
     if not bool(certification.get("certified")):
         raise ValueError(

@@ -5,7 +5,7 @@ import json
 import math
 import sqlite3
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 from .feature_contracts import FEATURE_NAMES, build_feature_rows
-from .spread_tracker import SpreadRecord, compute_closed_episodes
+from .spread_tracker import SpreadRecord, TrackerEpisode, compute_closed_episodes
 
 _SQLITE_BLOCK_FETCH_CHUNK = 2000
 _DEFAULT_REGIME_SHIFT_SCORE_THRESHOLD = 3.0
@@ -548,15 +548,17 @@ def _build_closed_episodes_from_records(
 ) -> list[Any]:
     """Build episodes from already-normalized records (with block_id, session_id).
 
-    Avoids the redundant canonicalize + sort that _build_closed_episodes_for_blocks does.
+    Computes episodes directly from dict records — avoids 6.3M SpreadRecord
+    allocations and the redundant canonicalize + sort of _build_closed_episodes_for_blocks.
+    Uses the same algorithm as compute_closed_episodes but on dicts.
     """
     if not records:
         return []
-    # Assign sequential synthetic block_ids starting from 1.
-    # compute_closed_episodes resets state on block_id transitions and skips block_id=0.
+    # Assign synthetic block_ids starting from 1 (episode detector skips block_id=0
+    # and resets state on block_id transitions).
     storage_to_synthetic: dict[int, int] = {}
     counter = 0
-    spread_records: list[SpreadRecord] = []
+    tagged: list[tuple[int, dict[str, float | int]]] = []
     for r in records:
         storage_bid = int(r.get("block_id") or 0)
         syn = storage_to_synthetic.get(storage_bid)
@@ -564,19 +566,77 @@ def _build_closed_episodes_from_records(
             counter += 1
             syn = counter
             storage_to_synthetic[storage_bid] = syn
-        spread_records.append(
-            SpreadRecord(
-                timestamp=float(r["timestamp"]),
-                entry_spread_pct=float(r["entry_spread"]),
-                exit_spread_pct=float(r.get("exit_spread") or 0.0),
-                session_id=int(r.get("session_id") or 0),
-                block_id=syn,
-            )
-        )
+        tagged.append((syn, r))
     synthetic_to_storage = {v: k for k, v in storage_to_synthetic.items()}
-    episodes = compute_closed_episodes(spread_records)
-    for ep in episodes:
-        ep.block_id = int(synthetic_to_storage.get(int(ep.block_id or 0), int(ep.block_id or 0)))
+
+    # Sort by (synthetic_block_id, timestamp) — same order compute_closed_episodes uses
+    tagged.sort(key=lambda item: (item[0], float(item[1]["timestamp"])))
+
+    # Inline episode detection — same algorithm as compute_closed_episodes
+    _BASELINE_WINDOW = 32
+    _SOURCE_VERSION = "recurring_v1"
+    episodes: list[Any] = []
+    baseline: deque[float] = deque(maxlen=_BASELINE_WINDOW)
+    last_entry: float | None = None
+    current_bid = 0
+    active: TrackerEpisode | None = None
+
+    for syn_bid, r in tagged:
+        if syn_bid != current_bid:
+            baseline.clear()
+            last_entry = None
+            current_bid = syn_bid
+            active = None
+
+        current_entry = float(r["entry_spread"])
+        n = len(baseline)
+        if n > 0:
+            s = sorted(baseline)
+            mid = n >> 1
+            bmed = s[mid] if (n & 1) else (s[mid - 1] + s[mid]) * 0.5
+            ds = sorted(abs(v - bmed) for v in baseline)
+            bmad = max(ds[mid] if (n & 1) else (ds[mid - 1] + ds[mid]) * 0.5, 0.0)
+        else:
+            bmed = current_entry
+            bmad = 0.0
+
+        act_thresh = bmed + max(1.0 * bmad, 0.05)
+        rel_thresh = bmed + max(0.25 * bmad, 0.02)
+
+        if active is None:
+            if last_entry is not None and last_entry <= act_thresh and current_entry > act_thresh:
+                storage_bid = int(synthetic_to_storage.get(syn_bid, syn_bid))
+                active = TrackerEpisode(
+                    start_ts=float(r["timestamp"]),
+                    peak_ts=float(r["timestamp"]),
+                    end_ts=0.0,
+                    duration_sec=0.0,
+                    peak_entry_spread=current_entry,
+                    exit_spread_at_close=float(r.get("exit_spread") or 0.0),
+                    baseline_median=float(bmed),
+                    baseline_mad=float(bmad),
+                    activation_threshold=float(act_thresh),
+                    release_threshold=float(rel_thresh),
+                    session_id=int(r.get("session_id") or 0),
+                    block_id=storage_bid,
+                    source_version=_SOURCE_VERSION,
+                    is_closed=False,
+                )
+        else:
+            if current_entry >= active.peak_entry_spread:
+                active.peak_entry_spread = current_entry
+                active.peak_ts = float(r["timestamp"])
+            if current_entry <= active.release_threshold:
+                active.end_ts = float(r["timestamp"])
+                active.duration_sec = max(0.0, active.end_ts - active.start_ts)
+                active.exit_spread_at_close = float(r.get("exit_spread") or 0.0)
+                active.is_closed = True
+                episodes.append(active)
+                active = None
+
+        baseline.append(current_entry)
+        last_entry = current_entry
+
     return sorted(
         episodes,
         key=lambda ep: (float(ep.end_ts), float(ep.start_ts)),
@@ -609,20 +669,14 @@ def _normalized_block_records(block: dict[str, Any]) -> list[dict[str, float | i
     raw_records = block.get("records", [])
     if not raw_records:
         return []
-    # Fast path: canonical keys from SQLite loader — already sorted by ts ASC
+    # Fast path: canonical keys from SQLite loader — already sorted by ts ASC.
+    # Enrich in-place (add block_id/session_id) to avoid 6.3M dict allocations.
     first = raw_records[0]
     if isinstance(first, dict) and "timestamp" in first:
-        return [
-            {
-                "timestamp": float(r["timestamp"]),
-                "entry_spread": float(r["entry_spread"]),
-                "exit_spread": float(r.get("exit_spread") or 0.0),
-                "block_id": block_id,
-                "session_id": session_id,
-            }
-            for r in raw_records
-            if isinstance(r, dict)
-        ]
+        for r in raw_records:
+            r["block_id"] = block_id
+            r["session_id"] = session_id
+        return raw_records
     # Slow path: legacy format — needs coercion and sort
     result: list[dict[str, float | int]] = []
     for index, record in enumerate(raw_records):

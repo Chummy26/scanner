@@ -753,7 +753,7 @@ def audit_snapshot_labeling(
     *,
     sequence_length: int = 15,
     prediction_horizon_sec: int = 14_400,
-    label_cost_floor_pct: float = 1.0,
+    label_cost_floor_pct: float = 0.50,
     label_percentile: int = 70,
     label_episode_window_days: int = 5,
     selected_only: bool = False,
@@ -855,7 +855,10 @@ def audit_snapshot_labeling(
         "ok": True,
         "snapshot_path": str(path),
         "summary": dict(bundle.summary),
-        "positive_rate": _safe_float(bundle.summary.get("positive_rate"), 0.0),
+        "positive_rate": (
+            _safe_float(bundle.summary.get("num_positive_samples"), 0.0)
+            / max(1, int(bundle.summary.get("num_samples", 1)))
+        ),
         "label_threshold_mode": str(bundle.summary.get("label_threshold_mode") or ""),
         "label_thresholds": label_threshold_summary,
         "elevated_threshold_pairs": elevated_pairs,

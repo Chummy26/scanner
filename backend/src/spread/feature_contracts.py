@@ -253,13 +253,27 @@ def build_feature_rows(
     episodes: list[Any] | None = None,
 ) -> list[list[float]]:
     contract_version, expected_names = resolve_feature_contract(feature_names, version=feature_contract_version)
+    if not records:
+        return []
+    # Fast path: canonical dict records (already sorted from _normalized_block_records).
+    # Avoids 6.3M NormalizedRecord allocations + redundant sort.
+    first = records[0]
+    if isinstance(first, dict) and "timestamp" in first:
+        micro_features = _build_micro_feature_lists_dicts(records)
+        if contract_version == "v1_micro_10":
+            return micro_features
+        normalized_episodes = sorted(
+            [normalize_episode(episode) for episode in list(episodes or [])],
+            key=lambda item: item.end_ts,
+        )
+        multiscale_features = _build_multiscale_feature_lists_dicts(records, normalized_episodes)
+        return [micro + multi for micro, multi in zip(micro_features, multiscale_features)]
+    # Slow path: needs NormalizedRecord conversion + sort
     normalized_records = [
         normalize_record(record, fallback_ts=float(index))
         for index, record in enumerate(records)
     ]
     normalized_records.sort(key=lambda item: item.timestamp)
-    if not normalized_records:
-        return []
     micro_features = _build_micro_feature_lists(normalized_records)
     if contract_version == "v1_micro_10":
         return micro_features
@@ -325,6 +339,74 @@ def _build_micro_feature_lists(records: list[NormalizedRecord]) -> list[list[flo
         previous_exit = exit_spread
         previous_delta_entry = delta_entry
         previous_delta_exit = delta_exit
+    return rows
+
+
+def _build_micro_feature_lists_dicts(records: list[dict]) -> list[list[float]]:
+    """Micro features from dict records — avoids NormalizedRecord allocation."""
+    rows: list[list[float]] = []
+    previous_entry: float | None = None
+    previous_exit: float | None = None
+    previous_delta_entry: float | None = None
+    previous_delta_exit: float | None = None
+    entry_buffer: deque[float] = deque(maxlen=_MICRO_ROLLING_WINDOW)
+    exit_buffer: deque[float] = deque(maxlen=_MICRO_ROLLING_WINDOW)
+    for record in records:
+        entry_spread = float(record["entry_spread"])
+        exit_spread = float(record.get("exit_spread") or 0.0)
+        delta_entry = 0.0 if previous_entry is None else entry_spread - previous_entry
+        delta_exit = 0.0 if previous_exit is None else exit_spread - previous_exit
+        delta2_entry = 0.0 if previous_delta_entry is None else delta_entry - previous_delta_entry
+        delta2_exit = 0.0 if previous_delta_exit is None else delta_exit - previous_delta_exit
+        entry_buffer.append(entry_spread)
+        exit_buffer.append(exit_spread)
+        rolling_std_entry, zscore_entry = _rolling_std_zscore(entry_buffer, entry_spread)
+        rolling_std_exit, zscore_exit = _rolling_std_zscore(exit_buffer, exit_spread)
+        rows.append([
+            entry_spread, exit_spread,
+            delta_entry, delta_exit,
+            delta2_entry, delta2_exit,
+            rolling_std_entry, rolling_std_exit,
+            zscore_entry, zscore_exit,
+        ])
+        previous_entry = entry_spread
+        previous_exit = exit_spread
+        previous_delta_entry = delta_entry
+        previous_delta_exit = delta_exit
+    return rows
+
+
+def _build_multiscale_feature_lists_dicts(
+    records: list[dict],
+    episodes: list[NormalizedEpisode],
+) -> list[list[float]]:
+    """Multiscale features from dict records — avoids NormalizedRecord allocation."""
+    entry_windows = {
+        name: _RollingEntryWindow(seconds)
+        for name, seconds in _MULTISCALE_WINDOWS.items()
+    }
+    episode_windows = {
+        name: _RollingEpisodeCounter(seconds)
+        for name, seconds in _MULTISCALE_WINDOWS.items()
+    }
+    rows: list[list[float]] = []
+    for record in records:
+        current_ts = float(record["timestamp"])
+        current_entry = float(record["entry_spread"])
+        for window in entry_windows.values():
+            window.push(current_ts, current_entry)
+        counts = {
+            name: episode_windows[name].advance(episodes, current_ts)
+            for name in episode_windows
+        }
+        s30 = entry_windows["30m"].stats(current_entry)
+        s2h = entry_windows["2h"].stats(current_entry)
+        s8h = entry_windows["8h"].stats(current_entry)
+        rows.append([
+            s30.mean, s30.std, s30.max, float(counts["30m"]), s30.position_in_range,
+            s2h.mean, s2h.std, s2h.max, float(counts["2h"]), s2h.trend_slope_per_hour,
+            s8h.mean, s8h.std, s8h.max, float(counts["8h"]), s8h.zscore_vs_mean,
+        ])
     return rows
 
 

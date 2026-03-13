@@ -1107,6 +1107,7 @@ def run_training_certification(
     run_reconnection_stress: bool = False,
     preflight_fn: Callable[..., dict[str, Any]],
     dataset_fingerprint_fn: Callable[..., str],
+    _preloaded_blocks: tuple[list, float, dict] | None = None,
 ) -> dict[str, Any]:
     state_path = Path(state_file)
     artifact_root = Path(artifact_dir)
@@ -1150,13 +1151,16 @@ def run_training_certification(
     _cached_blocks_tuple = None
     _cached_segments_for_merge: dict[bool, tuple[list[dict[str, Any]], dict[str, Any]]] = {}
     if quick_sqlite_metrics is None:
-        _cached_blocks_tuple = _load_blocks_from_sqlite(
-            state_path,
-            selected_block_ids=effective_block_ids or None,
-            selected_session_ids=effective_session_ids or None,
-            selected_only=False,
-            closed_only=True,
-        )
+        if _preloaded_blocks is not None:
+            _cached_blocks_tuple = _preloaded_blocks
+        else:
+            _cached_blocks_tuple = _load_blocks_from_sqlite(
+                state_path,
+                selected_block_ids=effective_block_ids or None,
+                selected_session_ids=effective_session_ids or None,
+                selected_only=False,
+                closed_only=True,
+            )
         blocks = _cached_blocks_tuple[0]
         # Pre-compute segments for the current merge mode (reused by bundle builder)
         _cert_eff_gap = max_session_gap_sec
