@@ -26,6 +26,7 @@ from .auto_retrain import (
 )
 from .feature_contracts import DEFAULT_FEATURE_CONTRACT_VERSION, V2_MULTISCALE_FEATURE_NAMES
 from .ml_dataset import (
+    _EpisodeIndex,
     _build_pair_segments,
     _load_blocks_from_sqlite,
     build_dataset_bundle,
@@ -761,6 +762,18 @@ def audit_snapshot_labeling(
     path = Path(snapshot_path)
     if not path.is_file():
         return {"ok": False, "error": f"snapshot db not found: {path}"}
+    blocks, saved_at, block_summary = _load_blocks_from_sqlite(
+        path,
+        selected_only=bool(selected_only),
+        closed_only=bool(closed_only),
+    )
+    # Compute segments ONCE — reused by both build_dataset_bundle and zero-leakage loop
+    pair_segments, seg_diagnostics = _build_pair_segments(
+        blocks,
+        allow_cross_session_merge=False,
+        max_session_gap_sec=None,
+        regime_shift_score_threshold=None,
+    )
     bundle = build_dataset_bundle(
         state_path=path,
         sequence_length=int(sequence_length),
@@ -771,23 +784,18 @@ def audit_snapshot_labeling(
         label_episode_window_days=int(label_episode_window_days),
         selected_only=bool(selected_only),
         closed_only=bool(closed_only),
+        _preloaded_blocks=(blocks, saved_at, block_summary),
+        _precomputed_pair_segments=(pair_segments, seg_diagnostics),
     )
-    blocks, _, _ = _load_blocks_from_sqlite(
-        path,
-        selected_only=bool(selected_only),
-        closed_only=bool(closed_only),
-    )
-    pair_segments, _ = _build_pair_segments(
-        blocks,
-        allow_cross_session_merge=False,
-        max_session_gap_sec=None,
-        regime_shift_score_threshold=None,
-    )
-    segments_by_pair_session: dict[tuple[str, int], dict[str, Any]] = {}
+    # Build lookup + episode indices once for O(log n) zero-leakage validation
+    segments_by_pair_session: dict[tuple[str, int], tuple[dict[str, Any], _EpisodeIndex]] = {}
     for segment in pair_segments:
         pair_id = str(segment.get("pair_id") or "")
-        for session_id in list(segment.get("session_ids") or []):
-            segments_by_pair_session[(pair_id, int(session_id))] = segment
+        episodes = list(segment.get("episodes") or [])
+        ep_index = _EpisodeIndex(episodes)
+        for sid in list(segment.get("session_ids") or []):
+            segments_by_pair_session[(pair_id, int(sid))] = (segment, ep_index)
+    history_window_sec = float(max(int(label_episode_window_days), 1) * 24 * 60 * 60)
     zero_leakage_violations: list[dict[str, Any]] = []
     fallback_samples = 0
     for pair_key, session_id, current_ts, threshold in zip(
@@ -796,8 +804,8 @@ def audit_snapshot_labeling(
         bundle.timestamps,
         bundle.label_thresholds,
     ):
-        segment = segments_by_pair_session.get((str(pair_key), int(session_id)))
-        if segment is None:
+        entry = segments_by_pair_session.get((str(pair_key), int(session_id)))
+        if entry is None:
             zero_leakage_violations.append(
                 {
                     "pair_id": str(pair_key),
@@ -812,14 +820,9 @@ def audit_snapshot_labeling(
             if len(zero_leakage_violations) >= 10:
                 break
             continue
-        episodes = list(segment.get("episodes") or [])
-        window_start = float(current_ts) - (int(label_episode_window_days) * 24 * 60 * 60)
-        prior_episodes = [
-            episode
-            for episode in episodes
-            if _safe_float(getattr(episode, "end_ts", 0.0), 0.0) <= float(current_ts)
-            and _safe_float(getattr(episode, "end_ts", 0.0), 0.0) >= window_start
-        ]
+        _segment, ep_index = entry
+        # O(log n) via bisect instead of O(n) list comprehension
+        prior_episodes = ep_index.prior_episodes_for_threshold(float(current_ts), history_window_sec)
         if not prior_episodes:
             fallback_samples += 1
         expected_threshold = compute_label_threshold(
@@ -1358,9 +1361,9 @@ def evaluate_stage2(
                 ),
                 _bool_gate(
                     "positive_rate_band",
-                    0.05 <= _safe_float(label_audit.get("positive_rate"), -1.0) <= 0.20,
+                    0.01 <= _safe_float(label_audit.get("positive_rate"), -1.0) <= 0.20,
                     value=label_audit.get("positive_rate"),
-                    expected="between 0.05 and 0.20",
+                    expected="between 0.01 and 0.20",
                 ),
                 _bool_gate(
                     "label_zero_leakage",

@@ -4,7 +4,16 @@ import hashlib
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
+
+
+class _WindowStats(NamedTuple):
+    mean: float
+    std: float
+    max: float
+    position_in_range: float
+    zscore_vs_mean: float
+    trend_slope_per_hour: float
 
 V1_MICRO_FEATURE_NAMES = [
     "entry_spread",
@@ -111,18 +120,10 @@ class _RollingEntryWindow:
             if self.min_points and self.min_points[0] == (ts, entry):
                 self.min_points.popleft()
 
-    def stats(self, current_entry: float) -> dict[str, float]:
+    def stats(self, current_entry: float) -> _WindowStats:
         count = len(self.points)
         if count <= 0:
-            return {
-                "mean": 0.0,
-                "std": 0.0,
-                "max": 0.0,
-                "min": 0.0,
-                "position_in_range": 0.0,
-                "zscore_vs_mean": 0.0,
-                "trend_slope_per_hour": 0.0,
-            }
+            return _WindowStats(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         mean = self.sum_y / count
         variance = max((self.sum_y2 / count) - (mean * mean), 0.0)
         std = math.sqrt(variance)
@@ -137,15 +138,14 @@ class _RollingEntryWindow:
             if abs(denominator) > 1e-9
             else 0.0
         )
-        return {
-            "mean": float(mean),
-            "std": float(std),
-            "max": float(max_entry),
-            "min": float(min_entry),
-            "position_in_range": float(position),
-            "zscore_vs_mean": float(zscore),
-            "trend_slope_per_hour": float(slope),
-        }
+        return _WindowStats(
+            mean=float(mean),
+            std=float(std),
+            max=float(max_entry),
+            position_in_range=float(position),
+            zscore_vs_mean=float(zscore),
+            trend_slope_per_hour=float(slope),
+        )
 
 
 class _RollingEpisodeCounter:
@@ -200,35 +200,40 @@ def resolve_feature_contract(feature_names: list[str] | None = None, *, version:
 def normalize_record(record: Any, fallback_ts: float = 0.0) -> NormalizedRecord:
     if isinstance(record, NormalizedRecord):
         return record
-    timestamp = float(fallback_ts)
-    entry_spread = 0.0
-    exit_spread = 0.0
-    session_id = 0
-    block_id = 0
     if isinstance(record, dict):
-        timestamp = _coerce_float(record.get("timestamp", record.get("ts", fallback_ts)), fallback_ts)
-        entry_spread = _coerce_float(record.get("entry_spread", record.get("entry", record.get("entry_spread_pct", 0.0))), 0.0)
-        exit_spread = _coerce_float(record.get("exit_spread", record.get("exit", record.get("exit_spread_pct", 0.0))), 0.0)
-        session_id = int(record.get("session_id") or 0)
-        block_id = int(record.get("block_id") or 0)
-    else:
-        timestamp = _coerce_float(getattr(record, "timestamp", getattr(record, "ts", fallback_ts)), fallback_ts)
-        entry_spread = _coerce_float(
-            getattr(record, "entry_spread", getattr(record, "entry_spread_pct", getattr(record, "entry", 0.0))),
-            0.0,
+        # Fast path for canonical keys (loaded from optimized SQLite)
+        ts_val = record.get("timestamp")
+        if ts_val is not None:
+            return NormalizedRecord(
+                timestamp=float(ts_val),
+                entry_spread=float(record.get("entry_spread") or 0.0),
+                exit_spread=float(record.get("exit_spread") or 0.0),
+                session_id=int(record.get("session_id") or 0),
+                block_id=int(record.get("block_id") or 0),
+            )
+        # Legacy keys fallback
+        return NormalizedRecord(
+            timestamp=_coerce_float(record.get("ts", fallback_ts), fallback_ts),
+            entry_spread=_coerce_float(record.get("entry", record.get("entry_spread_pct", 0.0)), 0.0),
+            exit_spread=_coerce_float(record.get("exit", record.get("exit_spread_pct", 0.0)), 0.0),
+            session_id=int(record.get("session_id") or 0),
+            block_id=int(record.get("block_id") or 0),
         )
-        exit_spread = _coerce_float(
-            getattr(record, "exit_spread", getattr(record, "exit_spread_pct", getattr(record, "exit", 0.0))),
-            0.0,
-        )
-        session_id = int(getattr(record, "session_id", 0) or 0)
-        block_id = int(getattr(record, "block_id", 0) or 0)
+    timestamp = _coerce_float(getattr(record, "timestamp", getattr(record, "ts", fallback_ts)), fallback_ts)
+    entry_spread = _coerce_float(
+        getattr(record, "entry_spread", getattr(record, "entry_spread_pct", getattr(record, "entry", 0.0))),
+        0.0,
+    )
+    exit_spread = _coerce_float(
+        getattr(record, "exit_spread", getattr(record, "exit_spread_pct", getattr(record, "exit", 0.0))),
+        0.0,
+    )
     return NormalizedRecord(
         timestamp=float(timestamp),
         entry_spread=float(entry_spread),
         exit_spread=float(exit_spread),
-        session_id=session_id,
-        block_id=block_id,
+        session_id=int(getattr(record, "session_id", 0) or 0),
+        block_id=int(getattr(record, "block_id", 0) or 0),
     )
 
 
@@ -255,20 +260,15 @@ def build_feature_rows(
     normalized_records.sort(key=lambda item: item.timestamp)
     if not normalized_records:
         return []
-    micro_features = _build_micro_feature_dicts(normalized_records)
+    micro_features = _build_micro_feature_lists(normalized_records)
     if contract_version == "v1_micro_10":
-        return [[feature_row[name] for name in expected_names] for feature_row in micro_features]
+        return micro_features
     normalized_episodes = sorted(
         [normalize_episode(episode) for episode in list(episodes or [])],
         key=lambda item: item.end_ts,
     )
-    multiscale_features = _build_multiscale_feature_dicts(normalized_records, normalized_episodes)
-    rows: list[list[float]] = []
-    for micro_row, multiscale_row in zip(micro_features, multiscale_features):
-        combined = dict(micro_row)
-        combined.update(multiscale_row)
-        rows.append([float(combined.get(name, 0.0) or 0.0) for name in expected_names])
-    return rows
+    multiscale_features = _build_multiscale_feature_lists(normalized_records, normalized_episodes)
+    return [micro + multi for micro, multi in zip(micro_features, multiscale_features)]
 
 
 def _coerce_float(value: Any, default: float = 0.0) -> float:
@@ -289,8 +289,9 @@ def _rolling_std_zscore(buffer: deque[float], current: float) -> tuple[float, fl
     return float(std), float((current - mean) / std)
 
 
-def _build_micro_feature_dicts(records: list[NormalizedRecord]) -> list[dict[str, float]]:
-    rows: list[dict[str, float]] = []
+def _build_micro_feature_lists(records: list[NormalizedRecord]) -> list[list[float]]:
+    """Return micro features as lists (order matches V1_MICRO_FEATURE_NAMES)."""
+    rows: list[list[float]] = []
     previous_entry: float | None = None
     previous_exit: float | None = None
     previous_delta_entry: float | None = None
@@ -308,20 +309,18 @@ def _build_micro_feature_dicts(records: list[NormalizedRecord]) -> list[dict[str
         exit_buffer.append(exit_spread)
         rolling_std_entry, zscore_entry = _rolling_std_zscore(entry_buffer, entry_spread)
         rolling_std_exit, zscore_exit = _rolling_std_zscore(exit_buffer, exit_spread)
-        rows.append(
-            {
-                "entry_spread": float(entry_spread),
-                "exit_spread": float(exit_spread),
-                "delta_entry": float(delta_entry),
-                "delta_exit": float(delta_exit),
-                "delta2_entry": float(delta2_entry),
-                "delta2_exit": float(delta2_exit),
-                "rolling_std_entry": float(rolling_std_entry),
-                "rolling_std_exit": float(rolling_std_exit),
-                "zscore_entry": float(zscore_entry),
-                "zscore_exit": float(zscore_exit),
-            }
-        )
+        rows.append([
+            entry_spread,
+            exit_spread,
+            delta_entry,
+            delta_exit,
+            delta2_entry,
+            delta2_exit,
+            rolling_std_entry,
+            rolling_std_exit,
+            zscore_entry,
+            zscore_exit,
+        ])
         previous_entry = entry_spread
         previous_exit = exit_spread
         previous_delta_entry = delta_entry
@@ -329,10 +328,11 @@ def _build_micro_feature_dicts(records: list[NormalizedRecord]) -> list[dict[str
     return rows
 
 
-def _build_multiscale_feature_dicts(
+def _build_multiscale_feature_lists(
     records: list[NormalizedRecord],
     episodes: list[NormalizedEpisode],
-) -> list[dict[str, float]]:
+) -> list[list[float]]:
+    """Return multiscale features as lists (order matches V2 extra names)."""
     entry_windows = {
         name: _RollingEntryWindow(seconds)
         for name, seconds in _MULTISCALE_WINDOWS.items()
@@ -341,7 +341,7 @@ def _build_multiscale_feature_dicts(
         name: _RollingEpisodeCounter(seconds)
         for name, seconds in _MULTISCALE_WINDOWS.items()
     }
-    rows: list[dict[str, float]] = []
+    rows: list[list[float]] = []
     for record in records:
         current_ts = float(record.timestamp)
         current_entry = float(record.entry_spread)
@@ -351,26 +351,24 @@ def _build_multiscale_feature_dicts(
             name: episode_windows[name].advance(episodes, current_ts)
             for name in episode_windows
         }
-        stats_30m = entry_windows["30m"].stats(current_entry)
-        stats_2h = entry_windows["2h"].stats(current_entry)
-        stats_8h = entry_windows["8h"].stats(current_entry)
-        rows.append(
-            {
-                "mean_entry_30m": float(stats_30m["mean"]),
-                "std_entry_30m": float(stats_30m["std"]),
-                "max_entry_30m": float(stats_30m["max"]),
-                "episode_count_30m": float(counts["30m"]),
-                "position_in_range_30m": float(stats_30m["position_in_range"]),
-                "mean_entry_2h": float(stats_2h["mean"]),
-                "std_entry_2h": float(stats_2h["std"]),
-                "max_entry_2h": float(stats_2h["max"]),
-                "episode_count_2h": float(counts["2h"]),
-                "trend_slope_2h": float(stats_2h["trend_slope_per_hour"]),
-                "mean_entry_8h": float(stats_8h["mean"]),
-                "std_entry_8h": float(stats_8h["std"]),
-                "max_entry_8h": float(stats_8h["max"]),
-                "episode_count_8h": float(counts["8h"]),
-                "zscore_vs_8h": float(stats_8h["zscore_vs_mean"]),
-            }
-        )
+        s30 = entry_windows["30m"].stats(current_entry)
+        s2h = entry_windows["2h"].stats(current_entry)
+        s8h = entry_windows["8h"].stats(current_entry)
+        rows.append([
+            s30.mean,
+            s30.std,
+            s30.max,
+            float(counts["30m"]),
+            s30.position_in_range,
+            s2h.mean,
+            s2h.std,
+            s2h.max,
+            float(counts["2h"]),
+            s2h.trend_slope_per_hour,
+            s8h.mean,
+            s8h.std,
+            s8h.max,
+            float(counts["8h"]),
+            s8h.zscore_vs_mean,
+        ])
     return rows

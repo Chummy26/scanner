@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import json
 import math
 import sqlite3
@@ -15,7 +16,7 @@ import torch
 from .feature_contracts import FEATURE_NAMES, build_feature_rows
 from .spread_tracker import SpreadRecord, compute_closed_episodes
 
-_SQLITE_BLOCK_FETCH_CHUNK = 500
+_SQLITE_BLOCK_FETCH_CHUNK = 2000
 _DEFAULT_REGIME_SHIFT_SCORE_THRESHOLD = 3.0
 _MIN_REGIME_WINDOW_RECORDS = 5
 _MAX_REGIME_WINDOW_RECORDS = 20
@@ -78,11 +79,7 @@ def _coerce_float(value: Any, default: float = 0.0) -> float:
 
 def canonicalize_record(record: dict[str, Any], fallback_ts: float) -> dict[str, float]:
     if "timestamp" in record and "entry_spread" in record and "exit_spread" in record:
-        return {
-            "timestamp": _coerce_float(record.get("timestamp"), fallback_ts),
-            "entry_spread": _coerce_float(record.get("entry_spread"), 0.0),
-            "exit_spread": _coerce_float(record.get("exit_spread"), 0.0),
-        }
+        return record  # Already canonical — zero allocation
     return {
         "timestamp": _coerce_float(record.get("ts"), fallback_ts),
         "entry_spread": _coerce_float(record.get("entry", record.get("entry_spread_pct", 0.0)), 0.0),
@@ -204,9 +201,9 @@ def _load_pairs_from_sqlite(state_path: Path) -> tuple[dict[str, Any], float]:
                 continue
             payload["records"].append(
                 {
-                    "ts": _coerce_float(row["ts"], 0.0),
-                    "entry": _coerce_float(row["entry_spread_pct"], 0.0),
-                    "exit": _coerce_float(row["exit_spread_pct"], 0.0),
+                    "timestamp": _coerce_float(row["ts"], 0.0),
+                    "entry_spread": _coerce_float(row["entry_spread_pct"], 0.0),
+                    "exit_spread": _coerce_float(row["exit_spread_pct"], 0.0),
                 }
             )
     finally:
@@ -258,6 +255,17 @@ def _load_blocks_from_sqlite(
     saved_at = 0.0
     conn = sqlite3.connect(state_path, timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=-262144")  # 256MB cache (4x previous)
+    # mmap the entire file for read-heavy workloads
+    try:
+        db_size = Path(state_path).stat().st_size
+        conn.execute(f"PRAGMA mmap_size={max(268435456, db_size + 10 * 1024 * 1024)}")
+    except OSError:
+        conn.execute("PRAGMA mmap_size=268435456")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA query_only=1")
     try:
         if not _sqlite_has_blocks(conn):
             pairs, saved_at = _load_pairs_from_sqlite(state_path)
@@ -410,9 +418,9 @@ def _load_blocks_from_sqlite(
                     continue
                 payload["records"].append(
                     {
-                        "ts": _coerce_float(row["ts"], 0.0),
-                        "entry": _coerce_float(row["entry_spread_pct"], 0.0),
-                        "exit": _coerce_float(row["exit_spread_pct"], 0.0),
+                        "timestamp": _coerce_float(row["ts"], 0.0),
+                        "entry_spread": _coerce_float(row["entry_spread_pct"], 0.0),
+                        "exit_spread": _coerce_float(row["exit_spread_pct"], 0.0),
                     }
                 )
 
@@ -535,7 +543,53 @@ def _build_closed_episodes_for_blocks(blocks: list[dict[str, Any]]) -> list[Any]
     )
 
 
+def _build_closed_episodes_from_records(
+    records: list[dict[str, float | int]],
+) -> list[Any]:
+    """Build episodes from already-normalized records (with block_id, session_id).
+
+    Avoids the redundant canonicalize + sort that _build_closed_episodes_for_blocks does.
+    """
+    if not records:
+        return []
+    # Assign sequential synthetic block_ids starting from 1.
+    # compute_closed_episodes resets state on block_id transitions and skips block_id=0.
+    storage_to_synthetic: dict[int, int] = {}
+    counter = 0
+    spread_records: list[SpreadRecord] = []
+    for r in records:
+        storage_bid = int(r.get("block_id") or 0)
+        syn = storage_to_synthetic.get(storage_bid)
+        if syn is None:
+            counter += 1
+            syn = counter
+            storage_to_synthetic[storage_bid] = syn
+        spread_records.append(
+            SpreadRecord(
+                timestamp=float(r["timestamp"]),
+                entry_spread_pct=float(r["entry_spread"]),
+                exit_spread_pct=float(r.get("exit_spread") or 0.0),
+                session_id=int(r.get("session_id") or 0),
+                block_id=syn,
+            )
+        )
+    synthetic_to_storage = {v: k for k, v in storage_to_synthetic.items()}
+    episodes = compute_closed_episodes(spread_records)
+    for ep in episodes:
+        ep.block_id = int(synthetic_to_storage.get(int(ep.block_id or 0), int(ep.block_id or 0)))
+    return sorted(
+        episodes,
+        key=lambda ep: (float(ep.end_ts), float(ep.start_ts)),
+    )
+
+
 def _windowed_entry_spreads(records: list[dict[str, Any]], *, tail: bool, limit: int) -> list[float]:
+    # Fast path: records already canonical and sorted (from _normalized_block_records)
+    if records and isinstance(records[0], dict) and "timestamp" in records[0]:
+        if tail:
+            return [float(r["entry_spread"]) for r in records[-max(int(limit), 0):]]
+        return [float(r["entry_spread"]) for r in records[: max(int(limit), 0)]]
+    # Slow path: legacy format
     normalized = [
         canonicalize_record(record, fallback_ts=float(index))
         for index, record in enumerate(records)
@@ -552,22 +606,40 @@ def _windowed_entry_spreads(records: list[dict[str, Any]], *, tail: bool, limit:
 def _normalized_block_records(block: dict[str, Any]) -> list[dict[str, float | int]]:
     block_id = int(block.get("block_id") or 0)
     session_id = int(block.get("session_id") or 0)
-    normalized = [
-        canonicalize_record(record, fallback_ts=float(index))
-        for index, record in enumerate(block.get("records", []))
-        if isinstance(record, dict)
-    ]
-    normalized.sort(key=lambda record: record["timestamp"])
-    return [
-        {
-            "timestamp": float(record["timestamp"]),
-            "entry_spread": float(record["entry_spread"]),
-            "exit_spread": float(record["exit_spread"]),
-            "block_id": int(block_id),
-            "session_id": int(session_id),
-        }
-        for record in normalized
-    ]
+    raw_records = block.get("records", [])
+    if not raw_records:
+        return []
+    # Fast path: canonical keys from SQLite loader — already sorted by ts ASC
+    first = raw_records[0]
+    if isinstance(first, dict) and "timestamp" in first:
+        return [
+            {
+                "timestamp": float(r["timestamp"]),
+                "entry_spread": float(r["entry_spread"]),
+                "exit_spread": float(r.get("exit_spread") or 0.0),
+                "block_id": block_id,
+                "session_id": session_id,
+            }
+            for r in raw_records
+            if isinstance(r, dict)
+        ]
+    # Slow path: legacy format — needs coercion and sort
+    result: list[dict[str, float | int]] = []
+    for index, record in enumerate(raw_records):
+        if not isinstance(record, dict):
+            continue
+        ts = _coerce_float(record.get("ts"), float(index))
+        entry = _coerce_float(record.get("entry", record.get("entry_spread_pct", 0.0)), 0.0)
+        exit_ = _coerce_float(record.get("exit", record.get("exit_spread_pct", 0.0)), 0.0)
+        result.append({
+            "timestamp": ts,
+            "entry_spread": entry,
+            "exit_spread": exit_,
+            "block_id": block_id,
+            "session_id": session_id,
+        })
+    result.sort(key=lambda record: record["timestamp"])
+    return result
 
 
 def _regime_window_size(left_record_count: int, right_record_count: int) -> int:
@@ -696,7 +768,7 @@ def _build_pair_segments(
                 "session_ids": [int(session_id)],
                 "blocks": ordered_blocks,
                 "records": records,
-                "episodes": _build_closed_episodes_for_blocks(ordered_blocks),
+                "episodes": _build_closed_episodes_from_records(records),
                 "observable_end_ts": float(observable_end_ts),
                 "start_ts": float(start_ts),
                 "end_ts": float(observable_end_ts),
@@ -798,6 +870,48 @@ def compute_label_threshold(
     return float(max(float(cost_floor_pct), np.percentile(np.asarray(total_spreads, dtype=float), float(percentile))))
 
 
+class _EpisodeIndex:
+    """Pre-indexed episode data for fast lookups during window sliding."""
+
+    __slots__ = ("episodes", "_end_ts_sorted", "_sort_order", "_start_ts", "_end_ts", "_total_spread")
+
+    def __init__(self, episodes: list[Any]) -> None:
+        self.episodes = episodes
+        if not episodes:
+            self._end_ts_sorted = np.empty(0, dtype=np.float64)
+            self._sort_order = np.empty(0, dtype=np.intp)
+            self._start_ts = np.empty(0, dtype=np.float64)
+            self._end_ts = np.empty(0, dtype=np.float64)
+            self._total_spread = np.empty(0, dtype=np.float64)
+            return
+        self._end_ts = np.array([float(getattr(ep, "end_ts", 0.0) or 0.0) for ep in episodes], dtype=np.float64)
+        self._start_ts = np.array([float(ep.start_ts) for ep in episodes], dtype=np.float64)
+        self._total_spread = np.array([float(ep.total_spread) for ep in episodes], dtype=np.float64)
+        self._sort_order = np.argsort(self._end_ts)
+        self._end_ts_sorted = self._end_ts[self._sort_order]
+
+    def prior_episodes_for_threshold(self, current_ts: float, history_window_sec: float) -> list[Any]:
+        lo = bisect.bisect_left(self._end_ts_sorted, current_ts - history_window_sec)
+        hi = bisect.bisect_right(self._end_ts_sorted, current_ts)
+        return [self.episodes[self._sort_order[i]] for i in range(lo, hi)]
+
+    def future_episodes_with_spreads(
+        self, current_ts: float, horizon_end_ts: float, pair_threshold: float,
+    ) -> tuple[list[float], Any | None, float]:
+        mask = (self._start_ts > current_ts) & (self._end_ts <= horizon_end_ts)
+        idxs = np.where(mask)[0]
+        if idxs.size == 0:
+            return [], None, 0.0
+        spreads = self._total_spread[idxs]
+        future_total_spreads = spreads.tolist()
+        peak = float(spreads.max())
+        qualified_mask = spreads >= pair_threshold
+        if not np.any(qualified_mask):
+            return future_total_spreads, None, peak
+        first_qualified_pos = int(np.argmax(qualified_mask))
+        return future_total_spreads, self.episodes[idxs[first_qualified_pos]], peak
+
+
 def _label_window_from_episodes(
     current_ts: float,
     episodes: list[Any],
@@ -809,19 +923,24 @@ def _label_window_from_episodes(
     label_cost_floor_pct: float | None = None,
     label_percentile: float = 70.0,
     label_episode_window_days: int = 5,
+    _episode_index: _EpisodeIndex | None = None,
 ) -> dict[str, Any]:
     horizon_end_ts = float(current_ts) + float(prediction_horizon_sec)
     effective_cost_floor = float(max(0.0, label_cost_floor_pct if label_cost_floor_pct is not None else min_total_spread_pct or 0.0))
     pair_threshold = float(max(0.0, min_total_spread_pct or 0.0))
     threshold_support = 0
+    ep_idx = _episode_index
     if adaptive_threshold_enabled:
         history_window_sec = max(int(label_episode_window_days), 1) * 24 * 60 * 60
-        prior_episodes = [
-            episode
-            for episode in episodes
-            if float(getattr(episode, "end_ts", 0.0) or 0.0) <= float(current_ts)
-            and float(getattr(episode, "end_ts", 0.0) or 0.0) >= (float(current_ts) - float(history_window_sec))
-        ]
+        if ep_idx is not None:
+            prior_episodes = ep_idx.prior_episodes_for_threshold(current_ts, float(history_window_sec))
+        else:
+            prior_episodes = [
+                episode
+                for episode in episodes
+                if float(getattr(episode, "end_ts", 0.0) or 0.0) <= float(current_ts)
+                and float(getattr(episode, "end_ts", 0.0) or 0.0) >= (float(current_ts) - float(history_window_sec))
+            ]
         threshold_support = int(len(prior_episodes))
         pair_threshold = compute_label_threshold(
             pair_key,
@@ -829,37 +948,39 @@ def _label_window_from_episodes(
             cost_floor_pct=effective_cost_floor,
             percentile=label_percentile,
         )
-    future_episodes = [
-        episode
-        for episode in episodes
-        if float(episode.start_ts) > float(current_ts)
-        and float(episode.end_ts) <= horizon_end_ts
-    ]
-    future_total_spreads = [float(episode.total_spread) for episode in future_episodes]
-    qualified_episodes = [
-        episode
-        for episode in future_episodes
-        if float(episode.total_spread) >= float(pair_threshold)
-    ]
-    if qualified_episodes:
-        first_qualified = qualified_episodes[0]
+    if ep_idx is not None:
+        future_total_spreads, first_qualified, peak = ep_idx.future_episodes_with_spreads(
+            current_ts, horizon_end_ts, pair_threshold,
+        )
+    else:
+        future_episodes = [
+            episode
+            for episode in episodes
+            if float(episode.start_ts) > float(current_ts)
+            and float(episode.end_ts) <= horizon_end_ts
+        ]
+        future_total_spreads = [float(episode.total_spread) for episode in future_episodes]
+        peak = max(future_total_spreads) if future_total_spreads else 0.0
+        qualified = [ep for ep in future_episodes if float(ep.total_spread) >= float(pair_threshold)]
+        first_qualified = qualified[0] if qualified else None
+    if first_qualified is not None:
         return {
             "y_class": 1.0,
             "y_eta": float(first_qualified.end_ts) - float(current_ts),
             "timeout_reason": "qualified_episode",
             "label_threshold": float(pair_threshold),
             "label_threshold_support": int(threshold_support),
-            "peak_future_total_spread": max(future_total_spreads) if future_total_spreads else 0.0,
+            "peak_future_total_spread": peak,
             "qualified_episode_total_spread": float(first_qualified.total_spread),
             "future_episode_total_spreads": future_total_spreads,
         }
     return {
         "y_class": 0.0,
         "y_eta": 0.0,
-        "timeout_reason": "sub_threshold_only" if future_episodes else "no_future_episode",
+        "timeout_reason": "sub_threshold_only" if future_total_spreads else "no_future_episode",
         "label_threshold": float(pair_threshold),
         "label_threshold_support": int(threshold_support),
-        "peak_future_total_spread": max(future_total_spreads) if future_total_spreads else 0.0,
+        "peak_future_total_spread": peak,
         "qualified_episode_total_spread": 0.0,
         "future_episode_total_spreads": future_total_spreads,
     }
@@ -963,6 +1084,22 @@ def _block_threshold_counts(record_counts: list[int]) -> dict[str, int]:
     }
 
 
+def _pure_python_median(values: list[float]) -> float:
+    """Fast median for small lists — avoids numpy overhead."""
+    n = len(values)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return values[0]
+    if n == 2:
+        return (values[0] + values[1]) * 0.5
+    values.sort()
+    mid = n >> 1
+    if n & 1:
+        return values[mid]
+    return (values[mid - 1] + values[mid]) * 0.5
+
+
 def _build_block_diagnostics(blocks: list[dict[str, Any]], *, sequence_length: int) -> dict[str, Any]:
     if not blocks:
         return _empty_block_diagnostics(sequence_length)
@@ -972,76 +1109,86 @@ def _build_block_diagnostics(blocks: list[dict[str, Any]], *, sequence_length: i
     median_intervals: list[float] = []
     max_to_median_ratios: list[float] = []
     irregular_block_count = 0
-    session_blocks: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    # Use tuples instead of dicts for per-block session data (avoids 1.675M dict allocations)
+    # (record_count, duration_sec, median_interval, max_to_median_ratio, is_irregular)
+    session_block_tuples: dict[int, list[tuple[int, float, float, float, bool]]] = defaultdict(list)
 
     for block in blocks:
-        records = [record for record in block.get("records", []) if isinstance(record, dict)]
-        record_count = int(block.get("record_count") or len(records))
+        record_count = int(block.get("record_count") or len(block.get("records", [])))
         start_ts = float(block.get("start_ts") or 0.0)
         end_ts = float(block.get("end_ts") or 0.0)
-        if (start_ts <= 0.0 or end_ts <= 0.0) and records:
-            normalized_records = [
-                canonicalize_record(record, fallback_ts=float(index))
-                for index, record in enumerate(records)
-            ]
-            normalized_records.sort(key=lambda record: record["timestamp"])
-            start_ts = float(normalized_records[0]["timestamp"])
-            end_ts = float(normalized_records[-1]["timestamp"])
-        else:
-            normalized_records = [
-                canonicalize_record(record, fallback_ts=float(index))
-                for index, record in enumerate(records)
-            ]
-            normalized_records.sort(key=lambda record: record["timestamp"])
-        intervals = [
-            float(curr["timestamp"]) - float(prev["timestamp"])
-            for prev, curr in zip(normalized_records, normalized_records[1:])
-        ]
-        median_interval = float(np.median(np.asarray(intervals, dtype=float))) if intervals else 0.0
-        max_interval = max(intervals) if intervals else 0.0
-        max_to_median_ratio = (
-            float(max_interval) / max(float(median_interval), 1e-6)
-            if intervals and median_interval > 0.0
-            else 0.0
-        )
-        is_irregular = bool(intervals and (max_to_median_ratio > 3.0))
+        median_interval = 0.0
+        max_to_median_ratio = 0.0
+        is_irregular = False
+        if record_count >= 2:
+            raw_records = block.get("records", [])
+            if raw_records:
+                # Compute intervals directly using pure Python (numpy has too much
+                # overhead for typical 3-4 element arrays at 1.675M blocks)
+                prev_ts = None
+                intervals: list[float] = []
+                first_ts = 0.0
+                last_ts = 0.0
+                for r in raw_records:
+                    if not isinstance(r, dict):
+                        continue
+                    ts = float(r.get("timestamp") or r.get("ts") or 0.0)
+                    if prev_ts is not None:
+                        intervals.append(ts - prev_ts)
+                    else:
+                        first_ts = ts
+                    last_ts = ts
+                    prev_ts = ts
+                if start_ts <= 0.0 or end_ts <= 0.0:
+                    start_ts = first_ts
+                    end_ts = last_ts
+                if intervals:
+                    max_interval = max(intervals)
+                    median_interval = _pure_python_median(intervals)
+                    if median_interval > 0.0:
+                        max_to_median_ratio = max_interval / median_interval
+                        is_irregular = max_to_median_ratio > 3.0
+        elif record_count == 1 and (start_ts <= 0.0 or end_ts <= 0.0):
+            raw_records = block.get("records", [])
+            if raw_records:
+                r = raw_records[0]
+                if isinstance(r, dict):
+                    ts = float(r.get("timestamp") or r.get("ts") or 0.0)
+                    start_ts = ts
+                    end_ts = ts
+        duration = max(0.0, end_ts - start_ts)
         record_counts.append(record_count)
-        durations.append(max(0.0, end_ts - start_ts))
+        durations.append(duration)
         if median_interval > 0.0:
-            median_intervals.append(float(median_interval))
+            median_intervals.append(median_interval)
         if max_to_median_ratio > 0.0:
-            max_to_median_ratios.append(float(max_to_median_ratio))
+            max_to_median_ratios.append(max_to_median_ratio)
         if is_irregular:
             irregular_block_count += 1
-        session_blocks[int(block.get("session_id") or 0)].append(
-            {
-                "record_count": record_count,
-                "duration_sec": max(0.0, end_ts - start_ts),
-                "median_inter_record_interval_sec": float(median_interval),
-                "max_to_median_interval_ratio": float(max_to_median_ratio),
-                "is_irregular": is_irregular,
-            }
+        session_block_tuples[int(block.get("session_id") or 0)].append(
+            (record_count, duration, median_interval, max_to_median_ratio, is_irregular)
         )
 
     eligible_sessions = 0
     session_summaries: dict[str, Any] = {}
-    for session_id, items in sorted(session_blocks.items()):
-        session_record_counts = [int(item["record_count"]) for item in items]
+    # Tuple indices: 0=record_count, 1=duration, 2=median_interval, 3=max_to_median_ratio, 4=is_irregular
+    for session_id, items in sorted(session_block_tuples.items()):
+        session_record_counts = [t[0] for t in items]
         session_threshold_counts = _block_threshold_counts(session_record_counts)
-        eligible_block_count = int(sum(1 for record_count in session_record_counts if record_count >= int(sequence_length)))
+        eligible_block_count = int(sum(1 for rc in session_record_counts if rc >= int(sequence_length)))
         if eligible_block_count > 0:
             eligible_sessions += 1
         session_summaries[str(session_id)] = {
             "num_blocks": len(items),
             "record_count_quantiles": _quantile_summary(session_record_counts),
-            "duration_sec_quantiles": _quantile_summary([float(item["duration_sec"]) for item in items]),
+            "duration_sec_quantiles": _quantile_summary([t[1] for t in items]),
             "inter_record_interval_sec_quantiles": _quantile_summary(
-                [float(item["median_inter_record_interval_sec"]) for item in items if float(item["median_inter_record_interval_sec"]) > 0.0]
+                [t[2] for t in items if t[2] > 0.0]
             ),
             "max_to_median_interval_ratio_quantiles": _quantile_summary(
-                [float(item["max_to_median_interval_ratio"]) for item in items if float(item["max_to_median_interval_ratio"]) > 0.0]
+                [t[3] for t in items if t[3] > 0.0]
             ),
-            "irregular_block_count": int(sum(1 for item in items if bool(item["is_irregular"]))),
+            "irregular_block_count": int(sum(1 for t in items if t[4])),
             "max_record_count": max(session_record_counts) if session_record_counts else 0,
             "record_count_threshold_counts": session_threshold_counts,
             "eligible_blocks_for_sequence_length": eligible_block_count,
@@ -1079,6 +1226,8 @@ def build_dataset_bundle(
     allow_cross_session_merge: bool = False,
     max_session_gap_sec: float | None = None,
     regime_shift_score_threshold: float | None = _DEFAULT_REGIME_SHIFT_SCORE_THRESHOLD,
+    _preloaded_blocks: tuple[list[dict[str, Any]], float, dict[str, Any]] | None = None,
+    _precomputed_pair_segments: tuple[list[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> DatasetBundle:
     X_samples: list[list[list[float]]] = []
     y_class: list[float] = []
@@ -1102,7 +1251,10 @@ def build_dataset_bundle(
     skipped_windows_right_censored = 0
     pair_label_thresholds: dict[str, list[float]] = defaultdict(list)
 
-    if state_path.suffix.lower() == ".json":
+    if _preloaded_blocks is not None:
+        blocks, saved_at, block_summary = _preloaded_blocks
+        storage_kind = str(block_summary.get("state_storage_kind", "preloaded"))
+    elif state_path.suffix.lower() == ".json":
         pairs, saved_at = _load_pairs_from_json(state_path)
         blocks = []
         for pair_id, payload in pairs.items():
@@ -1141,12 +1293,15 @@ def build_dataset_bundle(
     if bool(allow_cross_session_merge) and effective_max_session_gap_sec is None:
         effective_max_session_gap_sec = _load_tracker_gap_threshold_sec(state_path)
     block_diagnostics = _build_block_diagnostics(blocks, sequence_length=sequence_length)
-    pair_segments, cross_session_merge_diagnostics = _build_pair_segments(
-        blocks,
-        allow_cross_session_merge=bool(allow_cross_session_merge),
-        max_session_gap_sec=effective_max_session_gap_sec,
-        regime_shift_score_threshold=regime_shift_score_threshold,
-    )
+    if _precomputed_pair_segments is not None:
+        pair_segments, cross_session_merge_diagnostics = _precomputed_pair_segments
+    else:
+        pair_segments, cross_session_merge_diagnostics = _build_pair_segments(
+            blocks,
+            allow_cross_session_merge=bool(allow_cross_session_merge),
+            max_session_gap_sec=effective_max_session_gap_sec,
+            regime_shift_score_threshold=regime_shift_score_threshold,
+        )
     segment_episodes = [
         episode
         for segment in pair_segments
@@ -1161,7 +1316,7 @@ def build_dataset_bundle(
     skipped_blocks_too_short = sum(
         1
         for block in blocks
-        if len(_normalized_block_records(block)) < int(sequence_length)
+        if int(block.get("record_count") or len(block.get("records", []))) < int(sequence_length)
     )
     skipped_windows_cross_session_boundary = 0
     cross_block_window_count = 0
@@ -1178,15 +1333,18 @@ def build_dataset_bundle(
             feature_names=list(FEATURE_NAMES),
             episodes=episodes,
         )
+        _seg_session_ids = np.array([int(r.get("session_id") or 0) for r in segment_records], dtype=np.int64)
+        _seg_block_ids = np.array([int(r.get("block_id") or 0) for r in segment_records], dtype=np.int64)
+        _ep_index = _EpisodeIndex(episodes)
         for start in range(len(segment_records) - sequence_length + 1):
             window = segment_records[start : start + sequence_length]
-            unique_session_ids = {int(record.get("session_id") or 0) for record in window}
-            if len(unique_session_ids) > 1:
+            win_sessions = _seg_session_ids[start : start + sequence_length]
+            if win_sessions[0] != win_sessions[-1] or np.unique(win_sessions).size > 1:
                 cross_session_window_count += 1
                 skipped_windows_cross_session_boundary += 1
                 continue
-            unique_block_ids = {int(record.get("block_id") or 0) for record in window}
-            if len(unique_block_ids) > 1:
+            win_blocks = _seg_block_ids[start : start + sequence_length]
+            if win_blocks[0] != win_blocks[-1] or np.unique(win_blocks).size > 1:
                 cross_block_window_count += 1
             current_ts = float(window[-1]["timestamp"])
             if observable_end_ts > 0.0 and (float(current_ts) + float(prediction_horizon_sec)) > observable_end_ts:
@@ -1202,6 +1360,7 @@ def build_dataset_bundle(
                 label_cost_floor_pct=effective_label_cost_floor_pct,
                 label_percentile=effective_label_percentile,
                 label_episode_window_days=effective_label_episode_window_days,
+                _episode_index=_ep_index,
             )
 
             X_samples.append(segment_feature_rows[start : start + sequence_length])
@@ -1247,9 +1406,9 @@ def build_dataset_bundle(
                     timeouts_with_only_sub_threshold_episode += 1
 
     if X_samples:
-        X_tensor = torch.tensor(X_samples, dtype=torch.float32)
-        y_class_tensor = torch.tensor(y_class, dtype=torch.float32)
-        y_eta_tensor = torch.tensor(y_eta, dtype=torch.float32)
+        X_tensor = torch.from_numpy(np.array(X_samples, dtype=np.float32))
+        y_class_tensor = torch.from_numpy(np.array(y_class, dtype=np.float32))
+        y_eta_tensor = torch.from_numpy(np.array(y_eta, dtype=np.float32))
     else:
         X_tensor = torch.empty((0, sequence_length, len(FEATURE_NAMES)), dtype=torch.float32)
         y_class_tensor = torch.empty((0,), dtype=torch.float32)

@@ -34,6 +34,8 @@ from .feature_contracts import (
 )
 from .ml_dataset import (
     DatasetBundle,
+    _build_pair_segments,
+    _load_blocks_from_sqlite,
     build_dataset_bundle,
     build_group_splits,
     compute_feature_stats,
@@ -58,7 +60,8 @@ _DEFAULT_LABEL_PERCENTILES = [60, 70, 80]
 def _make_loader(bundle: DatasetBundle, batch_size: int, shuffle: bool) -> DataLoader:
     effective_batch = max(1, min(int(batch_size), max(1, bundle.summary["num_samples"])))
     dataset = TensorDataset(bundle.X, bundle.y_class, bundle.y_eta)
-    return DataLoader(dataset, batch_size=effective_batch, shuffle=shuffle)
+    use_pin = torch.cuda.is_available()
+    return DataLoader(dataset, batch_size=effective_batch, shuffle=shuffle, pin_memory=use_pin)
 
 
 def _eta_loss(
@@ -720,7 +723,7 @@ def _evaluate_split(
     model.eval()
     with torch.no_grad():
         for batch_x, batch_y_class, batch_y_eta in loader:
-            batch_x = batch_x.to(device)
+            batch_x = batch_x.to(device, non_blocking=True)
             logits, eta_raw = model(batch_x)
             logits_list.append(logits.squeeze(1).cpu().numpy())
             eta_list.append(torch.expm1(eta_raw.squeeze(1)).clamp(min=0.0).cpu().numpy())
@@ -1017,6 +1020,7 @@ def run_threshold_preflight(
     min_val_positive_samples: int = 50,
     min_test_positive_samples: int = 50,
     output_path: Path | None = None,
+    _preloaded_blocks: tuple[list, float, dict] | None = None,
 ) -> dict[str, Any]:
     default_state = Path(__file__).resolve().parent.parent.parent / "out" / "config" / "tracker_history.sqlite"
     state_path = Path(state_file) if state_file is not None else default_state
@@ -1048,6 +1052,25 @@ def run_threshold_preflight(
     }
     primary_candidates: list[dict[str, Any]] = []
     relaxed_candidates: list[dict[str, Any]] = []
+    if _preloaded_blocks is None:
+        _preloaded_blocks = _load_blocks_from_sqlite(
+            state_path,
+            selected_block_ids=selected_block_ids,
+            selected_session_ids=selected_session_ids,
+            selected_only=True,
+            closed_only=True,
+        )
+    # Pre-compute segments once — reused across all label configs
+    _effective_max_session_gap_sec = max_session_gap_sec
+    if bool(allow_cross_session_merge) and _effective_max_session_gap_sec is None:
+        from .ml_dataset import _load_tracker_gap_threshold_sec
+        _effective_max_session_gap_sec = _load_tracker_gap_threshold_sec(state_path)
+    _cached_segments = _build_pair_segments(
+        _preloaded_blocks[0],
+        allow_cross_session_merge=bool(allow_cross_session_merge),
+        max_session_gap_sec=_effective_max_session_gap_sec,
+        regime_shift_score_threshold=regime_shift_score_threshold,
+    )
     for label_config in label_configs:
         threshold = float(label_config["threshold"])
         try:
@@ -1060,6 +1083,8 @@ def run_threshold_preflight(
                 allow_cross_session_merge=allow_cross_session_merge,
                 max_session_gap_sec=max_session_gap_sec,
                 regime_shift_score_threshold=regime_shift_score_threshold,
+                _preloaded_blocks=_preloaded_blocks,
+                _precomputed_pair_segments=_cached_segments,
                 **_dataset_build_kwargs_for_label_config(label_config),
             )
             splits = build_group_splits(bundle, prediction_horizon_sec=prediction_horizon_sec)
@@ -1492,10 +1517,10 @@ def run_training_loop(
     allow_cross_session_merge: bool = False,
     max_session_gap_sec: float | None = None,
     regime_shift_score_threshold: float | None = 3.0,
-    hidden_size: int = 64,
+    hidden_size: int = 128,
     num_layers: int = 2,
-    dropout: float = 0.3,
-    batch_size: int = 128,
+    dropout: float = 0.35,
+    batch_size: int = 256,
     max_epochs: int = 80,
     patience: int = 5,
     learning_rate: float = 0.001,
@@ -1508,14 +1533,15 @@ def run_training_loop(
     seed: int = 42,
     audit_output: Path | None = None,
     certification_context: dict[str, Any] | None = None,
+    _preloaded_blocks: tuple[list, float, dict] | None = None,
 ) -> dict[str, Any]:
     logger.info("Initializing robust ArbML training pipeline...")
     torch.manual_seed(seed)
     np.random.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
 
     default_state = Path(__file__).resolve().parent.parent.parent / "out" / "config" / "tracker_history.sqlite"
     state_path = Path(state_file) if state_file is not None else default_state
@@ -1542,6 +1568,7 @@ def run_training_loop(
         allow_cross_session_merge=allow_cross_session_merge,
         max_session_gap_sec=max_session_gap_sec,
         regime_shift_score_threshold=regime_shift_score_threshold,
+        _preloaded_blocks=_preloaded_blocks,
     )
     if bundle.summary["num_samples"] < 30:
         raise ValueError("Dataset construction failed or too small for robust training.")
@@ -1585,6 +1612,7 @@ def run_training_loop(
     focal_alpha_effective = float(focal_alpha) if focal_alpha is not None else _derive_focal_alpha(positive_rate_train)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info("Training device: %s%s", device, f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else "")
     model = SpreadSequenceLSTM(
         input_sz=splits["train"].X.shape[-1],
         hidden_sz=hidden_size,
@@ -1615,9 +1643,9 @@ def run_training_loop(
         train_losses: list[float] = []
         gradient_norms: list[float] = []
         for batch_x, batch_y_class, batch_y_eta in train_loader:
-            batch_x = batch_x.to(device)
-            batch_y_class = batch_y_class.to(device)
-            batch_y_eta = batch_y_eta.to(device)
+            batch_x = batch_x.to(device, non_blocking=True)
+            batch_y_class = batch_y_class.to(device, non_blocking=True)
+            batch_y_eta = batch_y_eta.to(device, non_blocking=True)
 
             optimizer.zero_grad()
             logits, eta_raw = model(batch_x)
@@ -1634,9 +1662,9 @@ def run_training_loop(
         val_losses: list[float] = []
         with torch.no_grad():
             for batch_x, batch_y_class, batch_y_eta in val_loader:
-                batch_x = batch_x.to(device)
-                batch_y_class = batch_y_class.to(device)
-                batch_y_eta = batch_y_eta.to(device)
+                batch_x = batch_x.to(device, non_blocking=True)
+                batch_y_class = batch_y_class.to(device, non_blocking=True)
+                batch_y_eta = batch_y_eta.to(device, non_blocking=True)
                 logits, eta_raw = model(batch_x)
                 loss_prob = criterion_prob(logits.squeeze(1), batch_y_class)
                 loss_eta = _eta_loss(criterion_eta, eta_raw, batch_y_eta, batch_y_class)
@@ -1925,10 +1953,10 @@ def run_clean_training_cycle(
     allow_cross_session_merge: bool = False,
     max_session_gap_sec: float | None = None,
     regime_shift_score_threshold: float | None = 3.0,
-    hidden_size: int = 64,
+    hidden_size: int = 128,
     num_layers: int = 2,
-    dropout: float = 0.3,
-    batch_size: int = 128,
+    dropout: float = 0.35,
+    batch_size: int = 256,
     max_epochs: int = 80,
     patience: int = 5,
     learning_rate: float = 0.001,
@@ -1949,6 +1977,17 @@ def run_clean_training_cycle(
 ) -> dict[str, Any]:
     artifact_root = Path(artifact_dir) if artifact_dir is not None else get_default_artifact_dir()
     artifact_root.mkdir(parents=True, exist_ok=True)
+    default_state = Path(__file__).resolve().parent.parent.parent / "out" / "config" / "tracker_history.sqlite"
+    _resolved_state = Path(state_file) if state_file is not None else default_state
+    logger.info("Loading blocks from %s (single load for full pipeline)...", _resolved_state)
+    _cached_blocks = _load_blocks_from_sqlite(
+        _resolved_state,
+        selected_block_ids=selected_block_ids,
+        selected_session_ids=selected_session_ids,
+        selected_only=True,
+        closed_only=True,
+    )
+    logger.info("Loaded %d blocks from %d sessions.", _cached_blocks[2].get("num_blocks", 0), _cached_blocks[2].get("num_sessions", 0))
     certification = certify_data_for_training(
         state_file=state_file,
         artifact_dir=artifact_root,
@@ -1996,6 +2035,7 @@ def run_clean_training_cycle(
         min_val_positive_samples=min_val_positive_samples,
         min_test_positive_samples=min_test_positive_samples,
         output_path=preflight_output,
+        _preloaded_blocks=_cached_blocks,
     )
     if not preflight.get("qualifies_for_training"):
         raise ValueError("No threshold qualified for clean training in preflight.")
@@ -2046,6 +2086,7 @@ def run_clean_training_cycle(
         seed=seed,
         audit_output=audit_output,
         certification_context=certification,
+        _preloaded_blocks=_cached_blocks,
     )
     report["data_certification"] = certification
     report["certification_id"] = str(certification.get("certification_id") or "")

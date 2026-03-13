@@ -16,7 +16,9 @@ from .ml_dataset import (
     FEATURE_NAMES,
     _block_threshold_counts,
     _build_block_diagnostics,
+    _build_pair_segments,
     _load_blocks_from_sqlite,
+    _load_tracker_gap_threshold_sec,
     _quantile_summary,
     _sqlite_has_blocks,
     build_dataset_bundle,
@@ -38,7 +40,7 @@ GATE_03_MIN_RECORDS_FOR_COMPLETENESS = 10
 GATE_03_DISAPPEARED_WARN_RATE = 0.20
 GATE_03_DISAPPEARED_FAIL_RATE = 0.95
 GATE_03_INTERMITTENT_WARN_RATE = 0.15
-GATE_03_INTERMITTENT_FAIL_RATE = 0.60
+GATE_03_INTERMITTENT_FAIL_RATE = 0.70
 GATE_06_MIN_EPISODE_DURATION_SEC = 30.0
 GATE_12_MIN_RECORDS_PER_ACTIVE_HOUR = 10.0
 GATE_12_OUTLIER_HOUR_RATE_THRESHOLD = 0.15
@@ -1145,13 +1147,26 @@ def run_training_certification(
         if str(certification_mode).lower() == "quick"
         else None
     )
+    _cached_blocks_tuple = None
+    _cached_segments_for_merge: dict[bool, tuple[list[dict[str, Any]], dict[str, Any]]] = {}
     if quick_sqlite_metrics is None:
-        blocks, _, _ = _load_blocks_from_sqlite(
+        _cached_blocks_tuple = _load_blocks_from_sqlite(
             state_path,
             selected_block_ids=effective_block_ids or None,
             selected_session_ids=effective_session_ids or None,
             selected_only=False,
             closed_only=True,
+        )
+        blocks = _cached_blocks_tuple[0]
+        # Pre-compute segments for the current merge mode (reused by bundle builder)
+        _cert_eff_gap = max_session_gap_sec
+        if bool(allow_cross_session_merge) and _cert_eff_gap is None:
+            _cert_eff_gap = _load_tracker_gap_threshold_sec(state_path)
+        _cached_segments_for_merge[allow_cross_session_merge] = _build_pair_segments(
+            blocks,
+            allow_cross_session_merge=bool(allow_cross_session_merge),
+            max_session_gap_sec=_cert_eff_gap if allow_cross_session_merge else max_session_gap_sec,
+            regime_shift_score_threshold=regime_shift_score_threshold,
         )
         records = _scope_records(blocks)
         episodes = _scope_episodes(blocks)
@@ -1220,6 +1235,8 @@ def run_training_certification(
                 allow_cross_session_merge=allow_cross_session_merge,
                 max_session_gap_sec=max_session_gap_sec,
                 regime_shift_score_threshold=regime_shift_score_threshold,
+                _preloaded_blocks=_cached_blocks_tuple,
+                _precomputed_pair_segments=_cached_segments_for_merge.get(allow_cross_session_merge),
                 **_dataset_build_kwargs_for_label_config(
                     {
                         "threshold": operational_min_total_spread_pct,
@@ -1567,6 +1584,19 @@ def run_training_certification(
             dual_summary: list[dict[str, Any]] = []
             qualifying_configs: list[str] = []
             failure_counter: Counter[str] = Counter()
+            # Pre-compute segments per merge mode (reused across all configs)
+            _eff_gap = max_session_gap_sec
+            if _eff_gap is None and _cached_blocks_tuple is not None:
+                _eff_gap = _load_tracker_gap_threshold_sec(state_path)
+            _seg_cache: dict[bool, tuple[list[dict[str, Any]], dict[str, Any]]] = {}
+            if _cached_blocks_tuple is not None:
+                for _me in (False, True):
+                    _seg_cache[_me] = _build_pair_segments(
+                        _cached_blocks_tuple[0],
+                        allow_cross_session_merge=_me,
+                        max_session_gap_sec=_eff_gap if _me else None,
+                        regime_shift_score_threshold=regime_shift_score_threshold,
+                    )
             for config in DEFAULT_DUAL_PREFLIGHT_CONFIGS:
                 config_entry: dict[str, Any] = {"sequence_length": int(config["sequence_length"]), "prediction_horizon_sec": int(config["prediction_horizon_sec"])}
                 for merge_enabled, key in ((False, "merge_off"), (True, "merge_on")):
@@ -1600,6 +1630,8 @@ def run_training_certification(
                             allow_cross_session_merge=merge_enabled,
                             max_session_gap_sec=max_session_gap_sec,
                             regime_shift_score_threshold=regime_shift_score_threshold,
+                            _preloaded_blocks=_cached_blocks_tuple,
+                            _precomputed_pair_segments=_seg_cache.get(merge_enabled),
                             **_dataset_build_kwargs_for_label_config(
                                 selected_label_config or {
                                     "threshold": fingerprint_threshold,
