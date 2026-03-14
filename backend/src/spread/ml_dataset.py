@@ -1609,7 +1609,8 @@ def build_dataset_bundle(
             label_percentile=effective_label_percentile,
             label_episode_window_days=effective_label_episode_window_days,
         )
-    # --- Full windowing (builds scaffold if cache available) ---
+    # --- Full windowing: geometry only when scaffold cache available ---
+    _build_scaffold = _scaffold_cache is not None
     _scaffold_seg_indices: list[int] = []
     _scaffold_ep_indices: dict[int, _EpisodeIndex] = {}
     _scaffold_episodes: dict[int, list[Any]] = {}
@@ -1649,65 +1650,79 @@ def build_dataset_bundle(
             if observable_end_ts > 0.0 and (float(current_ts) + float(prediction_horizon_sec)) > observable_end_ts:
                 skipped_windows_right_censored += 1
                 continue
-            label = _label_window_from_episodes(
-                current_ts,
-                episodes,
-                prediction_horizon_sec=prediction_horizon_sec,
-                min_total_spread_pct=effective_min_total_spread_pct,
-                adaptive_threshold_enabled=adaptive_threshold_enabled,
-                pair_key=normalized_pair_id,
-                label_cost_floor_pct=effective_label_cost_floor_pct,
-                label_percentile=effective_label_percentile,
-                label_episode_window_days=effective_label_episode_window_days,
-                _episode_index=_ep_index,
-            )
 
+            # Geometry collection (always)
             X_samples.append(segment_feature_rows[start : start + sequence_length])
             _scaffold_seg_indices.append(_seg_idx)
-            y_class.append(float(label["y_class"]))
-            y_eta.append(float(label["y_eta"]))
-            sample_label_thresholds.append(float(label["label_threshold"]))
             pair_ids.append(normalized_pair_id)
             block_ids.append(int(window[-1].get("block_id") or 0))
             session_ids.append(int(window[-1].get("session_id") or 0))
             timestamps.append(current_ts)
             label_end_timestamps.append(float(current_ts) + float(prediction_horizon_sec))
             last_entries.append(float(window[-1]["entry_spread"]))
-            pair_label_thresholds[normalized_pair_id].append(float(label["label_threshold"]))
 
-            future_episode_total_spreads.extend(float(value) for value in label["future_episode_total_spreads"])
-            if float(label["y_class"]) >= 0.5:
-                _bucket_count(
-                    float(window[-1]["entry_spread"]),
-                    [
-                        ("lt_0_30", -float("inf"), 0.30),
-                        ("0_30_to_0_50", 0.30, 0.50),
-                        ("0_50_to_1_00", 0.50, 1.00),
-                        ("1_00_to_2_00", 1.00, 2.00),
-                        ("ge_2_00", 2.00, float("inf")),
-                    ],
-                    positive_entry_spread_buckets,
+            # Label computation (skip when building scaffold — relabel handles it)
+            if not _build_scaffold:
+                label = _label_window_from_episodes(
+                    current_ts,
+                    episodes,
+                    prediction_horizon_sec=prediction_horizon_sec,
+                    min_total_spread_pct=effective_min_total_spread_pct,
+                    adaptive_threshold_enabled=adaptive_threshold_enabled,
+                    pair_key=normalized_pair_id,
+                    label_cost_floor_pct=effective_label_cost_floor_pct,
+                    label_percentile=effective_label_percentile,
+                    label_episode_window_days=effective_label_episode_window_days,
+                    _episode_index=_ep_index,
                 )
-            else:
-                _bucket_count(
-                    float(label["peak_future_total_spread"]),
-                    [
-                        ("lt_0_30", -float("inf"), 0.30),
-                        ("0_30_to_0_50", 0.30, 0.50),
-                        ("0_50_to_0_80", 0.50, 0.80),
-                        ("0_80_to_1_00", 0.80, 1.00),
-                        ("ge_1_00", 1.00, float("inf")),
-                    ],
-                    timeout_peak_future_total_spread_buckets,
-                )
-                if label["timeout_reason"] == "no_future_episode":
-                    timeouts_without_future_episode += 1
-                elif label["timeout_reason"] == "sub_threshold_only":
-                    timeouts_with_only_sub_threshold_episode += 1
+                y_class.append(float(label["y_class"]))
+                y_eta.append(float(label["y_eta"]))
+                sample_label_thresholds.append(float(label["label_threshold"]))
+                pair_label_thresholds[normalized_pair_id].append(float(label["label_threshold"]))
 
-    # Save scaffold for reuse by subsequent bundles with same geometry
-    if _scaffold_cache is not None and _scaffold_key not in _scaffold_cache:
-        _scaffold_X = torch.from_numpy(np.array(X_samples, dtype=np.float32)) if X_samples else torch.empty((0, sequence_length, len(FEATURE_NAMES)), dtype=torch.float32)
+                future_episode_total_spreads.extend(float(value) for value in label["future_episode_total_spreads"])
+                if float(label["y_class"]) >= 0.5:
+                    _bucket_count(
+                        float(window[-1]["entry_spread"]),
+                        [
+                            ("lt_0_30", -float("inf"), 0.30),
+                            ("0_30_to_0_50", 0.30, 0.50),
+                            ("0_50_to_1_00", 0.50, 1.00),
+                            ("1_00_to_2_00", 1.00, 2.00),
+                            ("ge_2_00", 2.00, float("inf")),
+                        ],
+                        positive_entry_spread_buckets,
+                    )
+                else:
+                    _bucket_count(
+                        float(label["peak_future_total_spread"]),
+                        [
+                            ("lt_0_30", -float("inf"), 0.30),
+                            ("0_30_to_0_50", 0.30, 0.50),
+                            ("0_50_to_0_80", 0.50, 0.80),
+                            ("0_80_to_1_00", 0.80, 1.00),
+                            ("ge_1_00", 1.00, float("inf")),
+                        ],
+                        timeout_peak_future_total_spread_buckets,
+                    )
+                    if label["timeout_reason"] == "no_future_episode":
+                        timeouts_without_future_episode += 1
+                    elif label["timeout_reason"] == "sub_threshold_only":
+                        timeouts_with_only_sub_threshold_episode += 1
+
+    # Scaffold path: save geometry, delegate labeling to _relabel_scaffold
+    if _build_scaffold and _scaffold_key not in _scaffold_cache:
+        if X_samples:
+            # Fast tensor construction: pre-allocate and fill (avoids slow np.array on nested lists)
+            _n_win = len(X_samples)
+            _n_feat = len(FEATURE_NAMES)
+            _scaffold_np = np.empty((_n_win, sequence_length, _n_feat), dtype=np.float32)
+            for _wi, _xrow in enumerate(X_samples):
+                for _si, _srow in enumerate(_xrow):
+                    _scaffold_np[_wi, _si, :] = _srow
+            _scaffold_X = torch.from_numpy(_scaffold_np)
+        else:
+            _scaffold_X = torch.empty((0, sequence_length, len(FEATURE_NAMES)), dtype=torch.float32)
         _scaffold_cache[_scaffold_key] = _WindowScaffold(
             X_tensor=_scaffold_X, pair_ids=pair_ids, block_ids=block_ids,
             session_ids=session_ids, timestamps=timestamps,
@@ -1727,6 +1742,15 @@ def build_dataset_bundle(
             allow_cross_session_merge=bool(allow_cross_session_merge),
             effective_max_session_gap_sec=effective_max_session_gap_sec,
             selected_block_ids=selected_block_ids, selected_session_ids=selected_session_ids,
+        )
+        # Return via relabel (labels computed vectorized, not in the windowing loop)
+        return _relabel_scaffold(
+            _scaffold_cache[_scaffold_key],
+            min_total_spread_pct=effective_min_total_spread_pct,
+            adaptive_threshold_enabled=adaptive_threshold_enabled,
+            label_cost_floor_pct=effective_label_cost_floor_pct,
+            label_percentile=effective_label_percentile,
+            label_episode_window_days=effective_label_episode_window_days,
         )
 
     if X_samples:
