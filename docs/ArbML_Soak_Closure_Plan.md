@@ -404,12 +404,12 @@ O soak valida a INFRAESTRUTURA. O v3 plan é o PRODUTO.
 1. Reset do modelo:
    - `rm best_lstm_model.pth best_lstm_model.meta.json auto_retrain.state.json`
 
-2. Implementar Fase S (sampling + training perf, ~2.5h):
-   - S1: stride=5 na janela deslizante (ml_dataset.py)
-   - S2: max_samples_per_pair=2000 (ml_dataset.py)
-   - S5: diagnóstico de sampling no summary
-   - T1-T4: batch=1024, pin_memory, AMP, cudnn.benchmark (train_model.py)
-   - Ver ArbML_Sampling_Analysis.md e ArbML_Training_Performance.md
+2. Implementar Fase S (sampling + pipeline perf, ~4-6h):
+   - S1: stride=5, S2: max_samples_per_pair=2000 (ml_dataset.py)
+   - T1-T4: batch=1024, AMP, num_workers (train_model.py)
+   - SC1: Scaffold + Relabel — separar windowing de labeling (ml_dataset.py)
+   - V1: Vectorização de features (feature_contracts.py)
+   - Ver ArbML_Training_Performance.md para detalhes
 
 3. Implementar Fase 1 do v3 plan (features):
    - 40 features exit-aware multi-scale (V3_EXIT_AWARE_40)

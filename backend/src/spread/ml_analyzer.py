@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -31,6 +32,68 @@ from .spread_tracker import SpreadRecord, build_recurring_context_from_episodes,
 
 logger = logging.getLogger(__name__)
 
+_EPS = 0.01
+
+
+@dataclass(slots=True)
+class ExitPolicyResult:
+    """One of the 3 exit policies (shallow/median/deep) with capture economics."""
+    name: str                  # "shallow" | "median" | "deep"
+    exit_target: float         # P75 / P50 / P10 from recurring context
+    capture_gross: float       # entry + exit_target (NO abs)
+    net_capture: float         # capture_gross - cost
+    min_entry_required: float  # max(0, cost - exit_target)
+    percentile_label: str      # "P75" / "P50" / "P10"
+
+
+def compute_signal_score(
+    prob: float,
+    net_capture_median: float,
+    support_2h: int,
+    support_24h: int,
+    context_strength: str,
+    eta_minutes: float,
+    drift_status: str,
+) -> float:
+    """Composite ranking score for signal prioritization.
+
+    Uses single-point ETA. When ETA-1 (multi-quantile) is implemented,
+    add eta_uncertainty_min and uncertainty_penalty term.
+    """
+    viability = max(0.0, float(net_capture_median))
+    support_factor = min(1.0, (float(support_2h) / 3.0 + float(support_24h) / 10.0) / 2.0)
+    strength_mult = {"strong": 1.0, "normal": 0.7, "weak": 0.3}.get(str(context_strength), 0.1)
+    drift_penalty = 0.5 if str(drift_status) == "drifted" else 1.0
+    eta_discount = 1.0 / (1.0 + max(float(eta_minutes), 1.0) / 60.0)
+    return float(prob) * viability * support_factor * strength_mult * drift_penalty * eta_discount
+
+
+def compute_exit_policies(
+    current_entry: float,
+    context: dict[str, Any],
+    cost_estimate_pct: float = 0.30,
+) -> list[ExitPolicyResult]:
+    """Compute 3 exit policies from recurring context exit percentiles."""
+    policies: list[ExitPolicyResult] = []
+    for name, key, pctl in [
+        ("shallow", "exit_core_range_max", "P75"),
+        ("median", "exit_median", "P50"),
+        ("deep", "exit_outer_range_min", "P10"),
+    ]:
+        exit_target = float(context.get(key, 0.0) or 0.0)
+        capture_gross = float(current_entry) + exit_target  # NO abs
+        net_capture = capture_gross - float(cost_estimate_pct)
+        min_entry = max(0.0, float(cost_estimate_pct) - exit_target)
+        policies.append(ExitPolicyResult(
+            name=name,
+            exit_target=round(exit_target, 4),
+            capture_gross=round(capture_gross, 4),
+            net_capture=round(net_capture, 4),
+            min_entry_required=round(min_entry, 4),
+            percentile_label=pctl,
+        ))
+    return policies
+
 
 class SpreadMLAnalyzer:
     def __init__(
@@ -39,11 +102,15 @@ class SpreadMLAnalyzer:
         artifact_dir: Path | None = None,
         allow_stale_artifacts: bool = False,
         min_total_spread_pct: float = 0.0,
+        default_cost_estimate_pct: float = 0.30,
+        min_net_capture_pct: float = 0.20,
     ):
         self.sequence_length = int(sequence_length)
         self.artifact_dir = Path(artifact_dir) if artifact_dir is not None else None
         self.allow_stale_artifacts = bool(allow_stale_artifacts)
         self.min_total_spread_pct = max(0.0, float(min_total_spread_pct or 0.0))
+        self.default_cost_estimate_pct = float(default_cost_estimate_pct)
+        self.min_net_capture_pct = float(min_net_capture_pct)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.model: Optional[SpreadSequenceLSTM] = None
@@ -521,6 +588,30 @@ class SpreadMLAnalyzer:
         eta_payload = self._eta_payload(int(eta_seconds), context)
         ml_score = round(inversion_probability * 100)
 
+        # --- Exit policies (3 levels) ---
+        exit_policies = compute_exit_policies(
+            current_entry, context, cost_estimate_pct=self.default_cost_estimate_pct,
+        )
+        # Median policy is the reference for gates and ranking
+        median_policy = next((p for p in exit_policies if p.name == "median"), exit_policies[1] if len(exit_policies) > 1 else exit_policies[0])
+        shallow_policy = next((p for p in exit_policies if p.name == "shallow"), exit_policies[0])
+        net_capture_median = median_policy.net_capture
+        expected_net_median = round(inversion_probability * net_capture_median, 4)
+
+        # --- Signal score ---
+        support_2h = int(context.get("empirical_support_short", 0) or 0)
+        support_24h = int(context.get("empirical_support_long", 0) or 0)
+        drift_status = str(prediction.get("drift_status") or self.last_drift_status)
+        sig_score = compute_signal_score(
+            prob=inversion_probability,
+            net_capture_median=net_capture_median,
+            support_2h=support_2h,
+            support_24h=support_24h,
+            context_strength=str(context["context_strength"]),
+            eta_minutes=float(eta_seconds) / 60.0,
+            drift_status=drift_status,
+        )
+
         execute_threshold = self.metadata.execute_threshold
         strong_threshold = self.metadata.strong_threshold
         signal_action = "WAIT"
@@ -550,6 +641,12 @@ class SpreadMLAnalyzer:
         elif inversion_probability < execute_threshold:
             signal_reason_code = "probability_below_threshold"
             signal_reason = "Faixa recorrente válida, mas a probabilidade calibrada ainda está abaixo do limiar de execução."
+        elif drift_status == "drifted":
+            signal_reason_code = "concept_drift_detected"
+            signal_reason = "Features divergiram >3σ da distribuição de treino."
+        elif net_capture_median < self.min_net_capture_pct:
+            signal_reason_code = "net_capture_below_minimum"
+            signal_reason = f"Captura líquida mediana ({net_capture_median:.2f}%) abaixo do mínimo ({self.min_net_capture_pct:.2f}%)."
         elif (
             inversion_probability >= strong_threshold
             and bool(context["strong_short_ready"])
@@ -558,11 +655,14 @@ class SpreadMLAnalyzer:
             and bool(context["entry_coherent_short_long"])
             and bool(context["exit_coherent_short_long"])
             and str(eta_payload["eta_alignment_status"]) != "divergent"
+            and net_capture_median >= 2 * self.min_net_capture_pct
+            and shallow_policy.net_capture >= self.min_net_capture_pct
+            and support_2h >= 3 and support_24h >= 5
         ):
             signal_action = "STRONG_EXECUTE"
             signal_reason_code = "strong_execute_ready"
             signal_reason = "Contexto forte confirmado. Probabilidade alta e janela empírica alinhada."
-        elif inversion_probability >= execute_threshold:
+        elif inversion_probability >= execute_threshold and net_capture_median >= self.min_net_capture_pct:
             signal_action = "EXECUTE"
             if str(eta_payload["eta_alignment_status"]) == "divergent":
                 signal_reason_code = "eta_divergent"
@@ -625,12 +725,24 @@ class SpreadMLAnalyzer:
             "strong_threshold_used": float(strong_threshold),
             "signal_reason_code": signal_reason_code,
             "signal_reason": signal_reason,
-            "drift_status": str(prediction.get("drift_status") or self.last_drift_status),
+            "drift_status": drift_status,
             "drifted_features": list(prediction.get("drifted_features") or self.last_drifted_features),
             "inference_latency_ms": round(float(inference_time_ms), 3),
             "artifact_feature_count": int(prediction.get("artifact_feature_count", len(self.metadata.feature_names))),
             "artifact_trained_at_utc": str(prediction.get("artifact_trained_at_utc") or self.metadata.trained_at_utc),
             "artifact_dataset_samples": int(prediction.get("artifact_dataset_samples", self.metadata.dataset_summary.get("num_samples", 0))),
+            # V3: Exit policies & signal score
+            "exit_policies": [
+                {"name": p.name, "exit_target": p.exit_target, "capture_gross": p.capture_gross,
+                 "net_capture": p.net_capture, "min_entry_required": p.min_entry_required,
+                 "percentile_label": p.percentile_label}
+                for p in exit_policies
+            ],
+            "net_capture_median": net_capture_median,
+            "expected_net_median": expected_net_median,
+            "signal_score": round(sig_score, 6),
+            "default_cost_estimate_pct": self.default_cost_estimate_pct,
+            "min_net_capture_pct": self.min_net_capture_pct,
         }
 
     def analyze_pair(self, current_entry: float, history: list[Any], *, pair_key: Any = None) -> Optional[dict[str, Any]]:
@@ -638,4 +750,4 @@ class SpreadMLAnalyzer:
         return self.render_prediction(current_entry, prediction, pair_key=pair_key)
 
 
-__all__ = ["SpreadMLAnalyzer", "SpreadSequenceLSTM"]
+__all__ = ["SpreadMLAnalyzer", "SpreadSequenceLSTM", "ExitPolicyResult", "compute_exit_policies", "compute_signal_score"]

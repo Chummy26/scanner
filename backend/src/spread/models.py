@@ -175,6 +175,12 @@ class SpreadOpportunity:
             d["displayEtaSeconds"] = self.ml_context.get("display_eta_seconds")
             d["recommendedEntryRange"] = self.ml_context.get("recommended_entry_range") or "--"
             d["recommendedExitRange"] = self.ml_context.get("recommended_exit_range") or "--"
+            # V3: Exit policies, net capture, signal score
+            if self.ml_context.get("exit_policies"):
+                d["exitPolicies"] = self.ml_context["exit_policies"]
+                d["netCaptureMedian"] = self.ml_context.get("net_capture_median")
+                d["expectedNetMedian"] = self.ml_context.get("expected_net_median")
+                d["signalScore"] = self.ml_context.get("signal_score")
         return d
 
     def to_scanner_dict(self) -> Dict[str, Any]:
@@ -279,7 +285,17 @@ class SpreadConfig:
     label_cost_floor_pct: float = 0.50
     label_percentile: int = 70
     label_episode_window_days: int = 5
+    default_cost_estimate_pct: float = 0.30
+    min_net_capture_pct: float = 0.20
     tracker_db_path: str = ""
+
+    def __post_init__(self):
+        if self.min_total_spread_pct < self.min_net_capture_pct + self.default_cost_estimate_pct:
+            raise ValueError(
+                f"min_total_spread_pct ({self.min_total_spread_pct}) must be >= "
+                f"min_net_capture_pct ({self.min_net_capture_pct}) + "
+                f"default_cost_estimate_pct ({self.default_cost_estimate_pct})"
+            )
     symbols: List[str] = field(default_factory=lambda: [
         "BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "AVAX", "DOT",
         "LINK", "MATIC", "UNI", "ATOM", "FIL", "APT", "ARB", "OP",
