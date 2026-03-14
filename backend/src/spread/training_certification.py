@@ -1227,6 +1227,9 @@ def run_training_certification(
         )
 
         _check_timeout()
+        # Feature cache shared across all bundle builds with same merge mode.
+        # Features depend only on segment records/episodes, NOT on threshold/horizon.
+        _cert_feat_cache: dict[bool, dict[int, list[list[float]]]] = {False: {}, True: {}}
         bundle = (
             build_dataset_bundle(
                 state_path=state_path,
@@ -1241,6 +1244,7 @@ def run_training_certification(
                 regime_shift_score_threshold=regime_shift_score_threshold,
                 _preloaded_blocks=_cached_blocks_tuple,
                 _precomputed_pair_segments=_cached_segments_for_merge.get(allow_cross_session_merge),
+                _precomputed_segment_features=_cert_feat_cache[allow_cross_session_merge],
                 **_dataset_build_kwargs_for_label_config(
                     {
                         "threshold": operational_min_total_spread_pct,
@@ -1593,6 +1597,9 @@ def run_training_certification(
             if _eff_gap is None and _cached_blocks_tuple is not None:
                 _eff_gap = _load_tracker_gap_threshold_sec(state_path)
             _seg_cache: dict[bool, tuple[list[dict[str, Any]], dict[str, Any]]] = {}
+            # Reuse feature cache from earlier bundle build (gate_01→gate_02).
+            # Features are segment-level and independent of threshold/horizon.
+            _feat_cache = _cert_feat_cache
             if _cached_blocks_tuple is not None:
                 for _me in (False, True):
                     _seg_cache[_me] = _build_pair_segments(
@@ -1619,6 +1626,8 @@ def run_training_certification(
                         min_train_positive_samples=1,
                         min_val_positive_samples=1,
                         min_test_positive_samples=1,
+                        _preloaded_blocks=_cached_blocks_tuple,
+                        _precomputed_segment_features=_feat_cache.get(merge_enabled),
                     )
                     fingerprint_threshold = float(preflight.get("selected_threshold") or operational_min_total_spread_pct)
                     selected_label_config = _label_config_payload(preflight.get("selected_label_config"))
@@ -1636,6 +1645,7 @@ def run_training_certification(
                             regime_shift_score_threshold=regime_shift_score_threshold,
                             _preloaded_blocks=_cached_blocks_tuple,
                             _precomputed_pair_segments=_seg_cache.get(merge_enabled),
+                            _precomputed_segment_features=_feat_cache.get(merge_enabled),
                             **_dataset_build_kwargs_for_label_config(
                                 selected_label_config or {
                                     "threshold": fingerprint_threshold,

@@ -1282,6 +1282,7 @@ def build_dataset_bundle(
     regime_shift_score_threshold: float | None = _DEFAULT_REGIME_SHIFT_SCORE_THRESHOLD,
     _preloaded_blocks: tuple[list[dict[str, Any]], float, dict[str, Any]] | None = None,
     _precomputed_pair_segments: tuple[list[dict[str, Any]], dict[str, Any]] | None = None,
+    _precomputed_segment_features: dict[int, list[list[float]]] | None = None,
 ) -> DatasetBundle:
     X_samples: list[list[list[float]]] = []
     y_class: list[float] = []
@@ -1375,18 +1376,23 @@ def build_dataset_bundle(
     skipped_windows_cross_session_boundary = 0
     cross_block_window_count = 0
     cross_session_window_count = 0
-    for segment in pair_segments:
+    for _seg_idx, segment in enumerate(pair_segments):
         episodes = list(segment.get("episodes") or [])
         observable_end_ts = float(segment.get("observable_end_ts") or 0.0)
         segment_records = list(segment.get("records") or [])
         if len(segment_records) < sequence_length:
             continue
         normalized_pair_id = str(segment.get("pair_id") or "")
-        segment_feature_rows = build_feature_rows(
-            segment_records,
-            feature_names=list(FEATURE_NAMES),
-            episodes=episodes,
-        )
+        if _precomputed_segment_features is not None and _seg_idx in _precomputed_segment_features:
+            segment_feature_rows = _precomputed_segment_features[_seg_idx]
+        else:
+            segment_feature_rows = build_feature_rows(
+                segment_records,
+                feature_names=list(FEATURE_NAMES),
+                episodes=episodes,
+            )
+            if _precomputed_segment_features is not None:
+                _precomputed_segment_features[_seg_idx] = segment_feature_rows
         _seg_session_ids = np.array([int(r.get("session_id") or 0) for r in segment_records], dtype=np.int64)
         _seg_block_ids = np.array([int(r.get("block_id") or 0) for r in segment_records], dtype=np.int64)
         _ep_index = _EpisodeIndex(episodes)

@@ -1021,6 +1021,7 @@ def run_threshold_preflight(
     min_test_positive_samples: int = 50,
     output_path: Path | None = None,
     _preloaded_blocks: tuple[list, float, dict] | None = None,
+    _precomputed_segment_features: dict[int, list[list[float]]] | None = None,
 ) -> dict[str, Any]:
     default_state = Path(__file__).resolve().parent.parent.parent / "out" / "config" / "tracker_history.sqlite"
     state_path = Path(state_file) if state_file is not None else default_state
@@ -1071,6 +1072,10 @@ def run_threshold_preflight(
         max_session_gap_sec=_effective_max_session_gap_sec,
         regime_shift_score_threshold=regime_shift_score_threshold,
     )
+    # Feature cache: features depend only on segment records/episodes,
+    # not on threshold/prediction_horizon. Compute once, reuse across configs.
+    if _precomputed_segment_features is None:
+        _precomputed_segment_features = {}
     for label_config in label_configs:
         threshold = float(label_config["threshold"])
         try:
@@ -1085,6 +1090,7 @@ def run_threshold_preflight(
                 regime_shift_score_threshold=regime_shift_score_threshold,
                 _preloaded_blocks=_preloaded_blocks,
                 _precomputed_pair_segments=_cached_segments,
+                _precomputed_segment_features=_precomputed_segment_features,
                 **_dataset_build_kwargs_for_label_config(label_config),
             )
             splits = build_group_splits(bundle, prediction_horizon_sec=prediction_horizon_sec)
@@ -1990,6 +1996,14 @@ def run_clean_training_cycle(
         closed_only=True,
     )
     logger.info("Loaded %d blocks from %d sessions.", _cached_blocks[2].get("num_blocks", 0), _cached_blocks[2].get("num_sessions", 0))
+    # Scale certification timeout proportionally to dataset size.
+    # Gate_10 (dual-mode preflight) builds 6 bundles (3 configs × 2 merge modes).
+    # Feature engineering is O(n) on records — ~5 min per bundle at 6.3M records.
+    # Default 300s is only suitable for tiny datasets (<50k blocks).
+    _num_blocks = int(_cached_blocks[2].get("num_blocks", 0))
+    _scaled_timeout = max(int(max_certification_duration_sec), 300 + _num_blocks // 500)
+    if _scaled_timeout != max_certification_duration_sec:
+        logger.info("Scaled certification timeout %ds -> %ds for %d blocks.", max_certification_duration_sec, _scaled_timeout, _num_blocks)
     certification = certify_data_for_training(
         state_file=state_file,
         artifact_dir=artifact_root,
@@ -2003,7 +2017,7 @@ def run_clean_training_cycle(
         max_session_gap_sec=max_session_gap_sec,
         regime_shift_score_threshold=regime_shift_score_threshold,
         certification_mode=certification_mode,
-        max_certification_duration_sec=max_certification_duration_sec,
+        max_certification_duration_sec=_scaled_timeout,
         label_episode_window_days=label_episode_window_days,
         allow_legacy_sessions=allow_legacy_sessions,
         runtime_audit_dir=runtime_audit_dir,
