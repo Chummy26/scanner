@@ -647,6 +647,9 @@ class SpreadMLAnalyzer:
         elif net_capture_median < self.min_net_capture_pct:
             signal_reason_code = "net_capture_below_minimum"
             signal_reason = f"Captura líquida mediana ({net_capture_median:.2f}%) abaixo do mínimo ({self.min_net_capture_pct:.2f}%)."
+        elif str(context["context_strength"]) not in ("normal", "strong"):
+            signal_reason_code = "context_strength_weak"
+            signal_reason = "Contexto fraco — recorrência insuficiente para execução."
         elif (
             inversion_probability >= strong_threshold
             and bool(context["strong_short_ready"])

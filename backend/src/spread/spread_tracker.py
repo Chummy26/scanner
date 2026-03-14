@@ -2050,7 +2050,12 @@ class SpreadTracker:
             for record in records
             if float(record.timestamp) >= cutoff
         ]
-        rows = build_feature_rows(recent_records, feature_names=list(feature_names or []), episodes=episodes)
+        rows = build_feature_rows(
+            recent_records,
+            feature_names=list(feature_names or []),
+            episodes=episodes,
+            cost_estimate_pct=float(getattr(self.config, "default_cost_estimate_pct", 0.30)),
+        )
         rows = rows[-max(int(limit), 0) :]
         with self._lock:
             self._feature_history_cache[cache_key] = {
