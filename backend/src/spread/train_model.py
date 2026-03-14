@@ -36,6 +36,7 @@ from .ml_dataset import (
     DatasetBundle,
     _build_pair_segments,
     _load_blocks_from_sqlite,
+    _load_tracker_gap_threshold_sec,
     build_dataset_bundle,
     build_group_splits,
     compute_feature_stats,
@@ -61,7 +62,15 @@ def _make_loader(bundle: DatasetBundle, batch_size: int, shuffle: bool) -> DataL
     effective_batch = max(1, min(int(batch_size), max(1, bundle.summary["num_samples"])))
     dataset = TensorDataset(bundle.X, bundle.y_class, bundle.y_eta)
     use_pin = torch.cuda.is_available()
-    return DataLoader(dataset, batch_size=effective_batch, shuffle=shuffle, pin_memory=use_pin)
+    return DataLoader(
+        dataset,
+        batch_size=effective_batch,
+        shuffle=shuffle,
+        pin_memory=use_pin,
+        num_workers=4 if use_pin else 0,
+        persistent_workers=True if use_pin else False,
+        prefetch_factor=2 if use_pin else None,
+    )
 
 
 def _eta_loss(
@@ -724,7 +733,8 @@ def _evaluate_split(
     with torch.no_grad():
         for batch_x, batch_y_class, batch_y_eta in loader:
             batch_x = batch_x.to(device, non_blocking=True)
-            logits, eta_raw = model(batch_x)
+            with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                logits, eta_raw = model(batch_x)
             logits_list.append(logits.squeeze(1).cpu().numpy())
             eta_list.append(torch.expm1(eta_raw.squeeze(1)).clamp(min=0.0).cpu().numpy())
             y_class_list.append(batch_y_class.numpy())
@@ -1021,6 +1031,7 @@ def run_threshold_preflight(
     min_test_positive_samples: int = 50,
     output_path: Path | None = None,
     _preloaded_blocks: tuple[list, float, dict] | None = None,
+    _precomputed_pair_segments: tuple[list[dict[str, Any]], dict[str, Any]] | None = None,
     _precomputed_segment_features: dict[int, list[list[float]]] | None = None,
 ) -> dict[str, Any]:
     default_state = Path(__file__).resolve().parent.parent.parent / "out" / "config" / "tracker_history.sqlite"
@@ -1061,17 +1072,19 @@ def run_threshold_preflight(
             selected_only=True,
             closed_only=True,
         )
-    # Pre-compute segments once — reused across all label configs
-    _effective_max_session_gap_sec = max_session_gap_sec
-    if bool(allow_cross_session_merge) and _effective_max_session_gap_sec is None:
-        from .ml_dataset import _load_tracker_gap_threshold_sec
-        _effective_max_session_gap_sec = _load_tracker_gap_threshold_sec(state_path)
-    _cached_segments = _build_pair_segments(
-        _preloaded_blocks[0],
-        allow_cross_session_merge=bool(allow_cross_session_merge),
-        max_session_gap_sec=_effective_max_session_gap_sec,
-        regime_shift_score_threshold=regime_shift_score_threshold,
-    )
+    # Use pre-computed segments if available, otherwise build them
+    if _precomputed_pair_segments is not None:
+        _cached_segments = _precomputed_pair_segments
+    else:
+        _effective_max_session_gap_sec = max_session_gap_sec
+        if bool(allow_cross_session_merge) and _effective_max_session_gap_sec is None:
+            _effective_max_session_gap_sec = _load_tracker_gap_threshold_sec(state_path)
+        _cached_segments = _build_pair_segments(
+            _preloaded_blocks[0],
+            allow_cross_session_merge=bool(allow_cross_session_merge),
+            max_session_gap_sec=_effective_max_session_gap_sec,
+            regime_shift_score_threshold=regime_shift_score_threshold,
+        )
     # Feature cache: features depend only on segment records/episodes,
     # not on threshold/prediction_horizon. Compute once, reuse across configs.
     if _precomputed_segment_features is None:
@@ -1261,6 +1274,8 @@ def certify_data_for_training(
     runtime_audit_dir: Path | None = None,
     run_reconnection_stress: bool = False,
     _preloaded_blocks: tuple[list, float, dict] | None = None,
+    _precomputed_segments_by_merge: dict[bool, tuple[list[dict[str, Any]], dict[str, Any]]] | None = None,
+    _precomputed_features_by_merge: dict[bool, dict[int, list[list[float]]]] | None = None,
 ) -> dict[str, Any]:
     default_state = Path(__file__).resolve().parent.parent.parent / "out" / "config" / "tracker_history.sqlite"
     state_path = Path(state_file) if state_file is not None else default_state
@@ -1287,6 +1302,8 @@ def certify_data_for_training(
         preflight_fn=run_threshold_preflight,
         dataset_fingerprint_fn=_build_dataset_fingerprint,
         _preloaded_blocks=_preloaded_blocks,
+        _precomputed_segments_by_merge=_precomputed_segments_by_merge,
+        _precomputed_features_by_merge=_precomputed_features_by_merge,
     )
 
 
@@ -1528,7 +1545,7 @@ def run_training_loop(
     hidden_size: int = 128,
     num_layers: int = 2,
     dropout: float = 0.35,
-    batch_size: int = 256,
+    batch_size: int = 1024,
     max_epochs: int = 80,
     patience: int = 5,
     learning_rate: float = 0.001,
@@ -1542,6 +1559,8 @@ def run_training_loop(
     audit_output: Path | None = None,
     certification_context: dict[str, Any] | None = None,
     _preloaded_blocks: tuple[list, float, dict] | None = None,
+    _precomputed_pair_segments: tuple[list[dict[str, Any]], dict[str, Any]] | None = None,
+    _precomputed_segment_features: dict[int, list[list[float]]] | None = None,
 ) -> dict[str, Any]:
     logger.info("Initializing robust ArbML training pipeline...")
     torch.manual_seed(seed)
@@ -1577,6 +1596,8 @@ def run_training_loop(
         max_session_gap_sec=max_session_gap_sec,
         regime_shift_score_threshold=regime_shift_score_threshold,
         _preloaded_blocks=_preloaded_blocks,
+        _precomputed_pair_segments=_precomputed_pair_segments,
+        _precomputed_segment_features=_precomputed_segment_features,
     )
     if bundle.summary["num_samples"] < 30:
         raise ValueError("Dataset construction failed or too small for robust training.")
@@ -1620,7 +1641,9 @@ def run_training_loop(
     focal_alpha_effective = float(focal_alpha) if focal_alpha is not None else _derive_focal_alpha(positive_rate_train)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info("Training device: %s%s", device, f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else "")
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
+    logger.info("Training device: %s%s (AMP=%s)", device, f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else "", use_amp)
     model = SpreadSequenceLSTM(
         input_sz=splits["train"].X.shape[-1],
         hidden_sz=hidden_size,
@@ -1655,14 +1678,22 @@ def run_training_loop(
             batch_y_class = batch_y_class.to(device, non_blocking=True)
             batch_y_eta = batch_y_eta.to(device, non_blocking=True)
 
-            optimizer.zero_grad()
-            logits, eta_raw = model(batch_x)
-            loss_prob = criterion_prob(logits.squeeze(1), batch_y_class)
-            loss_eta = _eta_loss(criterion_eta, eta_raw, batch_y_eta, batch_y_class)
-            loss = loss_prob + 0.25 * loss_eta
-            loss.backward()
-            gradient_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0))
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                logits, eta_raw = model(batch_x)
+                loss_prob = criterion_prob(logits.squeeze(1), batch_y_class)
+                loss_eta = _eta_loss(criterion_eta, eta_raw, batch_y_eta, batch_y_class)
+                loss = loss_prob + 0.25 * loss_eta
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                gradient_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0))
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                gradient_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0))
+                optimizer.step()
             train_losses.append(float(loss.item()))
             gradient_norms.append(gradient_norm)
 
@@ -1673,10 +1704,11 @@ def run_training_loop(
                 batch_x = batch_x.to(device, non_blocking=True)
                 batch_y_class = batch_y_class.to(device, non_blocking=True)
                 batch_y_eta = batch_y_eta.to(device, non_blocking=True)
-                logits, eta_raw = model(batch_x)
-                loss_prob = criterion_prob(logits.squeeze(1), batch_y_class)
-                loss_eta = _eta_loss(criterion_eta, eta_raw, batch_y_eta, batch_y_class)
-                val_losses.append(float((loss_prob + 0.25 * loss_eta).item()))
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    logits, eta_raw = model(batch_x)
+                    loss_prob = criterion_prob(logits.squeeze(1), batch_y_class)
+                    loss_eta = _eta_loss(criterion_eta, eta_raw, batch_y_eta, batch_y_class)
+                    val_losses.append(float((loss_prob + 0.25 * loss_eta).item()))
 
         avg_train_loss = float(np.mean(train_losses)) if train_losses else float("inf")
         avg_val_loss = float(np.mean(val_losses)) if val_losses else float("inf")
@@ -1964,7 +1996,7 @@ def run_clean_training_cycle(
     hidden_size: int = 128,
     num_layers: int = 2,
     dropout: float = 0.35,
-    batch_size: int = 256,
+    batch_size: int = 1024,
     max_epochs: int = 80,
     patience: int = 5,
     learning_rate: float = 0.001,
@@ -1996,10 +2028,24 @@ def run_clean_training_cycle(
         closed_only=True,
     )
     logger.info("Loaded %d blocks from %d sessions.", _cached_blocks[2].get("num_blocks", 0), _cached_blocks[2].get("num_sessions", 0))
+    # Pre-compute segments + feature cache per merge mode (reused across all phases).
+    # Features depend only on segment records/episodes, NOT on threshold/horizon.
+    # Cache keyed by merge mode: Gate 10 tests both True/False — different segments.
+    _shared_segments: dict[bool, tuple[list[dict[str, Any]], dict[str, Any]]] = {}
+    _shared_feat_cache: dict[bool, dict[int, list[list[float]]]] = {}
+    for _merge_mode in ([False, True] if allow_cross_session_merge else [False]):
+        _eff_gap = max_session_gap_sec
+        if _merge_mode and _eff_gap is None:
+            _eff_gap = _load_tracker_gap_threshold_sec(_resolved_state)
+        _shared_segments[_merge_mode] = _build_pair_segments(
+            _cached_blocks[0],
+            allow_cross_session_merge=_merge_mode,
+            max_session_gap_sec=_eff_gap if _merge_mode else max_session_gap_sec,
+            regime_shift_score_threshold=regime_shift_score_threshold,
+        )
+        _shared_feat_cache[_merge_mode] = {}
+    logger.info("Pre-computed segments for %d merge modes.", len(_shared_segments))
     # Scale certification timeout proportionally to dataset size.
-    # Gate_10 (dual-mode preflight) builds 6 bundles (3 configs × 2 merge modes).
-    # Feature engineering is O(n) on records — ~5 min per bundle at 6.3M records.
-    # Default 300s is only suitable for tiny datasets (<50k blocks).
     _num_blocks = int(_cached_blocks[2].get("num_blocks", 0))
     _scaled_timeout = max(int(max_certification_duration_sec), 300 + _num_blocks // 500)
     if _scaled_timeout != max_certification_duration_sec:
@@ -2023,6 +2069,8 @@ def run_clean_training_cycle(
         runtime_audit_dir=runtime_audit_dir,
         run_reconnection_stress=run_reconnection_stress,
         _preloaded_blocks=_cached_blocks,
+        _precomputed_segments_by_merge=_shared_segments,
+        _precomputed_features_by_merge=_shared_feat_cache,
     )
     if not bool(certification.get("certified")):
         raise ValueError(
@@ -2053,6 +2101,8 @@ def run_clean_training_cycle(
         min_test_positive_samples=min_test_positive_samples,
         output_path=preflight_output,
         _preloaded_blocks=_cached_blocks,
+        _precomputed_pair_segments=_shared_segments.get(allow_cross_session_merge),
+        _precomputed_segment_features=_shared_feat_cache.get(allow_cross_session_merge),
     )
     if not preflight.get("qualifies_for_training"):
         raise ValueError("No threshold qualified for clean training in preflight.")
@@ -2104,6 +2154,8 @@ def run_clean_training_cycle(
         audit_output=audit_output,
         certification_context=certification,
         _preloaded_blocks=_cached_blocks,
+        _precomputed_pair_segments=_shared_segments.get(allow_cross_session_merge),
+        _precomputed_segment_features=_shared_feat_cache.get(allow_cross_session_merge),
     )
     report["data_certification"] = certification
     report["certification_id"] = str(certification.get("certification_id") or "")

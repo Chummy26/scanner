@@ -1283,6 +1283,7 @@ def build_dataset_bundle(
     _preloaded_blocks: tuple[list[dict[str, Any]], float, dict[str, Any]] | None = None,
     _precomputed_pair_segments: tuple[list[dict[str, Any]], dict[str, Any]] | None = None,
     _precomputed_segment_features: dict[int, list[list[float]]] | None = None,
+    _precomputed_block_diagnostics: dict[str, Any] | None = None,
 ) -> DatasetBundle:
     X_samples: list[list[list[float]]] = []
     y_class: list[float] = []
@@ -1347,7 +1348,11 @@ def build_dataset_bundle(
     effective_max_session_gap_sec = max_session_gap_sec
     if bool(allow_cross_session_merge) and effective_max_session_gap_sec is None:
         effective_max_session_gap_sec = _load_tracker_gap_threshold_sec(state_path)
-    block_diagnostics = _build_block_diagnostics(blocks, sequence_length=sequence_length)
+    block_diagnostics = (
+        _precomputed_block_diagnostics
+        if _precomputed_block_diagnostics is not None
+        else _build_block_diagnostics(blocks, sequence_length=sequence_length)
+    )
     if _precomputed_pair_segments is not None:
         pair_segments, cross_session_merge_diagnostics = _precomputed_pair_segments
     else:

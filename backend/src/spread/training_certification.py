@@ -1108,6 +1108,8 @@ def run_training_certification(
     preflight_fn: Callable[..., dict[str, Any]],
     dataset_fingerprint_fn: Callable[..., str],
     _preloaded_blocks: tuple[list, float, dict] | None = None,
+    _precomputed_segments_by_merge: dict[bool, tuple[list[dict[str, Any]], dict[str, Any]]] | None = None,
+    _precomputed_features_by_merge: dict[bool, dict[int, list[list[float]]]] | None = None,
 ) -> dict[str, Any]:
     state_path = Path(state_file)
     artifact_root = Path(artifact_dir)
@@ -1149,7 +1151,13 @@ def run_training_certification(
         else None
     )
     _cached_blocks_tuple = None
-    _cached_segments_for_merge: dict[bool, tuple[list[dict[str, Any]], dict[str, Any]]] = {}
+    # Use pre-computed segments/features from caller if available (keyed by merge mode)
+    _cached_segments_for_merge: dict[bool, tuple[list[dict[str, Any]], dict[str, Any]]] = (
+        dict(_precomputed_segments_by_merge) if _precomputed_segments_by_merge is not None else {}
+    )
+    _cached_features_for_merge: dict[bool, dict[int, list[list[float]]]] = (
+        dict(_precomputed_features_by_merge) if _precomputed_features_by_merge is not None else {}
+    )
     if quick_sqlite_metrics is None:
         if _preloaded_blocks is not None:
             _cached_blocks_tuple = _preloaded_blocks
@@ -1162,16 +1170,17 @@ def run_training_certification(
                 closed_only=True,
             )
         blocks = _cached_blocks_tuple[0]
-        # Pre-compute segments for the current merge mode (reused by bundle builder)
-        _cert_eff_gap = max_session_gap_sec
-        if bool(allow_cross_session_merge) and _cert_eff_gap is None:
-            _cert_eff_gap = _load_tracker_gap_threshold_sec(state_path)
-        _cached_segments_for_merge[allow_cross_session_merge] = _build_pair_segments(
-            blocks,
-            allow_cross_session_merge=bool(allow_cross_session_merge),
-            max_session_gap_sec=_cert_eff_gap if allow_cross_session_merge else max_session_gap_sec,
-            regime_shift_score_threshold=regime_shift_score_threshold,
-        )
+        # Build segments for current merge mode if not pre-computed
+        if allow_cross_session_merge not in _cached_segments_for_merge:
+            _cert_eff_gap = max_session_gap_sec
+            if bool(allow_cross_session_merge) and _cert_eff_gap is None:
+                _cert_eff_gap = _load_tracker_gap_threshold_sec(state_path)
+            _cached_segments_for_merge[allow_cross_session_merge] = _build_pair_segments(
+                blocks,
+                allow_cross_session_merge=bool(allow_cross_session_merge),
+                max_session_gap_sec=_cert_eff_gap if allow_cross_session_merge else max_session_gap_sec,
+                regime_shift_score_threshold=regime_shift_score_threshold,
+            )
         records = _scope_records(blocks)
         episodes = _scope_episodes(blocks)
         checkpoint_buckets = _checkpoint_buckets(records)
@@ -1227,9 +1236,9 @@ def run_training_certification(
         )
 
         _check_timeout()
-        # Feature cache shared across all bundle builds with same merge mode.
-        # Features depend only on segment records/episodes, NOT on threshold/horizon.
-        _cert_feat_cache: dict[bool, dict[int, list[list[float]]]] = {False: {}, True: {}}
+        # Ensure feature cache exists for current merge mode
+        if allow_cross_session_merge not in _cached_features_for_merge:
+            _cached_features_for_merge[allow_cross_session_merge] = {}
         bundle = (
             build_dataset_bundle(
                 state_path=state_path,
@@ -1244,7 +1253,7 @@ def run_training_certification(
                 regime_shift_score_threshold=regime_shift_score_threshold,
                 _preloaded_blocks=_cached_blocks_tuple,
                 _precomputed_pair_segments=_cached_segments_for_merge.get(allow_cross_session_merge),
-                _precomputed_segment_features=_cert_feat_cache[allow_cross_session_merge],
+                _precomputed_segment_features=_cached_features_for_merge[allow_cross_session_merge],
                 **_dataset_build_kwargs_for_label_config(
                     {
                         "threshold": operational_min_total_spread_pct,
@@ -1592,22 +1601,20 @@ def run_training_certification(
             dual_summary: list[dict[str, Any]] = []
             qualifying_configs: list[str] = []
             failure_counter: Counter[str] = Counter()
-            # Pre-compute segments per merge mode (reused across all configs)
+            # Use pre-computed segments + features if available, otherwise build per merge mode
             _eff_gap = max_session_gap_sec
             if _eff_gap is None and _cached_blocks_tuple is not None:
                 _eff_gap = _load_tracker_gap_threshold_sec(state_path)
-            _seg_cache: dict[bool, tuple[list[dict[str, Any]], dict[str, Any]]] = {}
-            # Reuse feature cache from earlier bundle build (gate_01→gate_02).
-            # Features are segment-level and independent of threshold/horizon.
-            _feat_cache = _cert_feat_cache
+            _seg_cache = _cached_segments_for_merge
             if _cached_blocks_tuple is not None:
                 for _me in (False, True):
-                    _seg_cache[_me] = _build_pair_segments(
-                        _cached_blocks_tuple[0],
-                        allow_cross_session_merge=_me,
-                        max_session_gap_sec=_eff_gap if _me else None,
-                        regime_shift_score_threshold=regime_shift_score_threshold,
-                    )
+                    if _me not in _seg_cache:
+                        _seg_cache[_me] = _build_pair_segments(
+                            _cached_blocks_tuple[0],
+                            allow_cross_session_merge=_me,
+                            max_session_gap_sec=_eff_gap if _me else None,
+                            regime_shift_score_threshold=regime_shift_score_threshold,
+                        )
             for config in DEFAULT_DUAL_PREFLIGHT_CONFIGS:
                 config_entry: dict[str, Any] = {"sequence_length": int(config["sequence_length"]), "prediction_horizon_sec": int(config["prediction_horizon_sec"])}
                 for merge_enabled, key in ((False, "merge_off"), (True, "merge_on")):
@@ -1627,7 +1634,8 @@ def run_training_certification(
                         min_val_positive_samples=1,
                         min_test_positive_samples=1,
                         _preloaded_blocks=_cached_blocks_tuple,
-                        _precomputed_segment_features=_feat_cache.get(merge_enabled),
+                        _precomputed_pair_segments=_seg_cache.get(merge_enabled),
+                        _precomputed_segment_features=_cached_features_for_merge.setdefault(merge_enabled, {}),
                     )
                     fingerprint_threshold = float(preflight.get("selected_threshold") or operational_min_total_spread_pct)
                     selected_label_config = _label_config_payload(preflight.get("selected_label_config"))
@@ -1645,7 +1653,7 @@ def run_training_certification(
                             regime_shift_score_threshold=regime_shift_score_threshold,
                             _preloaded_blocks=_cached_blocks_tuple,
                             _precomputed_pair_segments=_seg_cache.get(merge_enabled),
-                            _precomputed_segment_features=_feat_cache.get(merge_enabled),
+                            _precomputed_segment_features=_cached_features_for_merge.setdefault(merge_enabled, {}),
                             **_dataset_build_kwargs_for_label_config(
                                 selected_label_config or {
                                     "threshold": fingerprint_threshold,
