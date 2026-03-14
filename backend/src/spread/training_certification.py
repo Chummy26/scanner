@@ -29,8 +29,6 @@ CHECKPOINT_WINDOW_SEC = 30 * 60
 DEFAULT_CERTIFICATION_THRESHOLDS = [0.8, 1.0, 1.2]
 DEFAULT_CERTIFICATION_LABEL_PERCENTILES = [60, 70, 80]
 DEFAULT_DUAL_PREFLIGHT_CONFIGS = [
-    {"sequence_length": 4, "prediction_horizon_sec": 240},
-    {"sequence_length": 8, "prediction_horizon_sec": 600},
     {"sequence_length": 15, "prediction_horizon_sec": 14_400},
 ]
 DEFAULT_RUNTIME_AUDIT_STALENESS_SEC = 24 * 60 * 60
@@ -1110,6 +1108,8 @@ def run_training_certification(
     _preloaded_blocks: tuple[list, float, dict] | None = None,
     _precomputed_segments_by_merge: dict[bool, tuple[list[dict[str, Any]], dict[str, Any]]] | None = None,
     _precomputed_features_by_merge: dict[bool, dict[int, list[list[float]]]] | None = None,
+    _scaffold_cache: dict[tuple[int, int, bool], Any] | None = None,
+    window_stride: int = 1,
 ) -> dict[str, Any]:
     state_path = Path(state_file)
     artifact_root = Path(artifact_dir)
@@ -1254,6 +1254,7 @@ def run_training_certification(
                 _preloaded_blocks=_cached_blocks_tuple,
                 _precomputed_pair_segments=_cached_segments_for_merge.get(allow_cross_session_merge),
                 _precomputed_segment_features=_cached_features_for_merge[allow_cross_session_merge],
+                _scaffold_cache=_scaffold_cache,
                 **_dataset_build_kwargs_for_label_config(
                     {
                         "threshold": operational_min_total_spread_pct,
@@ -1636,6 +1637,8 @@ def run_training_certification(
                         _preloaded_blocks=_cached_blocks_tuple,
                         _precomputed_pair_segments=_seg_cache.get(merge_enabled),
                         _precomputed_segment_features=_cached_features_for_merge.setdefault(merge_enabled, {}),
+                        _scaffold_cache=_scaffold_cache,
+                        window_stride=window_stride,
                     )
                     fingerprint_threshold = float(preflight.get("selected_threshold") or operational_min_total_spread_pct)
                     selected_label_config = _label_config_payload(preflight.get("selected_label_config"))
@@ -1654,6 +1657,8 @@ def run_training_certification(
                             _preloaded_blocks=_cached_blocks_tuple,
                             _precomputed_pair_segments=_seg_cache.get(merge_enabled),
                             _precomputed_segment_features=_cached_features_for_merge.setdefault(merge_enabled, {}),
+                            _scaffold_cache=_scaffold_cache,
+                            window_stride=window_stride,
                             **_dataset_build_kwargs_for_label_config(
                                 selected_label_config or {
                                     "threshold": fingerprint_threshold,

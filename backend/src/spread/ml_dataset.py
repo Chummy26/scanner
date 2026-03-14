@@ -70,6 +70,220 @@ class DatasetBundle:
         )
 
 
+@dataclass
+class _WindowScaffold:
+    """Pre-computed window geometry. Reusable across label configs with same (seq_len, horizon, merge)."""
+    X_tensor: torch.Tensor  # (n_windows, seq_len, n_features) — built once, shared
+    pair_ids: list[str]
+    block_ids: list[int]
+    session_ids: list[int]
+    timestamps: list[float]
+    label_end_timestamps: list[float]
+    last_entries: list[float]
+    window_segment_indices: list[int]
+    episode_indices_by_seg: dict[int, "_EpisodeIndex"]
+    episodes_by_seg: dict[int, list[Any]]
+    cross_block_window_count: int
+    cross_session_window_count: int
+    skipped_windows_cross_session_boundary: int
+    skipped_windows_right_censored: int
+    skipped_blocks_too_short: int
+    block_diagnostics: dict[str, Any]
+    episode_diagnostics: dict[str, Any]
+    cross_session_merge_diagnostics: dict[str, Any]
+    block_summary: dict[str, Any]
+    saved_at: float
+    storage_kind: str
+    sequence_length: int
+    prediction_horizon_sec: int
+    allow_cross_session_merge: bool
+    effective_max_session_gap_sec: float | None
+    selected_block_ids: list[int] | None
+    selected_session_ids: list[int] | None
+
+
+def _relabel_scaffold(
+    scaffold: _WindowScaffold,
+    *,
+    min_total_spread_pct: float,
+    adaptive_threshold_enabled: bool,
+    label_cost_floor_pct: float,
+    label_percentile: float,
+    label_episode_window_days: int,
+) -> DatasetBundle:
+    """Vectorized relabel: numpy broadcast per segment instead of Python loop per window."""
+    effective_min = float(label_cost_floor_pct if adaptive_threshold_enabled else min_total_spread_pct)
+    cost_floor = float(max(0.0, label_cost_floor_pct if label_cost_floor_pct is not None else min_total_spread_pct or 0.0))
+    n_total = int(scaffold.X_tensor.shape[0])
+    if n_total == 0:
+        return DatasetBundle(
+            X=scaffold.X_tensor, y_class=torch.empty((0,), dtype=torch.float32),
+            y_eta=torch.empty((0,), dtype=torch.float32), label_thresholds=[],
+            pair_ids=[], block_ids=[], session_ids=[], timestamps=[], label_end_timestamps=[],
+            last_entries=[], feature_names=list(FEATURE_NAMES), summary={"num_samples": 0},
+        )
+
+    all_ts = np.array(scaffold.timestamps, dtype=np.float64)
+    seg_indices = np.array(scaffold.window_segment_indices, dtype=np.int64)
+    horizon = float(scaffold.prediction_horizon_sec)
+    history_window_sec = float(max(int(label_episode_window_days), 1) * 86400) if adaptive_threshold_enabled else 0.0
+    pctl = float(label_percentile)
+
+    y_class_arr = np.zeros(n_total, dtype=np.float64)
+    y_eta_arr = np.zeros(n_total, dtype=np.float64)
+    threshold_arr = np.full(n_total, effective_min, dtype=np.float64)
+    peak_arr = np.zeros(n_total, dtype=np.float64)
+    has_future_arr = np.zeros(n_total, dtype=bool)
+
+    unique_segs = np.unique(seg_indices)
+    for seg_idx in unique_segs:
+        seg_idx = int(seg_idx)
+        ep_idx = scaffold.episode_indices_by_seg.get(seg_idx)
+        if ep_idx is None or ep_idx._start_ts.size == 0:
+            continue
+
+        mask = seg_indices == seg_idx
+        seg_positions = np.where(mask)[0]
+        seg_ts = all_ts[seg_positions]
+        n_win = seg_ts.shape[0]
+        if n_win == 0:
+            continue
+
+        ep_starts = ep_idx._start_ts
+        ep_ends = ep_idx._end_ts
+        ep_spreads = ep_idx._total_spread
+
+        # 1. Adaptive thresholds (vectorized searchsorted + per-group percentile)
+        if adaptive_threshold_enabled:
+            lo = np.searchsorted(ep_idx._end_ts_sorted, seg_ts - history_window_sec, side="left")
+            hi = np.searchsorted(ep_idx._end_ts_sorted, seg_ts, side="right")
+            prev_lo, prev_hi, prev_thresh = -1, -1, cost_floor
+            for j in range(n_win):
+                if lo[j] == hi[j]:
+                    threshold_arr[seg_positions[j]] = cost_floor
+                elif lo[j] == prev_lo and hi[j] == prev_hi:
+                    threshold_arr[seg_positions[j]] = prev_thresh
+                else:
+                    prior_spreads = ep_spreads[ep_idx._sort_order[lo[j]:hi[j]]]
+                    t = float(max(cost_floor, np.percentile(prior_spreads, pctl)))
+                    threshold_arr[seg_positions[j]] = t
+                    prev_lo, prev_hi, prev_thresh = int(lo[j]), int(hi[j]), t
+
+        # 2. Future episodes — numpy broadcast: (n_win, 1) vs (1, n_episodes) → (n_win, n_episodes)
+        horizon_ends = seg_ts + horizon
+        future_mask = (ep_starts[None, :] > seg_ts[:, None]) & (ep_ends[None, :] <= horizon_ends[:, None])
+        # (n_win, n_episodes)
+
+        # Peak future spread per window
+        spreads_matrix = np.where(future_mask, ep_spreads[None, :], 0.0)
+        has_any_future = future_mask.any(axis=1)
+        has_future_arr[seg_positions] = has_any_future
+        peak_arr[seg_positions] = spreads_matrix.max(axis=1)
+
+        # Qualified check: spread >= threshold
+        seg_thresholds = threshold_arr[seg_positions]
+        qualified = future_mask & (ep_spreads[None, :] >= seg_thresholds[:, None])
+        has_qualified = qualified.any(axis=1)
+        y_class_arr[seg_positions[has_qualified]] = 1.0
+
+        # ETA for qualified windows: end_ts of first qualified episode
+        for j in np.where(has_qualified)[0]:
+            q_ep_indices = np.where(qualified[j])[0]
+            first_q = q_ep_indices[0]
+            y_eta_arr[seg_positions[j]] = ep_ends[first_q] - seg_ts[j]
+
+    # Build audit accumulators from vectorized results
+    positive_entry_spread_buckets: dict[str, int] = {}
+    timeout_peak_future_total_spread_buckets: dict[str, int] = {}
+    timeouts_without_future_episode = 0
+    timeouts_with_only_sub_threshold_episode = 0
+    last_entries_arr = np.array(scaffold.last_entries, dtype=np.float64)
+
+    pos_mask = y_class_arr >= 0.5
+    neg_mask = ~pos_mask
+    for name, lo_b, hi_b in [("lt_0_30", -1e30, 0.30), ("0_30_to_0_50", 0.30, 0.50),
+                              ("0_50_to_1_00", 0.50, 1.00), ("1_00_to_2_00", 1.00, 2.00),
+                              ("ge_2_00", 2.00, 1e30)]:
+        positive_entry_spread_buckets[name] = int(np.sum((last_entries_arr[pos_mask] >= lo_b) & (last_entries_arr[pos_mask] < hi_b)))
+    for name, lo_b, hi_b in [("lt_0_30", -1e30, 0.30), ("0_30_to_0_50", 0.30, 0.50),
+                              ("0_50_to_0_80", 0.50, 0.80), ("0_80_to_1_00", 0.80, 1.00),
+                              ("ge_1_00", 1.00, 1e30)]:
+        timeout_peak_future_total_spread_buckets[name] = int(np.sum((peak_arr[neg_mask] >= lo_b) & (peak_arr[neg_mask] < hi_b)))
+    timeouts_without_future_episode = int(np.sum(neg_mask & ~has_future_arr))
+    timeouts_with_only_sub_threshold_episode = int(np.sum(neg_mask & has_future_arr))
+
+    sample_label_thresholds = threshold_arr.tolist()
+    pair_label_thresholds: dict[str, list[float]] = defaultdict(list)
+    for pid, thr in zip(scaffold.pair_ids, sample_label_thresholds):
+        pair_label_thresholds[pid].append(thr)
+
+    X_tensor = scaffold.X_tensor
+    y_class_tensor = torch.from_numpy(y_class_arr.astype(np.float32))
+    y_eta_tensor = torch.from_numpy(y_eta_arr.astype(np.float32))
+
+    label_threshold_summary = {
+        pid: {"latest": float(vals[-1]), "min": float(min(vals)),
+              "p50": float(np.percentile(np.asarray(vals, dtype=float), 50)),
+              "p90": float(np.percentile(np.asarray(vals, dtype=float), 90)),
+              "max": float(max(vals)), "samples": int(len(vals))}
+        for pid, vals in sorted(pair_label_thresholds.items()) if vals
+    }
+    summary = {
+        "num_samples": int(scaffold.X_tensor.shape[0]),
+        "num_positive_samples": int(y_class_arr.sum()),
+        "num_negative_samples": int(scaffold.X_tensor.shape[0]) - int(y_class_arr.sum()),
+        "num_pairs": len(set(scaffold.pair_ids)),
+        "num_blocks": int(scaffold.block_summary.get("num_blocks", 0)),
+        "num_sessions": int(scaffold.block_summary.get("num_sessions", 0)),
+        "blocks_used": len(set(scaffold.block_ids)),
+        "sessions_used": len(set(scaffold.session_ids)),
+        "block_ids_used": sorted({int(b) for b in scaffold.block_ids if int(b) > 0}),
+        "session_ids_used": sorted({int(s) for s in scaffold.session_ids if int(s) > 0}),
+        "selected_block_ids": sorted({int(b) for b in (scaffold.selected_block_ids or []) if int(b) > 0}),
+        "selected_session_ids": sorted({int(s) for s in (scaffold.selected_session_ids or []) if int(s) > 0}),
+        "skipped_blocks_too_short": scaffold.skipped_blocks_too_short,
+        "skipped_windows_right_censored": scaffold.skipped_windows_right_censored,
+        "skipped_windows_cross_session_boundary": scaffold.skipped_windows_cross_session_boundary,
+        "num_cross_block_windows": scaffold.cross_block_window_count,
+        "num_cross_session_windows": scaffold.cross_session_window_count,
+        "prediction_horizon_sec": int(scaffold.prediction_horizon_sec),
+        "sequence_length": int(scaffold.sequence_length),
+        "min_total_spread_pct": float(effective_min),
+        "label_threshold_mode": "rolling_pair_percentile" if adaptive_threshold_enabled else "fixed_threshold",
+        "label_cost_floor_pct": float(label_cost_floor_pct),
+        "label_percentile": float(label_percentile),
+        "label_episode_window_days": int(label_episode_window_days),
+        "label_thresholds": label_threshold_summary,
+        "cross_session_merge_enabled": bool(scaffold.allow_cross_session_merge),
+        "cross_session_merges_applied": int(scaffold.cross_session_merge_diagnostics.get("applied_count", 0)),
+        "cross_session_gap_threshold_sec": None if scaffold.effective_max_session_gap_sec is None else float(scaffold.effective_max_session_gap_sec),
+        "cross_session_boundaries": int(scaffold.cross_session_merge_diagnostics.get("applied_count", 0)),
+        "cross_session_merge_diagnostics": dict(scaffold.cross_session_merge_diagnostics),
+        "episode_diagnostics": scaffold.episode_diagnostics,
+        "labeling_method": "rolling_pair_percentile_take_profit_time_barrier" if adaptive_threshold_enabled else "episode_take_profit_time_barrier",
+        "labeling_timeout_only": True,
+        "label_audit": _finalize_label_audit(
+            positive_entry_spread_buckets, [],
+            timeout_peak_future_total_spread_buckets,
+            timeouts_without_future_episode=timeouts_without_future_episode,
+            timeouts_with_only_sub_threshold_episode=timeouts_with_only_sub_threshold_episode,
+            right_censored_windows=scaffold.skipped_windows_right_censored,
+        ),
+        "block_diagnostics": scaffold.block_diagnostics,
+        "state_saved_at": float(scaffold.saved_at),
+        "state_storage_kind": scaffold.storage_kind,
+    }
+    return DatasetBundle(
+        X=X_tensor, y_class=y_class_tensor, y_eta=y_eta_tensor,
+        label_thresholds=sample_label_thresholds,
+        pair_ids=list(scaffold.pair_ids), block_ids=list(scaffold.block_ids),
+        session_ids=list(scaffold.session_ids), timestamps=list(scaffold.timestamps),
+        label_end_timestamps=list(scaffold.label_end_timestamps),
+        last_entries=list(scaffold.last_entries),
+        feature_names=list(FEATURE_NAMES), summary=summary,
+    )
+
+
 def _coerce_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -1270,6 +1484,7 @@ def build_dataset_bundle(
     prediction_horizon_sec: int = 14_400,
     *,
     min_total_spread_pct: float = 0.0,
+    window_stride: int = 1,
     label_cost_floor_pct: float | None = None,
     label_percentile: float | None = None,
     label_episode_window_days: int | None = None,
@@ -1284,6 +1499,7 @@ def build_dataset_bundle(
     _precomputed_pair_segments: tuple[list[dict[str, Any]], dict[str, Any]] | None = None,
     _precomputed_segment_features: dict[int, list[list[float]]] | None = None,
     _precomputed_block_diagnostics: dict[str, Any] | None = None,
+    _scaffold_cache: dict[tuple[int, int, bool], _WindowScaffold] | None = None,
 ) -> DatasetBundle:
     X_samples: list[list[list[float]]] = []
     y_class: list[float] = []
@@ -1381,6 +1597,22 @@ def build_dataset_bundle(
     skipped_windows_cross_session_boundary = 0
     cross_block_window_count = 0
     cross_session_window_count = 0
+    # --- Scaffold fast path: reuse geometry, only relabel ---
+    _effective_stride = max(1, int(window_stride))
+    _scaffold_key = (int(sequence_length), int(prediction_horizon_sec), bool(allow_cross_session_merge), _effective_stride)
+    if _scaffold_cache is not None and _scaffold_key in _scaffold_cache:
+        return _relabel_scaffold(
+            _scaffold_cache[_scaffold_key],
+            min_total_spread_pct=effective_min_total_spread_pct,
+            adaptive_threshold_enabled=adaptive_threshold_enabled,
+            label_cost_floor_pct=effective_label_cost_floor_pct,
+            label_percentile=effective_label_percentile,
+            label_episode_window_days=effective_label_episode_window_days,
+        )
+    # --- Full windowing (builds scaffold if cache available) ---
+    _scaffold_seg_indices: list[int] = []
+    _scaffold_ep_indices: dict[int, _EpisodeIndex] = {}
+    _scaffold_episodes: dict[int, list[Any]] = {}
     for _seg_idx, segment in enumerate(pair_segments):
         episodes = list(segment.get("episodes") or [])
         observable_end_ts = float(segment.get("observable_end_ts") or 0.0)
@@ -1401,7 +1633,9 @@ def build_dataset_bundle(
         _seg_session_ids = np.array([int(r.get("session_id") or 0) for r in segment_records], dtype=np.int64)
         _seg_block_ids = np.array([int(r.get("block_id") or 0) for r in segment_records], dtype=np.int64)
         _ep_index = _EpisodeIndex(episodes)
-        for start in range(len(segment_records) - sequence_length + 1):
+        _scaffold_ep_indices[_seg_idx] = _ep_index
+        _scaffold_episodes[_seg_idx] = episodes
+        for start in range(0, len(segment_records) - sequence_length + 1, max(1, int(window_stride))):
             window = segment_records[start : start + sequence_length]
             win_sessions = _seg_session_ids[start : start + sequence_length]
             if win_sessions[0] != win_sessions[-1] or np.unique(win_sessions).size > 1:
@@ -1429,6 +1663,7 @@ def build_dataset_bundle(
             )
 
             X_samples.append(segment_feature_rows[start : start + sequence_length])
+            _scaffold_seg_indices.append(_seg_idx)
             y_class.append(float(label["y_class"]))
             y_eta.append(float(label["y_eta"]))
             sample_label_thresholds.append(float(label["label_threshold"]))
@@ -1469,6 +1704,30 @@ def build_dataset_bundle(
                     timeouts_without_future_episode += 1
                 elif label["timeout_reason"] == "sub_threshold_only":
                     timeouts_with_only_sub_threshold_episode += 1
+
+    # Save scaffold for reuse by subsequent bundles with same geometry
+    if _scaffold_cache is not None and _scaffold_key not in _scaffold_cache:
+        _scaffold_X = torch.from_numpy(np.array(X_samples, dtype=np.float32)) if X_samples else torch.empty((0, sequence_length, len(FEATURE_NAMES)), dtype=torch.float32)
+        _scaffold_cache[_scaffold_key] = _WindowScaffold(
+            X_tensor=_scaffold_X, pair_ids=pair_ids, block_ids=block_ids,
+            session_ids=session_ids, timestamps=timestamps,
+            label_end_timestamps=label_end_timestamps, last_entries=last_entries,
+            window_segment_indices=_scaffold_seg_indices,
+            episode_indices_by_seg=_scaffold_ep_indices,
+            episodes_by_seg=_scaffold_episodes,
+            cross_block_window_count=cross_block_window_count,
+            cross_session_window_count=cross_session_window_count,
+            skipped_windows_cross_session_boundary=skipped_windows_cross_session_boundary,
+            skipped_windows_right_censored=skipped_windows_right_censored,
+            skipped_blocks_too_short=skipped_blocks_too_short,
+            block_diagnostics=block_diagnostics, episode_diagnostics=episode_diagnostics,
+            cross_session_merge_diagnostics=cross_session_merge_diagnostics,
+            block_summary=block_summary, saved_at=saved_at, storage_kind=storage_kind,
+            sequence_length=sequence_length, prediction_horizon_sec=prediction_horizon_sec,
+            allow_cross_session_merge=bool(allow_cross_session_merge),
+            effective_max_session_gap_sec=effective_max_session_gap_sec,
+            selected_block_ids=selected_block_ids, selected_session_ids=selected_session_ids,
+        )
 
     if X_samples:
         X_tensor = torch.from_numpy(np.array(X_samples, dtype=np.float32))

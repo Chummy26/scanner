@@ -1033,6 +1033,8 @@ def run_threshold_preflight(
     _preloaded_blocks: tuple[list, float, dict] | None = None,
     _precomputed_pair_segments: tuple[list[dict[str, Any]], dict[str, Any]] | None = None,
     _precomputed_segment_features: dict[int, list[list[float]]] | None = None,
+    _scaffold_cache: dict[tuple[int, int, bool], Any] | None = None,
+    window_stride: int = 1,
 ) -> dict[str, Any]:
     default_state = Path(__file__).resolve().parent.parent.parent / "out" / "config" / "tracker_history.sqlite"
     state_path = Path(state_file) if state_file is not None else default_state
@@ -1104,6 +1106,8 @@ def run_threshold_preflight(
                 _preloaded_blocks=_preloaded_blocks,
                 _precomputed_pair_segments=_cached_segments,
                 _precomputed_segment_features=_precomputed_segment_features,
+                _scaffold_cache=_scaffold_cache,
+                window_stride=window_stride,
                 **_dataset_build_kwargs_for_label_config(label_config),
             )
             splits = build_group_splits(bundle, prediction_horizon_sec=prediction_horizon_sec)
@@ -1276,6 +1280,8 @@ def certify_data_for_training(
     _preloaded_blocks: tuple[list, float, dict] | None = None,
     _precomputed_segments_by_merge: dict[bool, tuple[list[dict[str, Any]], dict[str, Any]]] | None = None,
     _precomputed_features_by_merge: dict[bool, dict[int, list[list[float]]]] | None = None,
+    _scaffold_cache: dict[tuple[int, int, bool], Any] | None = None,
+    window_stride: int = 1,
 ) -> dict[str, Any]:
     default_state = Path(__file__).resolve().parent.parent.parent / "out" / "config" / "tracker_history.sqlite"
     state_path = Path(state_file) if state_file is not None else default_state
@@ -1304,6 +1310,8 @@ def certify_data_for_training(
         _preloaded_blocks=_preloaded_blocks,
         _precomputed_segments_by_merge=_precomputed_segments_by_merge,
         _precomputed_features_by_merge=_precomputed_features_by_merge,
+        _scaffold_cache=_scaffold_cache,
+        window_stride=window_stride,
     )
 
 
@@ -1546,6 +1554,7 @@ def run_training_loop(
     num_layers: int = 2,
     dropout: float = 0.35,
     batch_size: int = 1024,
+    window_stride: int = 5,
     max_epochs: int = 80,
     patience: int = 5,
     learning_rate: float = 0.001,
@@ -1561,6 +1570,7 @@ def run_training_loop(
     _preloaded_blocks: tuple[list, float, dict] | None = None,
     _precomputed_pair_segments: tuple[list[dict[str, Any]], dict[str, Any]] | None = None,
     _precomputed_segment_features: dict[int, list[list[float]]] | None = None,
+    _scaffold_cache: dict[tuple[int, int, bool], Any] | None = None,
 ) -> dict[str, Any]:
     logger.info("Initializing robust ArbML training pipeline...")
     torch.manual_seed(seed)
@@ -1595,9 +1605,11 @@ def run_training_loop(
         allow_cross_session_merge=allow_cross_session_merge,
         max_session_gap_sec=max_session_gap_sec,
         regime_shift_score_threshold=regime_shift_score_threshold,
+        window_stride=window_stride,
         _preloaded_blocks=_preloaded_blocks,
         _precomputed_pair_segments=_precomputed_pair_segments,
         _precomputed_segment_features=_precomputed_segment_features,
+        _scaffold_cache=_scaffold_cache,
     )
     if bundle.summary["num_samples"] < 30:
         raise ValueError("Dataset construction failed or too small for robust training.")
@@ -1997,6 +2009,7 @@ def run_clean_training_cycle(
     num_layers: int = 2,
     dropout: float = 0.35,
     batch_size: int = 1024,
+    window_stride: int = 5,
     max_epochs: int = 80,
     patience: int = 5,
     learning_rate: float = 0.001,
@@ -2033,6 +2046,7 @@ def run_clean_training_cycle(
     # Cache keyed by merge mode: Gate 10 tests both True/False — different segments.
     _shared_segments: dict[bool, tuple[list[dict[str, Any]], dict[str, Any]]] = {}
     _shared_feat_cache: dict[bool, dict[int, list[list[float]]]] = {}
+    _shared_scaffold_cache: dict[tuple[int, int, bool, int], Any] = {}  # (seq_len, horizon, merge, stride) → _WindowScaffold
     for _merge_mode in ([False, True] if allow_cross_session_merge else [False]):
         _eff_gap = max_session_gap_sec
         if _merge_mode and _eff_gap is None:
@@ -2071,6 +2085,8 @@ def run_clean_training_cycle(
         _preloaded_blocks=_cached_blocks,
         _precomputed_segments_by_merge=_shared_segments,
         _precomputed_features_by_merge=_shared_feat_cache,
+        _scaffold_cache=_shared_scaffold_cache,
+        window_stride=window_stride,
     )
     if not bool(certification.get("certified")):
         raise ValueError(
@@ -2103,6 +2119,8 @@ def run_clean_training_cycle(
         _preloaded_blocks=_cached_blocks,
         _precomputed_pair_segments=_shared_segments.get(allow_cross_session_merge),
         _precomputed_segment_features=_shared_feat_cache.get(allow_cross_session_merge),
+        _scaffold_cache=_shared_scaffold_cache,
+        window_stride=window_stride,
     )
     if not preflight.get("qualifies_for_training"):
         raise ValueError("No threshold qualified for clean training in preflight.")
@@ -2141,6 +2159,7 @@ def run_clean_training_cycle(
         num_layers=num_layers,
         dropout=dropout,
         batch_size=batch_size,
+        window_stride=window_stride,
         max_epochs=max_epochs,
         patience=patience,
         learning_rate=learning_rate,
@@ -2156,6 +2175,7 @@ def run_clean_training_cycle(
         _preloaded_blocks=_cached_blocks,
         _precomputed_pair_segments=_shared_segments.get(allow_cross_session_merge),
         _precomputed_segment_features=_shared_feat_cache.get(allow_cross_session_merge),
+        _scaffold_cache=_shared_scaffold_cache,
     )
     report["data_certification"] = certification
     report["certification_id"] = str(certification.get("certification_id") or "")
