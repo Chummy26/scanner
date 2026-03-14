@@ -4,7 +4,6 @@ import bisect
 import json
 import math
 import sqlite3
-import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -448,13 +447,55 @@ def _safe_in(
         return "", []
     if len(normalized) <= 999:
         return f"{column_expr} IN ({_placeholders(normalized)})", normalized
-    temp_table_name = f"temp_{temp_table_prefix}_{time.time_ns()}"
-    conn.execute(f"CREATE TEMP TABLE {temp_table_name} (id INTEGER PRIMARY KEY)")
-    conn.executemany(
-        f"INSERT OR IGNORE INTO {temp_table_name}(id) VALUES (?)",
-        ((value,) for value in normalized),
-    )
-    return f"{column_expr} IN (SELECT id FROM {temp_table_name})", []
+    chunk_size = 900
+    chunks = [normalized[index : index + chunk_size] for index in range(0, len(normalized), chunk_size)]
+    clauses = [f"{column_expr} IN ({_placeholders(chunk)})" for chunk in chunks]
+    params = [value for chunk in chunks for value in chunk]
+    return f"({' OR '.join(clauses)})", params
+
+
+def _looks_like_sqlite_database(state_path: Path) -> bool:
+    path = Path(state_path)
+    if not path.exists() or not path.is_file():
+        return False
+    if path.suffix.lower() == ".json":
+        return False
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(16)
+    except OSError:
+        return False
+    return header.startswith(b"SQLite format 3")
+
+
+def _legacy_blocks_from_pairs(
+    pairs: dict[str, Any],
+    *,
+    saved_at: float,
+    storage_kind: str,
+) -> tuple[list[dict[str, Any]], float, dict[str, Any]]:
+    legacy_blocks: list[dict[str, Any]] = []
+    for pair_id, payload in pairs.items():
+        legacy_blocks.append(
+            {
+                "block_id": 0,
+                "session_id": 0,
+                "pair_id": pair_id,
+                "pair_key": pair_id,
+                "records": list(payload.get("records", [])),
+                "inverted_events": list(payload.get("inverted_events", [])),
+                "boundary_reason": "legacy_pair",
+                "selected_for_training": True,
+                "is_open": False,
+            }
+        )
+    return legacy_blocks, saved_at, {
+        "num_blocks": len(legacy_blocks),
+        "num_sessions": 0,
+        "state_storage_kind": storage_kind,
+        "selected_only": False,
+        "closed_only": False,
+    }
 
 
 def _load_blocks_from_sqlite(
@@ -465,16 +506,22 @@ def _load_blocks_from_sqlite(
     selected_only: bool = True,
     closed_only: bool = True,
 ) -> tuple[list[dict[str, Any]], float, dict[str, Any]]:
+    resolved_state_path = Path(state_path)
+    if not resolved_state_path.exists():
+        raise FileNotFoundError(f"State file not found: {resolved_state_path}")
+    if not _looks_like_sqlite_database(resolved_state_path):
+        pairs, saved_at, storage_kind = _load_pairs_payload(resolved_state_path)
+        return _legacy_blocks_from_pairs(pairs, saved_at=saved_at, storage_kind=f"{storage_kind}_legacy_pairs")
     blocks: list[dict[str, Any]] = []
     saved_at = 0.0
-    conn = sqlite3.connect(state_path, timeout=30.0)
+    conn = sqlite3.connect(resolved_state_path, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA cache_size=-262144")  # 256MB cache (4x previous)
     # mmap the entire file for read-heavy workloads
     try:
-        db_size = Path(state_path).stat().st_size
+        db_size = resolved_state_path.stat().st_size
         conn.execute(f"PRAGMA mmap_size={max(268435456, db_size + 10 * 1024 * 1024)}")
     except OSError:
         conn.execute("PRAGMA mmap_size=268435456")
@@ -482,29 +529,8 @@ def _load_blocks_from_sqlite(
     conn.execute("PRAGMA query_only=1")
     try:
         if not _sqlite_has_blocks(conn):
-            pairs, saved_at = _load_pairs_from_sqlite(state_path)
-            legacy_blocks = []
-            for pair_id, payload in pairs.items():
-                legacy_blocks.append(
-                    {
-                        "block_id": 0,
-                        "session_id": 0,
-                        "pair_id": pair_id,
-                        "pair_key": pair_id,
-                        "records": list(payload.get("records", [])),
-                        "inverted_events": list(payload.get("inverted_events", [])),
-                        "boundary_reason": "legacy_pair",
-                        "selected_for_training": True,
-                        "is_open": False,
-                    }
-                )
-            return legacy_blocks, saved_at, {
-                "num_blocks": len(legacy_blocks),
-                "num_sessions": 0,
-                "state_storage_kind": "sqlite_legacy_pairs",
-                "selected_only": False,
-                "closed_only": False,
-            }
+            pairs, saved_at = _load_pairs_from_sqlite(resolved_state_path)
+            return _legacy_blocks_from_pairs(pairs, saved_at=saved_at, storage_kind="sqlite_legacy_pairs")
 
         meta_rows = {
             row["key"]: row["value"]
@@ -665,6 +691,8 @@ def _load_blocks_from_sqlite(
 
 
 def _load_pairs_payload(state_path: Path) -> tuple[dict[str, Any], float, str]:
+    if not Path(state_path).exists():
+        raise FileNotFoundError(f"State file not found: {state_path}")
     suffix = state_path.suffix.lower()
     if suffix == ".json":
         pairs, saved_at = _load_pairs_from_json(state_path)
@@ -1631,22 +1659,27 @@ def build_dataset_bundle(
             )
             if _precomputed_segment_features is not None:
                 _precomputed_segment_features[_seg_idx] = segment_feature_rows
-        _seg_session_ids = np.array([int(r.get("session_id") or 0) for r in segment_records], dtype=np.int64)
-        _seg_block_ids = np.array([int(r.get("block_id") or 0) for r in segment_records], dtype=np.int64)
+        _seg_sids = [int(r.get("session_id") or 0) for r in segment_records]
+        _seg_bids = [int(r.get("block_id") or 0) for r in segment_records]
         _ep_index = _EpisodeIndex(episodes)
         _scaffold_ep_indices[_seg_idx] = _ep_index
         _scaffold_episodes[_seg_idx] = episodes
-        for start in range(0, len(segment_records) - sequence_length + 1, max(1, int(window_stride))):
-            window = segment_records[start : start + sequence_length]
-            win_sessions = _seg_session_ids[start : start + sequence_length]
-            if win_sessions[0] != win_sessions[-1] or np.unique(win_sessions).size > 1:
+        _stride = max(1, int(window_stride))
+        _seq_len = int(sequence_length)
+        _n_rec = len(segment_records)
+        for start in range(0, _n_rec - _seq_len + 1, _stride):
+            end = start + _seq_len
+            first_sid = _seg_sids[start]
+            last_sid = _seg_sids[end - 1]
+            if first_sid != last_sid or len(set(_seg_sids[start:end])) > 1:
                 cross_session_window_count += 1
                 skipped_windows_cross_session_boundary += 1
                 continue
-            win_blocks = _seg_block_ids[start : start + sequence_length]
-            if win_blocks[0] != win_blocks[-1] or np.unique(win_blocks).size > 1:
+            first_bid = _seg_bids[start]
+            last_bid = _seg_bids[end - 1]
+            if first_bid != last_bid or len(set(_seg_bids[start:end])) > 1:
                 cross_block_window_count += 1
-            current_ts = float(window[-1]["timestamp"])
+            current_ts = float(segment_records[end - 1]["timestamp"])
             if observable_end_ts > 0.0 and (float(current_ts) + float(prediction_horizon_sec)) > observable_end_ts:
                 skipped_windows_right_censored += 1
                 continue
@@ -1655,11 +1688,11 @@ def build_dataset_bundle(
             X_samples.append(segment_feature_rows[start : start + sequence_length])
             _scaffold_seg_indices.append(_seg_idx)
             pair_ids.append(normalized_pair_id)
-            block_ids.append(int(window[-1].get("block_id") or 0))
-            session_ids.append(int(window[-1].get("session_id") or 0))
+            block_ids.append(int(segment_records[end - 1].get("block_id") or 0))
+            session_ids.append(int(segment_records[end - 1].get("session_id") or 0))
             timestamps.append(current_ts)
             label_end_timestamps.append(float(current_ts) + float(prediction_horizon_sec))
-            last_entries.append(float(window[-1]["entry_spread"]))
+            last_entries.append(float(segment_records[end - 1]["entry_spread"]))
 
             # Label computation (skip when building scaffold — relabel handles it)
             if not _build_scaffold:
@@ -1683,7 +1716,7 @@ def build_dataset_bundle(
                 future_episode_total_spreads.extend(float(value) for value in label["future_episode_total_spreads"])
                 if float(label["y_class"]) >= 0.5:
                     _bucket_count(
-                        float(window[-1]["entry_spread"]),
+                        float(segment_records[end - 1]["entry_spread"]),
                         [
                             ("lt_0_30", -float("inf"), 0.30),
                             ("0_30_to_0_50", 0.30, 0.50),
@@ -2014,35 +2047,44 @@ def build_group_splits(
     ordered_indices = sorted(range(len(bundle.timestamps)), key=lambda index: (bundle.timestamps[index], index))
     target_counts = _largest_remainder_counts(len(ordered_indices), (train_ratio, val_ratio, test_ratio))
     next_start = _next_start_after_horizon(ordered_indices)
-    valid_val_end_positions = [index for index, candidate in enumerate(next_start) if candidate is not None]
+    valid_val_end_positions = sorted([index for index, candidate in enumerate(next_start) if candidate is not None])
+    valid_val_end_arr = np.array(valid_val_end_positions, dtype=np.int64) if valid_val_end_positions else np.array([], dtype=np.int64)
 
     chosen: tuple[int, int, int] | None = None
     best_score: tuple[float, float, float, float] | None = None
+    n_ordered = len(ordered_indices)
     for train_last_index, val_start in enumerate(next_start):
         if val_start is None:
             continue
         train_count = train_last_index + 1
-        if train_count <= 0 or val_start >= len(ordered_indices) - 1:
+        if train_count <= 0 or val_start >= n_ordered - 1:
             continue
-        target_val_last = min(len(ordered_indices) - 2, max(val_start, val_start + target_counts[1] - 1))
+        target_val_last = min(n_ordered - 2, max(val_start, val_start + target_counts[1] - 1))
         candidate_positions = sorted(
             {
                 candidate
                 for candidate in (
-                    max(val_start, min(target_val_last, len(ordered_indices) - 2)),
-                    max(val_start, min(target_val_last - 1, len(ordered_indices) - 2)),
-                    max(val_start, min(target_val_last + 1, len(ordered_indices) - 2)),
+                    max(val_start, min(target_val_last, n_ordered - 2)),
+                    max(val_start, min(target_val_last - 1, n_ordered - 2)),
+                    max(val_start, min(target_val_last + 1, n_ordered - 2)),
                 )
-                if candidate < len(ordered_indices) - 1
+                if candidate < n_ordered - 1
             }
         )
-        candidate_positions.extend(
-            [
-                candidate
-                for candidate in valid_val_end_positions
-                if candidate >= val_start and candidate < len(ordered_indices) - 1 and candidate not in candidate_positions
-            ][:3]
-        )
+        # O(log n) bisect instead of O(n) list scan for valid_val_end_positions
+        if valid_val_end_arr.size > 0:
+            lo = bisect.bisect_left(valid_val_end_positions, val_start)
+            added = 0
+            candidate_set = set(candidate_positions)
+            for j in range(lo, len(valid_val_end_positions)):
+                c = valid_val_end_positions[j]
+                if c >= n_ordered - 1:
+                    break
+                if c not in candidate_set:
+                    candidate_positions.append(c)
+                    added += 1
+                    if added >= 3:
+                        break
         for val_last_index in candidate_positions:
             test_start = next_start[val_last_index]
             if test_start is None:

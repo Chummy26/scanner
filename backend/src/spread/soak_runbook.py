@@ -24,7 +24,11 @@ from .auto_retrain import (
     state_file_path,
     training_manifest_path,
 )
-from .feature_contracts import DEFAULT_FEATURE_CONTRACT_VERSION, V2_MULTISCALE_FEATURE_NAMES
+from .feature_contracts import (
+    DEFAULT_FEATURE_CONTRACT_VERSION,
+    FEATURE_NAMES,
+    feature_contract_version_for_names,
+)
 from .ml_dataset import (
     _EpisodeIndex,
     _build_pair_segments,
@@ -541,12 +545,12 @@ def run_feature_history_harness(db_path: Path, *, limit: int = 15) -> dict[str, 
     pair = _pick_tracker_pair(tracker, min_records=max(int(limit), 8))
     if pair is None:
         return {"ok": False, "error": "no tracker pair has enough records for feature-history harness"}
-    rows = tracker.get_feature_history(*pair, limit=int(limit), feature_names=list(V2_MULTISCALE_FEATURE_NAMES))
+    rows = tracker.get_feature_history(*pair, limit=int(limit), feature_names=list(FEATURE_NAMES))
     if not rows:
         return {"ok": False, "error": "get_feature_history returned no rows", "selected_pair": "|".join(pair)}
     multiscale_indices = {
         name: index
-        for index, name in enumerate(V2_MULTISCALE_FEATURE_NAMES)
+        for index, name in enumerate(FEATURE_NAMES)
         if any(window in name for window in ("30m", "2h", "8h"))
     }
     variances: dict[str, float] = {}
@@ -571,14 +575,14 @@ def run_feature_history_harness(db_path: Path, *, limit: int = 15) -> dict[str, 
         last_exit - 0.017,
         now_ts=last_ts + float(max(tracker.record_interval_sec, 1.0)),
     )
-    updated_rows = tracker.get_feature_history(*pair, limit=int(limit), feature_names=list(V2_MULTISCALE_FEATURE_NAMES))
+    updated_rows = tracker.get_feature_history(*pair, limit=int(limit), feature_names=list(FEATURE_NAMES))
     cache_invalidated = bool(updated_rows and rows and updated_rows[-1] != rows[-1])
     return {
         "ok": True,
         "selected_pair": "|".join(pair),
         "row_count": len(rows),
         "feature_count": len(rows[0]) if rows else 0,
-        "feature_contract_version": DEFAULT_FEATURE_CONTRACT_VERSION,
+        "feature_contract_version": feature_contract_version_for_names(list(FEATURE_NAMES)) or DEFAULT_FEATURE_CONTRACT_VERSION,
         "nonzero_multiscale_features": nonzero_multiscale_features,
         "multiscale_variance": variances,
         "cache_invalidated": cache_invalidated,
@@ -865,7 +869,7 @@ def audit_snapshot_labeling(
         "fallback_cost_floor_samples": int(fallback_samples),
         "zero_leakage_ok": not zero_leakage_violations,
         "zero_leakage_violations": zero_leakage_violations,
-        "feature_contract_version": DEFAULT_FEATURE_CONTRACT_VERSION if len(bundle.feature_names) == len(V2_MULTISCALE_FEATURE_NAMES) else "",
+        "feature_contract_version": feature_contract_version_for_names(list(bundle.feature_names)) or "",
         "sample_count": int(bundle.summary.get("num_samples", 0)),
     }
 
@@ -1169,7 +1173,7 @@ def evaluate_stage1(
         _bool_gate(
             "feature_history_contract",
             bool(feature_harness.get("ok"))
-            and int(feature_harness.get("feature_count", 0)) == len(V2_MULTISCALE_FEATURE_NAMES)
+            and int(feature_harness.get("feature_count", 0)) == len(FEATURE_NAMES)
             and bool(feature_harness.get("cache_invalidated"))
             and bool(feature_harness.get("nonzero_multiscale_features")),
             value={
@@ -1177,7 +1181,7 @@ def evaluate_stage1(
                 "cache_invalidated": feature_harness.get("cache_invalidated"),
                 "nonzero_multiscale_features": len(list(feature_harness.get("nonzero_multiscale_features") or [])),
             },
-            expected="25 features, cache invalidates, multiscale variance > 0",
+            expected=f"{len(FEATURE_NAMES)} features, cache invalidates, multiscale variance > 0",
         ),
         _bool_gate(
             "hourly_digest_present",

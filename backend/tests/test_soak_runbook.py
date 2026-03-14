@@ -2,7 +2,7 @@ import math
 from pathlib import Path
 
 from tests.run_arbml_v2_soak import _normalize_stage_arg, _resolve_duration_override
-from src.spread.feature_contracts import DEFAULT_FEATURE_CONTRACT_VERSION, V2_MULTISCALE_FEATURE_NAMES
+from src.spread.feature_contracts import DEFAULT_FEATURE_CONTRACT_VERSION, FEATURE_NAMES
 from src.spread.runtime_audit import RuntimeAuditCollector
 from src.spread.soak_runbook import (
     _signal_anti_spike_gate,
@@ -141,7 +141,7 @@ def test_collect_tracker_sql_checks_and_feature_history_harness_cover_low_spread
     assert sql_checks["latest_hourly_health"]["quality_verdict"] == "healthy"
 
     assert feature_harness["ok"] is True
-    assert feature_harness["feature_count"] == len(V2_MULTISCALE_FEATURE_NAMES)
+    assert feature_harness["feature_count"] == len(FEATURE_NAMES)
     assert feature_harness["feature_contract_version"] == DEFAULT_FEATURE_CONTRACT_VERSION
     assert feature_harness["cache_invalidated"] is True
     assert feature_harness["nonzero_multiscale_features"]
@@ -354,7 +354,7 @@ def test_validate_latest_run_payload_and_stage_gates_use_runtime_shapes():
         },
         feature_harness={
             "ok": True,
-            "feature_count": len(V2_MULTISCALE_FEATURE_NAMES),
+            "feature_count": len(FEATURE_NAMES),
             "cache_invalidated": True,
             "nonzero_multiscale_features": ["entry_std_30m"],
         },
@@ -440,7 +440,7 @@ def test_stage1_skips_runtime_audit_gates_when_package_is_stale():
         },
         feature_harness={
             "ok": True,
-            "feature_count": len(V2_MULTISCALE_FEATURE_NAMES),
+            "feature_count": len(FEATURE_NAMES),
             "cache_invalidated": True,
             "nonzero_multiscale_features": ["entry_std_30m", "zscore_vs_8h"],
         },

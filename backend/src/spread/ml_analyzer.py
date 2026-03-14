@@ -562,6 +562,7 @@ class SpreadMLAnalyzer:
         *,
         pair_key: Any = None,
     ) -> dict[str, Any]:
+        effective_pair_key = prediction.get("pair_key", pair_key)
         model_status = str(prediction.get("model_status") or self.model_status)
         signal_reason = str(prediction.get("signal_reason") or self.signal_reason)
         history_points = int(prediction.get("history_points", 0) or 0)
@@ -573,7 +574,7 @@ class SpreadMLAnalyzer:
                 history=canonical_history,
                 model_status=model_status,
                 signal_reason=signal_reason,
-                pair_key=pair_key,
+                pair_key=effective_pair_key,
             )
 
         inversion_probability = float(prediction["inversion_probability"])
@@ -582,7 +583,7 @@ class SpreadMLAnalyzer:
         context = self._range_context(
             current_entry=current_entry,
             history=canonical_history,
-            pair_key=pair_key,
+            pair_key=effective_pair_key,
             now_ts=history_last_ts,
         )
         eta_payload = self._eta_payload(int(eta_seconds), context)
@@ -749,7 +750,7 @@ class SpreadMLAnalyzer:
         }
 
     def analyze_pair(self, current_entry: float, history: list[Any], *, pair_key: Any = None) -> Optional[dict[str, Any]]:
-        prediction = self.predict_history(history)
+        prediction = self.predict_history(history, pair_key=pair_key)
         return self.render_prediction(current_entry, prediction, pair_key=pair_key)
 
 

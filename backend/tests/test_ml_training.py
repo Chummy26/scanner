@@ -9,6 +9,7 @@ from src.spread.train_model import (
     FocalLoss,
     _build_split_summary,
     _derive_focal_alpha,
+    _loader_worker_count,
     build_dataset_bundle,
     build_group_splits,
     run_clean_training_cycle,
@@ -17,6 +18,19 @@ from src.spread.train_model import (
 )
 from src.spread.ml_dataset import FEATURE_NAMES, _label_window_from_episodes, _load_blocks_from_sqlite
 from src.spread.spread_tracker import SpreadTracker, TrackerEpisode
+
+
+def test_loader_worker_count_disables_multiprocessing_on_windows(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("ARBML_DATALOADER_WORKERS", raising=False)
+    monkeypatch.setattr("src.spread.train_model.os.name", "nt")
+
+    assert _loader_worker_count(use_pin=True, sample_count=50_000, batch_size=256) == 0
+
+
+def test_loader_worker_count_honors_env_override(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("ARBML_DATALOADER_WORKERS", "2")
+
+    assert _loader_worker_count(use_pin=True, sample_count=50_000, batch_size=256) == 2
 
 
 def _make_pair(base_ts: int, positive: bool, offset: float) -> dict:

@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from src.spread.ml_dataset import FEATURE_NAMES
@@ -56,6 +57,8 @@ def _save_ready_artifact(
     platt_scale: float = 1.0,
     platt_bias: float = 0.0,
     selected_threshold: float | None = None,
+    feature_mean: list[float] | None = None,
+    feature_std: list[float] | None = None,
     training_config_extra: dict | None = None,
 ) -> None:
     model = SpreadSequenceLSTM(input_sz=len(FEATURE_NAMES), hidden_sz=8, num_layers=1, dropout=0.0)
@@ -71,8 +74,8 @@ def _save_ready_artifact(
         num_layers=1,
         dropout=0.0,
         feature_names=list(FEATURE_NAMES),
-        feature_mean=[0.0] * len(FEATURE_NAMES),
-        feature_std=[1.0] * len(FEATURE_NAMES),
+        feature_mean=list(feature_mean) if feature_mean is not None else [0.0] * len(FEATURE_NAMES),
+        feature_std=list(feature_std) if feature_std is not None else [1.0] * len(FEATURE_NAMES),
         platt_scale=platt_scale,
         platt_bias=platt_bias,
         execute_threshold=execute_threshold,
@@ -96,6 +99,15 @@ def _save_ready_artifact(
         feature_schema_hash=current_feature_schema_hash(),
     )
     save_artifact_bundle(model, metadata, artifact_dir)
+
+
+def _artifact_feature_stats_from_tracker(tracker, pair: tuple[str, str, str, str, str]) -> tuple[list[float], list[float]]:
+    rows = tracker.get_feature_history(*pair, limit=256, feature_names=list(FEATURE_NAMES))
+    assert rows, "tracker must provide feature rows for the synthetic artifact baseline"
+    arr = np.asarray(rows, dtype=np.float32)
+    mean = arr.mean(axis=0)
+    std = np.maximum(arr.std(axis=0), 1.0)
+    return mean.tolist(), std.tolist()
 
 
 def _save_legacy_artifact(artifact_dir: Path, sequence_length: int = 12) -> None:
@@ -306,6 +318,7 @@ def test_analyzer_executes_only_when_recurring_context_is_ready(tmp_path: Path):
         tracker.record_spread(*pair, entry_spread, exit_spread, now_ts=float(index * 15))
     tracker.flush_to_storage(now_ts=float((len(entries) - 1) * 15), force=True)
     tracker.close_active_session(ended_at=float(len(entries) * 15))
+    feature_mean, feature_std = _artifact_feature_stats_from_tracker(tracker, pair)
 
     _save_ready_artifact(
         tmp_path,
@@ -313,6 +326,8 @@ def test_analyzer_executes_only_when_recurring_context_is_ready(tmp_path: Path):
         execute_threshold=0.45,
         strong_threshold=0.85,
         selected_threshold=1.0,
+        feature_mean=feature_mean,
+        feature_std=feature_std,
     )
     analyzer = SpreadMLAnalyzer(sequence_length=12, artifact_dir=tmp_path)
     analyzer.attach_tracker(tracker)
@@ -371,8 +386,16 @@ def test_analyzer_allows_strong_execute_when_eta_gate_is_disabled(tmp_path: Path
             ts += 45.0
     tracker.flush_to_storage(now_ts=ts, force=True)
     tracker.close_active_session(ended_at=ts)
+    feature_mean, feature_std = _artifact_feature_stats_from_tracker(tracker, pair)
 
-    _save_ready_artifact(tmp_path, sequence_length=12, execute_threshold=0.45, strong_threshold=0.45)
+    _save_ready_artifact(
+        tmp_path,
+        sequence_length=12,
+        execute_threshold=0.45,
+        strong_threshold=0.45,
+        feature_mean=feature_mean,
+        feature_std=feature_std,
+    )
     analyzer = SpreadMLAnalyzer(sequence_length=12, artifact_dir=tmp_path)
     analyzer.attach_tracker(tracker)
 

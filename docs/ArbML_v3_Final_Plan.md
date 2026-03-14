@@ -42,12 +42,14 @@ Regras:
 | Captura persistente 15s, SQLite WAL, 12h RAM / 8d disco | ✅ Produção |
 | Episódios econômicos (peak_entry + exit_at_close) | ✅ Produção |
 | Recurring context: bandas P10-P90 entry/exit, coerência short/long | ✅ Produção |
-| LSTM + TemporalAttention + dual head (prob + multi-quantile ETA) | ✅ Produção |
+| LSTM + TemporalAttention + dual head (prob + ETA single-point) | ✅ Produção |
 | Platt scaling, FocalLoss, threshold selection cronológica | ✅ Produção |
 | Adaptive labeling (rolling pair percentile, 3×3 sweep) | ✅ Produção |
 | Drift detection (features > 3σ do treino) | ✅ Produção |
 | Snapshots imutáveis com SHA-256 | ✅ Produção |
-| Soak v2 (Stage 1 PASS, Stage 2 em curso) | ✅ Em execução |
+| Soak / certification hardening (scheduler, manifest, suite backend) | ✅ Implementado |
+
+Nota: ETA multi-quantile e CLSTM permanecem no roadmap pós-v3; o baseline implementado hoje usa ETA pontual e drift gate sobre o contrato de 40 features.
 
 ### O que está errado ou ausente
 

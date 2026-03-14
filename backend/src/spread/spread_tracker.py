@@ -2054,7 +2054,7 @@ class SpreadTracker:
             recent_records,
             feature_names=list(feature_names or []),
             episodes=episodes,
-            cost_estimate_pct=float(getattr(self.config, "default_cost_estimate_pct", 0.30)),
+            cost_estimate_pct=float(getattr(getattr(self, "config", None), "default_cost_estimate_pct", 0.30)),
         )
         rows = rows[-max(int(limit), 0) :]
         with self._lock:

@@ -802,6 +802,10 @@ def test_run_clean_training_cycle_propagates_certification_id_to_report_and_meta
 
     monkeypatch.setattr("src.spread.train_model.certify_data_for_training", lambda **kwargs: certification)
     monkeypatch.setattr(
+        "src.spread.train_model._load_blocks_from_sqlite",
+        lambda *args, **kwargs: ([], 0.0, {"num_blocks": 0, "num_sessions": 0}),
+    )
+    monkeypatch.setattr(
         "src.spread.train_model.run_threshold_preflight",
         lambda **kwargs: {"qualifies_for_training": True, "selected_threshold": 0.8},
     )

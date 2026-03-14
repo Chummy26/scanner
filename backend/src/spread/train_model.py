@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import shutil
 import time as _time
 from datetime import datetime, timezone
@@ -58,18 +59,37 @@ _DEFAULT_PRELIGHT_THRESHOLDS = [0.8, 1.0, 1.2]
 _DEFAULT_LABEL_PERCENTILES = [60, 70, 80]
 
 
+def _loader_worker_count(*, use_pin: bool, sample_count: int, batch_size: int) -> int:
+    override = os.getenv("ARBML_DATALOADER_WORKERS")
+    if override is not None:
+        try:
+            return max(0, int(override))
+        except (TypeError, ValueError):
+            logger.warning("Ignoring invalid ARBML_DATALOADER_WORKERS=%r", override)
+    if not use_pin or os.name == "nt":
+        return 0
+    if int(sample_count) <= max(1024, int(batch_size) * 8):
+        return 0
+    return 4
+
+
 def _make_loader(bundle: DatasetBundle, batch_size: int, shuffle: bool) -> DataLoader:
     effective_batch = max(1, min(int(batch_size), max(1, bundle.summary["num_samples"])))
     dataset = TensorDataset(bundle.X, bundle.y_class, bundle.y_eta)
     use_pin = torch.cuda.is_available()
+    worker_count = _loader_worker_count(
+        use_pin=use_pin,
+        sample_count=int(bundle.summary["num_samples"]),
+        batch_size=effective_batch,
+    )
     return DataLoader(
         dataset,
         batch_size=effective_batch,
         shuffle=shuffle,
         pin_memory=use_pin,
-        num_workers=4 if use_pin else 0,
-        persistent_workers=True if use_pin else False,
-        prefetch_factor=2 if use_pin else None,
+        num_workers=worker_count,
+        persistent_workers=worker_count > 0,
+        prefetch_factor=2 if worker_count > 0 else None,
     )
 
 
@@ -1091,10 +1111,25 @@ def run_threshold_preflight(
     # not on threshold/prediction_horizon. Compute once, reuse across configs.
     if _precomputed_segment_features is None:
         _precomputed_segment_features = {}
+
+    def _build_bundle_with_fallback(**dataset_kwargs: Any) -> tuple[DatasetBundle, int]:
+        requested_stride = max(1, int(window_stride))
+        bundle_obj = build_dataset_bundle(window_stride=requested_stride, **dataset_kwargs)
+        if requested_stride > 1 and int(bundle_obj.summary.get("num_samples", 0) or 0) < 30:
+            fallback_bundle = build_dataset_bundle(window_stride=1, **dataset_kwargs)
+            fallback_bundle.summary["window_stride_requested"] = int(requested_stride)
+            fallback_bundle.summary["window_stride_used"] = 1
+            fallback_bundle.summary["window_stride_fallback_applied"] = True
+            return fallback_bundle, 1
+        bundle_obj.summary["window_stride_requested"] = int(requested_stride)
+        bundle_obj.summary["window_stride_used"] = int(requested_stride)
+        bundle_obj.summary["window_stride_fallback_applied"] = False
+        return bundle_obj, requested_stride
+
     for label_config in label_configs:
         threshold = float(label_config["threshold"])
         try:
-            bundle = build_dataset_bundle(
+            bundle, used_window_stride = _build_bundle_with_fallback(
                 state_path=state_path,
                 sequence_length=sequence_length,
                 prediction_horizon_sec=prediction_horizon_sec,
@@ -1107,7 +1142,6 @@ def run_threshold_preflight(
                 _precomputed_pair_segments=_cached_segments,
                 _precomputed_segment_features=_precomputed_segment_features,
                 _scaffold_cache=_scaffold_cache,
-                window_stride=window_stride,
                 **_dataset_build_kwargs_for_label_config(label_config),
             )
             splits = build_group_splits(bundle, prediction_horizon_sec=prediction_horizon_sec)
@@ -1120,6 +1154,8 @@ def run_threshold_preflight(
                 min_val_positive_samples=min_val_positive_samples,
                 min_test_positive_samples=min_test_positive_samples,
             )
+            entry["window_stride_used"] = int(used_window_stride)
+            entry["window_stride_fallback_applied"] = bool(bundle.summary.get("window_stride_fallback_applied"))
         except Exception as exc:
             entry = _preflight_entry(
                 threshold=threshold,
@@ -1592,25 +1628,41 @@ def run_training_loop(
     else:
         audit_path = Path(audit_output)
 
-    bundle = build_dataset_bundle(
-        state_path=state_path,
-        sequence_length=sequence_length,
-        prediction_horizon_sec=prediction_horizon_sec,
-        min_total_spread_pct=min_total_spread_pct,
-        label_cost_floor_pct=label_cost_floor_pct,
-        label_percentile=label_percentile,
-        label_episode_window_days=label_episode_window_days,
-        selected_session_ids=selected_session_ids,
-        selected_block_ids=selected_block_ids,
-        allow_cross_session_merge=allow_cross_session_merge,
-        max_session_gap_sec=max_session_gap_sec,
-        regime_shift_score_threshold=regime_shift_score_threshold,
-        window_stride=window_stride,
-        _preloaded_blocks=_preloaded_blocks,
-        _precomputed_pair_segments=_precomputed_pair_segments,
-        _precomputed_segment_features=_precomputed_segment_features,
-        _scaffold_cache=_scaffold_cache,
-    )
+    requested_window_stride = max(1, int(window_stride))
+
+    def _build_training_bundle(effective_window_stride: int) -> DatasetBundle:
+        return build_dataset_bundle(
+            state_path=state_path,
+            sequence_length=sequence_length,
+            prediction_horizon_sec=prediction_horizon_sec,
+            min_total_spread_pct=min_total_spread_pct,
+            label_cost_floor_pct=label_cost_floor_pct,
+            label_percentile=label_percentile,
+            label_episode_window_days=label_episode_window_days,
+            selected_session_ids=selected_session_ids,
+            selected_block_ids=selected_block_ids,
+            allow_cross_session_merge=allow_cross_session_merge,
+            max_session_gap_sec=max_session_gap_sec,
+            regime_shift_score_threshold=regime_shift_score_threshold,
+            window_stride=effective_window_stride,
+            _preloaded_blocks=_preloaded_blocks,
+            _precomputed_pair_segments=_precomputed_pair_segments,
+            _precomputed_segment_features=_precomputed_segment_features,
+            _scaffold_cache=_scaffold_cache,
+        )
+
+    bundle = _build_training_bundle(requested_window_stride)
+    used_window_stride = requested_window_stride
+    if requested_window_stride > 1 and int(bundle.summary.get("num_samples", 0) or 0) < 30:
+        bundle = _build_training_bundle(1)
+        used_window_stride = 1
+        bundle.summary["window_stride_requested"] = int(requested_window_stride)
+        bundle.summary["window_stride_used"] = 1
+        bundle.summary["window_stride_fallback_applied"] = True
+    else:
+        bundle.summary["window_stride_requested"] = int(requested_window_stride)
+        bundle.summary["window_stride_used"] = int(used_window_stride)
+        bundle.summary["window_stride_fallback_applied"] = False
     if bundle.summary["num_samples"] < 30:
         raise ValueError("Dataset construction failed or too small for robust training.")
 
@@ -1898,6 +1950,9 @@ def run_training_loop(
         "batch_size": batch_size,
         "max_epochs": max_epochs,
         "patience": patience,
+        "window_stride_requested": int(requested_window_stride),
+        "window_stride_used": int(used_window_stride),
+        "window_stride_fallback_applied": bool(bundle.summary.get("window_stride_fallback_applied")),
         "learning_rate": learning_rate,
         "weight_decay": weight_decay,
         "focal_alpha": focal_alpha_effective,
@@ -2032,7 +2087,36 @@ def run_clean_training_cycle(
     artifact_root.mkdir(parents=True, exist_ok=True)
     default_state = Path(__file__).resolve().parent.parent.parent / "out" / "config" / "tracker_history.sqlite"
     _resolved_state = Path(state_file) if state_file is not None else default_state
-    logger.info("Loading blocks from %s (single load for full pipeline)...", _resolved_state)
+    _cached_blocks = None
+    _shared_segments: dict[bool, tuple[list[dict[str, Any]], dict[str, Any]]] = {}
+    _shared_feat_cache: dict[bool, dict[int, list[list[float]]]] = {}
+    _shared_scaffold_cache: dict[tuple[int, int, bool, int], Any] = {}  # (seq_len, horizon, merge, stride) → _WindowScaffold
+    certification = certify_data_for_training(
+        state_file=_resolved_state,
+        artifact_dir=artifact_root,
+        sequence_length=sequence_length,
+        prediction_horizon_sec=prediction_horizon_sec,
+        thresholds=thresholds,
+        label_percentiles=label_percentiles,
+        selected_session_ids=selected_session_ids,
+        selected_block_ids=selected_block_ids,
+        allow_cross_session_merge=allow_cross_session_merge,
+        max_session_gap_sec=max_session_gap_sec,
+        regime_shift_score_threshold=regime_shift_score_threshold,
+        certification_mode=certification_mode,
+        max_certification_duration_sec=max_certification_duration_sec,
+        label_episode_window_days=label_episode_window_days,
+        allow_legacy_sessions=allow_legacy_sessions,
+        runtime_audit_dir=runtime_audit_dir,
+        run_reconnection_stress=run_reconnection_stress,
+        window_stride=window_stride,
+    )
+    if not bool(certification.get("certified")):
+        raise ValueError(
+            "Training data certification failed: "
+            + ", ".join(certification.get("failure_reasons", []) or ["unknown_certification_failure"])
+        )
+    logger.info("Loading blocks from %s (single load for preflight/training)...", _resolved_state)
     _cached_blocks = _load_blocks_from_sqlite(
         _resolved_state,
         selected_block_ids=selected_block_ids,
@@ -2041,12 +2125,6 @@ def run_clean_training_cycle(
         closed_only=True,
     )
     logger.info("Loaded %d blocks from %d sessions.", _cached_blocks[2].get("num_blocks", 0), _cached_blocks[2].get("num_sessions", 0))
-    # Pre-compute segments + feature cache per merge mode (reused across all phases).
-    # Features depend only on segment records/episodes, NOT on threshold/horizon.
-    # Cache keyed by merge mode: Gate 10 tests both True/False — different segments.
-    _shared_segments: dict[bool, tuple[list[dict[str, Any]], dict[str, Any]]] = {}
-    _shared_feat_cache: dict[bool, dict[int, list[list[float]]]] = {}
-    _shared_scaffold_cache: dict[tuple[int, int, bool, int], Any] = {}  # (seq_len, horizon, merge, stride) → _WindowScaffold
     for _merge_mode in ([False, True] if allow_cross_session_merge else [False]):
         _eff_gap = max_session_gap_sec
         if _merge_mode and _eff_gap is None:
@@ -2059,40 +2137,6 @@ def run_clean_training_cycle(
         )
         _shared_feat_cache[_merge_mode] = {}
     logger.info("Pre-computed segments for %d merge modes.", len(_shared_segments))
-    # Scale certification timeout proportionally to dataset size.
-    _num_blocks = int(_cached_blocks[2].get("num_blocks", 0))
-    _scaled_timeout = max(int(max_certification_duration_sec), 300 + _num_blocks // 500)
-    if _scaled_timeout != max_certification_duration_sec:
-        logger.info("Scaled certification timeout %ds -> %ds for %d blocks.", max_certification_duration_sec, _scaled_timeout, _num_blocks)
-    certification = certify_data_for_training(
-        state_file=state_file,
-        artifact_dir=artifact_root,
-        sequence_length=sequence_length,
-        prediction_horizon_sec=prediction_horizon_sec,
-        thresholds=thresholds,
-        label_percentiles=label_percentiles,
-        selected_session_ids=selected_session_ids,
-        selected_block_ids=selected_block_ids,
-        allow_cross_session_merge=allow_cross_session_merge,
-        max_session_gap_sec=max_session_gap_sec,
-        regime_shift_score_threshold=regime_shift_score_threshold,
-        certification_mode=certification_mode,
-        max_certification_duration_sec=_scaled_timeout,
-        label_episode_window_days=label_episode_window_days,
-        allow_legacy_sessions=allow_legacy_sessions,
-        runtime_audit_dir=runtime_audit_dir,
-        run_reconnection_stress=run_reconnection_stress,
-        _preloaded_blocks=_cached_blocks,
-        _precomputed_segments_by_merge=_shared_segments,
-        _precomputed_features_by_merge=_shared_feat_cache,
-        _scaffold_cache=_shared_scaffold_cache,
-        window_stride=window_stride,
-    )
-    if not bool(certification.get("certified")):
-        raise ValueError(
-            "Training data certification failed: "
-            + ", ".join(certification.get("failure_reasons", []) or ["unknown_certification_failure"])
-        )
     effective_scope = dict(certification.get("effective_session_scope") or {})
     effective_session_ids = [
         int(value)
