@@ -23,6 +23,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from src.spread.feature_contracts import DEFAULT_FEATURE_CONTRACT_VERSION, FEATURE_NAMES
+from src.spread.dataset_catalog import catalog_snapshot_manifest, register_sqlite_dataset
 from src.spread.runtime_audit import create_sqlite_snapshot
 from src.spread.train_model import certify_data_for_training, run_clean_training_cycle, run_threshold_preflight
 from src.spread.training_certification import collect_sqlite_integrity
@@ -539,6 +540,34 @@ def run_full_training(
 
 def create_fresh_snapshot(*, source_db: Path, run_dir: Path, name: str = "snapshot.sqlite") -> Path:
     return create_sqlite_snapshot(Path(source_db), Path(run_dir) / str(name))
+
+
+def register_snapshot_dataset(
+    *,
+    snapshot_path: Path,
+    certification: dict[str, Any] | None = None,
+    label: str | None = None,
+    role: str = "baseline_snapshot",
+    tags: list[str] | None = None,
+    bless: bool = False,
+    related_files: list[Path] | None = None,
+    extra_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return register_sqlite_dataset(
+        Path(snapshot_path),
+        base_path=ROOT_DIR / "out",
+        certification=certification,
+        label=label,
+        role=role,
+        tags=tags,
+        bless=bless,
+        related_files=related_files,
+        extra_metadata=extra_metadata,
+    )
+
+
+def sync_existing_snapshot_catalog() -> dict[str, Any]:
+    return catalog_snapshot_manifest(base_path=ROOT_DIR / "out")
 
 
 def count_records_since(db_path: Path, *, since_ts: float) -> int:

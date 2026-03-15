@@ -30,6 +30,7 @@ from sklearn.metrics import (
 )
 from torch.utils.data import DataLoader, TensorDataset
 
+from .dataset_catalog import describe_state_file
 from .feature_contracts import (
     DEFAULT_FEATURE_CONTRACT_VERSION,
     feature_contract_version_for_names,
@@ -2023,9 +2024,12 @@ def run_training_loop(
         for split_name, evaluation in evaluations.items()
     }
 
+    dataset_artifact = describe_state_file(state_path)
+
     report = {
         "model_status": "trained",
         "device": str(device),
+        "dataset_artifact": dataset_artifact,
         "dataset_summary": dataset_summary,
         "split_summary": split_summary,
         "metrics": {
@@ -2124,6 +2128,10 @@ def run_training_loop(
         "regime_shift_score_threshold": None if regime_shift_score_threshold is None else float(regime_shift_score_threshold),
         "psi_reference": feature_monitoring["psi_reference"],
         "feature_contract_version": feature_contract_version_for_names(list(bundle.feature_names)) or DEFAULT_FEATURE_CONTRACT_VERSION,
+        "state_file": str(dataset_artifact.get("state_file") or ""),
+        "state_file_sha256": str(dataset_artifact.get("state_file_sha256") or ""),
+        "state_file_size_bytes": int(dataset_artifact.get("state_file_size_bytes") or 0),
+        "dataset_manifest_path": str(dataset_artifact.get("dataset_manifest_path") or ""),
     }
     if certification_context:
         training_config_payload["certification_id"] = str(certification_context.get("certification_id") or "")

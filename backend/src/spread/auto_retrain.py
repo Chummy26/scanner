@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .dataset_catalog import register_sqlite_dataset
 from .runtime_audit import _build_snapshot_psi_summary, create_sqlite_snapshot
 from .train_model import run_clean_training_cycle
 
@@ -202,6 +203,25 @@ def update_snapshot_manifest(
     manifest["snapshots"] = snapshots
     manifest["last_updated_utc"] = created_at.isoformat().replace("+00:00", "Z")
     write_json(snapshot_manifest_path(base_path), manifest)
+    register_sqlite_dataset(
+        snapshot_path,
+        base_path=base_path,
+        certification={
+            "verdict": certification.get("verdict"),
+            "certification_id": certification.get("certification_id"),
+            "failure_reasons": certification.get("failure_reasons"),
+            "warnings": certification.get("warnings"),
+        },
+        label=snapshot_path.stem,
+        role="scheduled_snapshot",
+        tags=["snapshot", "auto-retrain"],
+        bless=bool(is_trainable_snapshot(entry)),
+        related_files=[Path(f"{snapshot_path}.cert.json")],
+        extra_metadata={
+            "created_at_utc": entry["created_at_utc"],
+            "source_snapshot_manifest_path": str(snapshot_manifest_path(base_path)),
+        },
+    )
     return manifest
 
 

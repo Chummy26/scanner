@@ -56,6 +56,8 @@ def run_t8_cycle(
     quick_summary = {"verdict": "UNKNOWN", "failure_reasons": [], "warnings": []}
     preflight: dict[str, object] = {}
     training_result: dict[str, object] = {}
+    dataset_entry: dict[str, object] = {}
+    dataset_catalog_error = ""
     training_error = ""
     copied_data_certification = ""
 
@@ -70,6 +72,23 @@ def run_t8_cycle(
         )
         common.write_json(quick_cert_path, quick_cert)
         quick_summary = common.summarize_certification(quick_cert)
+        try:
+            dataset_entry = common.register_snapshot_dataset(
+                snapshot_path=snapshot_path,
+                certification=quick_cert,
+                label=snapshot_path.stem,
+                role="baseline_snapshot",
+                tags=["baseline", "snapshot", "staged"],
+                bless=False,
+                related_files=[quick_cert_path],
+                extra_metadata={
+                    "run_dir": str(run_dir),
+                    "restart_ts_utc": common.utc_now_iso(float(restart_ts)),
+                },
+            )
+        except Exception as exc:
+            dataset_catalog_error = str(exc)
+            warnings.append("dataset_catalog_failed")
         if str(quick_summary.get("verdict", "UNKNOWN")) not in {"PASS", "WARN"}:
             failures.append("quick_certification_failed")
         warnings.extend(str(value) for value in quick_summary.get("warnings", []))
@@ -101,6 +120,24 @@ def run_t8_cycle(
                 training_artifacts_dir / "data_certification.json",
                 data_certification_path,
             )
+            try:
+                dataset_entry = common.register_snapshot_dataset(
+                    snapshot_path=snapshot_path,
+                    certification=quick_cert,
+                    label=snapshot_path.stem,
+                    role="baseline_snapshot",
+                    tags=["baseline", "snapshot", "trained"],
+                    bless=True,
+                    related_files=[quick_cert_path, preflight_path, data_certification_path, training_report_path],
+                    extra_metadata={
+                        "run_dir": str(run_dir),
+                        "training_report_path": str(training_report_path),
+                        "model_status": str(training_result.get("model_status") or ""),
+                    },
+                )
+            except Exception as exc:
+                dataset_catalog_error = str(exc)
+                warnings.append("dataset_catalog_failed")
         except Exception:
             training_error = traceback.format_exc()
             failures.append("training_cycle_failed")
@@ -142,6 +179,8 @@ def run_t8_cycle(
             "report_path": str(training_report_path),
             "data_certification_path": copied_data_certification,
         },
+        "dataset_entry": dataset_entry,
+        "dataset_catalog_error": dataset_catalog_error,
         "training_error": training_error,
         "warnings": sorted(set(warnings)),
         "failures": failures,

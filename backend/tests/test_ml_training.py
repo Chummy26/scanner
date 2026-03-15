@@ -1338,6 +1338,8 @@ def test_run_training_loop_saves_artifacts_and_beats_negative_baseline(tmp_path:
     assert report["split_summary"]["purged_temporal_separation_ok"] is True
     assert report["dataset_summary"]["labeling_method"] == "episode_take_profit_time_barrier"
     assert "future_episode_total_spread_quantiles" in report["label_audit"]
+    assert report["dataset_artifact"]["state_file"] == str(state_path.resolve())
+    assert report["dataset_artifact"]["state_file_exists"] is True
 
     metadata_payload = json.loads(artifact_dir.joinpath("best_lstm_model.meta.json").read_text(encoding="utf-8"))
     assert metadata_payload["execute_threshold"] == report["thresholds"]["execute_threshold"]
@@ -1349,6 +1351,8 @@ def test_run_training_loop_saves_artifacts_and_beats_negative_baseline(tmp_path:
     assert metadata_payload["training_config"]["labeling_timeout_only"] is True
     assert metadata_payload["training_config"]["positive_rate_train"] > 0.0
     assert 0.25 <= metadata_payload["training_config"]["focal_alpha_effective"] <= 0.95
+    assert metadata_payload["training_config"]["state_file"] == str(state_path.resolve())
+    assert metadata_payload["training_config"]["state_file_sha256"] == report["dataset_artifact"]["state_file_sha256"]
     assert metadata_payload["validation_metrics"] == report["metrics"]["val_threshold"]
     assert metadata_payload["trained_at_utc"]
     assert metadata_payload["dataset_fingerprint"]
