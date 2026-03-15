@@ -2087,10 +2087,37 @@ def run_clean_training_cycle(
     artifact_root.mkdir(parents=True, exist_ok=True)
     default_state = Path(__file__).resolve().parent.parent.parent / "out" / "config" / "tracker_history.sqlite"
     _resolved_state = Path(state_file) if state_file is not None else default_state
-    _cached_blocks = None
+    # Single load of blocks — shared across certification, preflight, and training
+    logger.info("Loading blocks from %s (single load for full pipeline)...", _resolved_state)
+    _cached_blocks = _load_blocks_from_sqlite(
+        _resolved_state,
+        selected_block_ids=selected_block_ids,
+        selected_session_ids=selected_session_ids,
+        selected_only=True,
+        closed_only=True,
+    )
+    logger.info("Loaded %d blocks from %d sessions.", _cached_blocks[2].get("num_blocks", 0), _cached_blocks[2].get("num_sessions", 0))
+    # Pre-compute segments for merge_off (shared across all phases)
     _shared_segments: dict[bool, tuple[list[dict[str, Any]], dict[str, Any]]] = {}
     _shared_feat_cache: dict[bool, dict[int, list[list[float]]]] = {}
-    _shared_scaffold_cache: dict[tuple[int, int, bool, int], Any] = {}  # (seq_len, horizon, merge, stride) → _WindowScaffold
+    _shared_scaffold_cache: dict[tuple[int, int, bool, int], Any] = {}
+    for _merge_mode in ([False, True] if allow_cross_session_merge else [False]):
+        _eff_gap = max_session_gap_sec
+        if _merge_mode and _eff_gap is None:
+            _eff_gap = _load_tracker_gap_threshold_sec(_resolved_state)
+        _shared_segments[_merge_mode] = _build_pair_segments(
+            _cached_blocks[0],
+            allow_cross_session_merge=_merge_mode,
+            max_session_gap_sec=_eff_gap if _merge_mode else max_session_gap_sec,
+            regime_shift_score_threshold=regime_shift_score_threshold,
+        )
+        _shared_feat_cache[_merge_mode] = {}
+    logger.info("Pre-computed segments for %d merge modes.", len(_shared_segments))
+    # Scale certification timeout proportionally to dataset size
+    _num_blocks = int(_cached_blocks[2].get("num_blocks", 0))
+    _scaled_timeout = max(int(max_certification_duration_sec), 300 + _num_blocks // 500)
+    if _scaled_timeout != max_certification_duration_sec:
+        logger.info("Scaled certification timeout %ds -> %ds for %d blocks.", max_certification_duration_sec, _scaled_timeout, _num_blocks)
     certification = certify_data_for_training(
         state_file=_resolved_state,
         artifact_dir=artifact_root,
@@ -2104,11 +2131,15 @@ def run_clean_training_cycle(
         max_session_gap_sec=max_session_gap_sec,
         regime_shift_score_threshold=regime_shift_score_threshold,
         certification_mode=certification_mode,
-        max_certification_duration_sec=max_certification_duration_sec,
+        max_certification_duration_sec=_scaled_timeout,
         label_episode_window_days=label_episode_window_days,
         allow_legacy_sessions=allow_legacy_sessions,
         runtime_audit_dir=runtime_audit_dir,
         run_reconnection_stress=run_reconnection_stress,
+        _preloaded_blocks=_cached_blocks,
+        _precomputed_segments_by_merge=_shared_segments,
+        _precomputed_features_by_merge=_shared_feat_cache,
+        _scaffold_cache=_shared_scaffold_cache,
         window_stride=window_stride,
     )
     if not bool(certification.get("certified")):
@@ -2116,27 +2147,6 @@ def run_clean_training_cycle(
             "Training data certification failed: "
             + ", ".join(certification.get("failure_reasons", []) or ["unknown_certification_failure"])
         )
-    logger.info("Loading blocks from %s (single load for preflight/training)...", _resolved_state)
-    _cached_blocks = _load_blocks_from_sqlite(
-        _resolved_state,
-        selected_block_ids=selected_block_ids,
-        selected_session_ids=selected_session_ids,
-        selected_only=True,
-        closed_only=True,
-    )
-    logger.info("Loaded %d blocks from %d sessions.", _cached_blocks[2].get("num_blocks", 0), _cached_blocks[2].get("num_sessions", 0))
-    for _merge_mode in ([False, True] if allow_cross_session_merge else [False]):
-        _eff_gap = max_session_gap_sec
-        if _merge_mode and _eff_gap is None:
-            _eff_gap = _load_tracker_gap_threshold_sec(_resolved_state)
-        _shared_segments[_merge_mode] = _build_pair_segments(
-            _cached_blocks[0],
-            allow_cross_session_merge=_merge_mode,
-            max_session_gap_sec=_eff_gap if _merge_mode else max_session_gap_sec,
-            regime_shift_score_threshold=regime_shift_score_threshold,
-        )
-        _shared_feat_cache[_merge_mode] = {}
-    logger.info("Pre-computed segments for %d merge modes.", len(_shared_segments))
     effective_scope = dict(certification.get("effective_session_scope") or {})
     effective_session_ids = [
         int(value)

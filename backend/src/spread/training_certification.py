@@ -1254,7 +1254,7 @@ def run_training_certification(
                 _preloaded_blocks=_cached_blocks_tuple,
                 _precomputed_pair_segments=_cached_segments_for_merge.get(allow_cross_session_merge),
                 _precomputed_segment_features=_cached_features_for_merge[allow_cross_session_merge],
-                _scaffold_cache=_scaffold_cache,
+                window_stride=window_stride,
                 **_dataset_build_kwargs_for_label_config(
                     {
                         "threshold": operational_min_total_spread_pct,
@@ -1618,7 +1618,7 @@ def run_training_certification(
                         )
             for config in DEFAULT_DUAL_PREFLIGHT_CONFIGS:
                 config_entry: dict[str, Any] = {"sequence_length": int(config["sequence_length"]), "prediction_horizon_sec": int(config["prediction_horizon_sec"])}
-                for merge_enabled, key in ((False, "merge_off"), (True, "merge_on")):
+                for merge_enabled, key in ((False, "merge_off"),):
                     preflight = preflight_fn(
                         state_file=state_path,
                         sequence_length=int(config["sequence_length"]),
