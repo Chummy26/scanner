@@ -86,6 +86,10 @@ class _WindowScaffold:
     cross_session_window_count: int
     skipped_windows_cross_session_boundary: int
     skipped_windows_right_censored: int
+    right_censoring_fraction: float
+    warmup_partial_8h_count: int
+    warmup_partial_8h_fraction: float
+    pair_sample_counts: dict[str, int]
     skipped_blocks_too_short: int
     block_diagnostics: dict[str, Any]
     episode_diagnostics: dict[str, Any]
@@ -99,6 +103,34 @@ class _WindowScaffold:
     effective_max_session_gap_sec: float | None
     selected_block_ids: list[int] | None
     selected_session_ids: list[int] | None
+
+
+def _validate_bundle_tensors(
+    X_tensor: torch.Tensor,
+    y_class_tensor: torch.Tensor,
+    y_eta_tensor: torch.Tensor,
+    feature_names: list[str],
+) -> None:
+    x_nonfinite = ~torch.isfinite(X_tensor)
+    y_class_nonfinite = ~torch.isfinite(y_class_tensor)
+    y_eta_nonfinite = ~torch.isfinite(y_eta_tensor)
+    if not bool(x_nonfinite.any() or y_class_nonfinite.any() or y_eta_nonfinite.any()):
+        return
+    feature_mask = x_nonfinite.any(dim=0).any(dim=0) if X_tensor.ndim == 3 else x_nonfinite.any(dim=0)
+    bad_feature_indices = torch.nonzero(feature_mask, as_tuple=False).flatten().tolist()
+    bad_feature_names = [
+        str(feature_names[index])
+        for index in bad_feature_indices
+        if 0 <= int(index) < len(feature_names)
+    ]
+    raise ValueError(
+        "dataset_bundle_non_finite_tensors:"
+        f" x_nonfinite={int(x_nonfinite.sum().item())}"
+        f" y_class_nonfinite={int(y_class_nonfinite.sum().item())}"
+        f" y_eta_nonfinite={int(y_eta_nonfinite.sum().item())}"
+        f" bad_feature_indices={bad_feature_indices}"
+        f" bad_feature_names={bad_feature_names}"
+    )
 
 
 def _relabel_scaffold(
@@ -119,7 +151,15 @@ def _relabel_scaffold(
             X=scaffold.X_tensor, y_class=torch.empty((0,), dtype=torch.float32),
             y_eta=torch.empty((0,), dtype=torch.float32), label_thresholds=[],
             pair_ids=[], block_ids=[], session_ids=[], timestamps=[], label_end_timestamps=[],
-            last_entries=[], feature_names=list(FEATURE_NAMES), summary={"num_samples": 0},
+            last_entries=[],
+            feature_names=list(FEATURE_NAMES),
+            summary={
+                "num_samples": 0,
+                "right_censoring_fraction": float(scaffold.right_censoring_fraction),
+                "warmup_partial_8h_count": int(scaffold.warmup_partial_8h_count),
+                "warmup_partial_8h_fraction": float(scaffold.warmup_partial_8h_fraction),
+                "pair_sample_counts": dict(scaffold.pair_sample_counts),
+            },
         )
 
     all_ts = np.array(scaffold.timestamps, dtype=np.float64)
@@ -219,6 +259,7 @@ def _relabel_scaffold(
     X_tensor = scaffold.X_tensor
     y_class_tensor = torch.from_numpy(y_class_arr.astype(np.float32))
     y_eta_tensor = torch.from_numpy(y_eta_arr.astype(np.float32))
+    _validate_bundle_tensors(X_tensor, y_class_tensor, y_eta_tensor, list(FEATURE_NAMES))
 
     label_threshold_summary = {
         pid: {"latest": float(vals[-1]), "min": float(min(vals)),
@@ -242,7 +283,11 @@ def _relabel_scaffold(
         "selected_session_ids": sorted({int(s) for s in (scaffold.selected_session_ids or []) if int(s) > 0}),
         "skipped_blocks_too_short": scaffold.skipped_blocks_too_short,
         "skipped_windows_right_censored": scaffold.skipped_windows_right_censored,
+        "right_censoring_fraction": float(scaffold.right_censoring_fraction),
         "skipped_windows_cross_session_boundary": scaffold.skipped_windows_cross_session_boundary,
+        "warmup_partial_8h_count": int(scaffold.warmup_partial_8h_count),
+        "warmup_partial_8h_fraction": float(scaffold.warmup_partial_8h_fraction),
+        "pair_sample_counts": dict(scaffold.pair_sample_counts),
         "num_cross_block_windows": scaffold.cross_block_window_count,
         "num_cross_session_windows": scaffold.cross_session_window_count,
         "prediction_horizon_sec": int(scaffold.prediction_horizon_sec),
@@ -1527,7 +1572,7 @@ def build_dataset_bundle(
     _precomputed_pair_segments: tuple[list[dict[str, Any]], dict[str, Any]] | None = None,
     _precomputed_segment_features: dict[int, list[list[float]]] | None = None,
     _precomputed_block_diagnostics: dict[str, Any] | None = None,
-    _scaffold_cache: dict[tuple[int, int, bool], _WindowScaffold] | None = None,
+    _scaffold_cache: dict[tuple[int, int, bool, int], _WindowScaffold] | None = None,
 ) -> DatasetBundle:
     X_samples: list[list[list[float]]] = []
     y_class: list[float] = []
@@ -1549,7 +1594,9 @@ def build_dataset_bundle(
     timeouts_without_future_episode = 0
     timeouts_with_only_sub_threshold_episode = 0
     skipped_windows_right_censored = 0
+    warmup_partial_8h_count = 0
     pair_label_thresholds: dict[str, list[float]] = defaultdict(list)
+    pair_sample_counts: dict[str, int] = defaultdict(int)
 
     if _preloaded_blocks is not None:
         blocks, saved_at, block_summary = _preloaded_blocks
@@ -1667,6 +1714,7 @@ def build_dataset_bundle(
         _stride = max(1, int(window_stride))
         _seq_len = int(sequence_length)
         _n_rec = len(segment_records)
+        segment_start_ts = float(segment_records[0]["timestamp"]) if segment_records else 0.0
         for start in range(0, _n_rec - _seq_len + 1, _stride):
             end = start + _seq_len
             first_sid = _seg_sids[start]
@@ -1688,11 +1736,14 @@ def build_dataset_bundle(
             X_samples.append(segment_feature_rows[start : start + sequence_length])
             _scaffold_seg_indices.append(_seg_idx)
             pair_ids.append(normalized_pair_id)
+            pair_sample_counts[normalized_pair_id] += 1
             block_ids.append(int(segment_records[end - 1].get("block_id") or 0))
             session_ids.append(int(segment_records[end - 1].get("session_id") or 0))
             timestamps.append(current_ts)
             label_end_timestamps.append(float(current_ts) + float(prediction_horizon_sec))
             last_entries.append(float(segment_records[end - 1]["entry_spread"]))
+            if segment_start_ts > 0.0 and (current_ts - segment_start_ts) < 28_800.0:
+                warmup_partial_8h_count += 1
 
             # Label computation (skip when building scaffold — relabel handles it)
             if not _build_scaffold:
@@ -1745,6 +1796,18 @@ def build_dataset_bundle(
 
     # Scaffold path: save geometry, delegate labeling to _relabel_scaffold
     if _build_scaffold and _scaffold_key not in _scaffold_cache:
+        accepted_window_count = int(len(X_samples))
+        censoring_denominator = accepted_window_count + int(skipped_windows_right_censored)
+        right_censoring_fraction = (
+            float(skipped_windows_right_censored / censoring_denominator)
+            if censoring_denominator > 0
+            else 0.0
+        )
+        warmup_partial_8h_fraction = (
+            float(warmup_partial_8h_count / accepted_window_count)
+            if accepted_window_count > 0
+            else 0.0
+        )
         if X_samples:
             # Fast tensor construction: pre-allocate and fill (avoids slow np.array on nested lists)
             _n_win = len(X_samples)
@@ -1756,6 +1819,12 @@ def build_dataset_bundle(
             _scaffold_X = torch.from_numpy(_scaffold_np)
         else:
             _scaffold_X = torch.empty((0, sequence_length, len(FEATURE_NAMES)), dtype=torch.float32)
+        _validate_bundle_tensors(
+            _scaffold_X,
+            torch.zeros((_scaffold_X.shape[0],), dtype=torch.float32),
+            torch.zeros((_scaffold_X.shape[0],), dtype=torch.float32),
+            list(FEATURE_NAMES),
+        )
         _scaffold_cache[_scaffold_key] = _WindowScaffold(
             X_tensor=_scaffold_X, pair_ids=pair_ids, block_ids=block_ids,
             session_ids=session_ids, timestamps=timestamps,
@@ -1767,6 +1836,10 @@ def build_dataset_bundle(
             cross_session_window_count=cross_session_window_count,
             skipped_windows_cross_session_boundary=skipped_windows_cross_session_boundary,
             skipped_windows_right_censored=skipped_windows_right_censored,
+            right_censoring_fraction=right_censoring_fraction,
+            warmup_partial_8h_count=warmup_partial_8h_count,
+            warmup_partial_8h_fraction=warmup_partial_8h_fraction,
+            pair_sample_counts=dict(sorted(pair_sample_counts.items())),
             skipped_blocks_too_short=skipped_blocks_too_short,
             block_diagnostics=block_diagnostics, episode_diagnostics=episode_diagnostics,
             cross_session_merge_diagnostics=cross_session_merge_diagnostics,
@@ -1794,6 +1867,19 @@ def build_dataset_bundle(
         X_tensor = torch.empty((0, sequence_length, len(FEATURE_NAMES)), dtype=torch.float32)
         y_class_tensor = torch.empty((0,), dtype=torch.float32)
         y_eta_tensor = torch.empty((0,), dtype=torch.float32)
+    _validate_bundle_tensors(X_tensor, y_class_tensor, y_eta_tensor, list(FEATURE_NAMES))
+    accepted_window_count = int(len(X_samples))
+    censoring_denominator = accepted_window_count + int(skipped_windows_right_censored)
+    right_censoring_fraction = (
+        float(skipped_windows_right_censored / censoring_denominator)
+        if censoring_denominator > 0
+        else 0.0
+    )
+    warmup_partial_8h_fraction = (
+        float(warmup_partial_8h_count / accepted_window_count)
+        if accepted_window_count > 0
+        else 0.0
+    )
     label_threshold_summary = {
         pair_id: {
             "latest": float(values[-1]),
@@ -1822,7 +1908,11 @@ def build_dataset_bundle(
         "selected_session_ids": sorted({int(session_id) for session_id in (selected_session_ids or []) if int(session_id) > 0}),
         "skipped_blocks_too_short": int(skipped_blocks_too_short),
         "skipped_windows_right_censored": int(skipped_windows_right_censored),
+        "right_censoring_fraction": float(right_censoring_fraction),
         "skipped_windows_cross_session_boundary": int(skipped_windows_cross_session_boundary),
+        "warmup_partial_8h_count": int(warmup_partial_8h_count),
+        "warmup_partial_8h_fraction": float(warmup_partial_8h_fraction),
+        "pair_sample_counts": dict(sorted(pair_sample_counts.items())),
         "num_cross_block_windows": int(cross_block_window_count),
         "num_cross_session_windows": int(cross_session_window_count),
         "prediction_horizon_sec": int(prediction_horizon_sec),
@@ -1954,6 +2044,15 @@ def build_group_splits(
         )
         if min_cross_split_gap_sec == float("inf"):
             min_cross_split_gap_sec = 0.0
+        purge_ok = bool(
+            (not train_bundle.timestamps or not val_bundle.timestamps or train_end_label_ts <= val_start_ts)
+            and (not val_bundle.timestamps or not test_bundle.timestamps or val_end_label_ts <= test_start_ts)
+        )
+        embargo_gap_below_horizon_warning = bool(
+            purge_ok
+            and min_cross_split_gap_sec > 0.0
+            and min_cross_split_gap_sec < float(horizon_sec)
+        )
         split_summary = {
             "pair_overlap": overlap,
             "train_pairs": len(split_pairs["train"]),
@@ -1980,11 +2079,9 @@ def build_group_splits(
             "train_session_ids": list(train_session_ids or []),
             "val_session_ids": list(val_session_ids or []),
             "test_session_ids": list(test_session_ids or []),
-            "purged_temporal_separation_ok": bool(
-                (not train_bundle.timestamps or not val_bundle.timestamps or train_end_label_ts <= val_start_ts)
-                and (not val_bundle.timestamps or not test_bundle.timestamps or val_end_label_ts <= test_start_ts)
-            ),
+            "purged_temporal_separation_ok": purge_ok,
             "min_cross_split_gap_sec": float(min_cross_split_gap_sec),
+            "embargo_gap_below_horizon_warning": embargo_gap_below_horizon_warning,
             "global_temporal_order": bool(
                 (max(train_bundle.timestamps) if train_bundle.timestamps else 0.0) <= (min(val_bundle.timestamps) if val_bundle.timestamps else float("inf"))
                 and (max(val_bundle.timestamps) if val_bundle.timestamps else 0.0) <= (min(test_bundle.timestamps) if test_bundle.timestamps else float("inf"))
@@ -1992,6 +2089,13 @@ def build_group_splits(
         }
         for split_bundle in (train_bundle, val_bundle, test_bundle):
             split_bundle.summary["split_summary"] = split_summary
+        if not purge_ok:
+            raise ValueError(
+                "temporal_label_window_overlap:"
+                f" min_cross_split_gap_sec={float(min_cross_split_gap_sec):.6f}"
+                f" horizon_sec={int(horizon_sec)}"
+                f" split_mode={split_mode}"
+            )
         return {"train": train_bundle, "val": val_bundle, "test": test_bundle}
 
     valid_session_ids = [int(session_id) for session_id in bundle.session_ids if int(session_id) > 0]

@@ -126,8 +126,8 @@ def test_spread_engine_rejects_uncomputable_exit_spread_from_tracker_capture(mon
     assert opps == []
     assert raw_records == []
     assert len(rejections) == 1
-    assert rejections[0]["invalid_fields"] == ["exit"]
-    assert rejections[0]["reason"] == "exit_spread_invalid"
+    assert rejections[0]["invalid_fields"] == ["entry", "exit"]
+    assert rejections[0]["reason"] == "crossed_book"
 
 
 def test_spread_engine_discards_records_when_exit_spread_exceeds_max_bound(monkeypatch):
@@ -146,3 +146,22 @@ def test_spread_engine_discards_records_when_exit_spread_exceeds_max_bound(monke
 
     assert opps == []
     assert raw_records == []
+
+
+def test_spread_engine_attaches_quality_hints_for_thin_and_asymmetric_books(monkeypatch):
+    monkeypatch.setattr("src.spread.spread_engine.time.time", lambda: 1_000.0)
+    engine = SpreadEngine(SpreadConfig(min_spread_pct=0.1))
+    engine._snapshots = {
+        "BTC": {
+            "mexc": {"spot": OrderBookSnapshot(exchange="mexc", symbol="BTC", market_type="spot", bids=[(99.0, 0.01)], asks=[(100.0, 0.01)], timestamp=999.8, connected=True)},
+            "gate": {"futures": OrderBookSnapshot(exchange="gate", symbol="BTC", market_type="futures", bids=[(101.0, 0.01)], asks=[(102.0, 0.01)], timestamp=997.0, connected=True)},
+        }
+    }
+    engine._dirty_symbols = {"BTC"}
+
+    opps = engine.calculate_all()
+
+    assert len(opps) == 1
+    quality_hints = getattr(opps[0], "quality_hints", {})
+    assert quality_hints["thin_book_warning"] is True
+    assert quality_hints["book_age_asymmetry_warning"] is True

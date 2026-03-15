@@ -18,7 +18,7 @@ import logging
 import math
 import time
 import threading
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from .models import OrderBookSnapshot, SpreadOpportunity, SpreadConfig
 from .orderbook import OrderBook
@@ -44,6 +44,15 @@ def _valid_tracker_spread(value: float, *, max_spread: float) -> bool:
     except (TypeError, ValueError):
         return False
     return math.isfinite(numeric) and abs(numeric) <= float(max_spread)
+
+
+def _top_level_qty(levels: list) -> float:
+    if not levels:
+        return 0.0
+    try:
+        return float(levels[0][1])
+    except (IndexError, TypeError, ValueError):
+        return 0.0
 
 
 class SpreadEngine:
@@ -373,47 +382,13 @@ class SpreadEngine:
         """
         stale_n = 0
         # Pre-group sources by market type
-        # Each entry: (exchange, snap, bid_px, ask_px)
-        spot_src: List[Tuple[str, OrderBookSnapshot, float, float]] = []
-        fut_src: List[Tuple[str, OrderBookSnapshot, float, float]] = []
-
-        for exchange, markets in exchanges.items():
-            for market_type, snap in markets.items():
-                if not snap.is_valid():
-                    continue
-                age = now - snap.timestamp
-                # Keep quiet books visible while the feed itself is still
-                # Do not surface opportunities backed by very old books even
-                # if the feed still appears logically connected.
-                if age >= stale_threshold:
-                    stale_n += 1
-                    continue
-
-                # Extract prices — inline for the common top-of-book case
-                if use_top_of_book:
-                    try:
-                        bid_px = float(snap.bids[0][0])
-                        ask_px = float(snap.asks[0][0])
-                    except (IndexError, TypeError, ValueError):
-                        continue
-                else:
-                    bid_px = _effective_price(snap.bids, notional_usd)
-                    ask_px = _effective_price(snap.asks, notional_usd)
-
-                if bid_px <= 0 or ask_px <= 0:
-                    continue
-
-                entry = (exchange, snap, bid_px, ask_px)
-                if market_type == "spot":
-                    spot_src.append(entry)
-                elif market_type == "futures":
-                    fut_src.append(entry)
+        # Each entry: (exchange, snap, bid_px, ask_px, bid_qty, ask_qty)
+        spot_src: List[Tuple[str, OrderBookSnapshot, float, float, float, float]] = []
+        fut_src: List[Tuple[str, OrderBookSnapshot, float, float, float, float]] = []
 
         opps: List[SpreadOpportunity] = []
         records: list = []
         rejections: list = []
-        cross_exchange_validation = SpreadEngine._validate_cross_exchange_price(symbol, exchanges)
-        flagged_sources = set(cross_exchange_validation.get("flagged_sources") or set())
 
         def _record_rejection(
             buy_ex: str,
@@ -440,9 +415,87 @@ class SpreadEngine:
                 }
             )
 
+        def _record_source_rejection(exchange: str, market_type: str, reason: str) -> None:
+            _record_rejection(
+                exchange,
+                market_type,
+                exchange,
+                market_type,
+                invalid_fields=["entry", "exit"],
+                reason=reason,
+                affected_exchanges=[exchange],
+            )
+
+        def _extract_book_view(snap: OrderBookSnapshot) -> tuple[tuple[float, float, float, float] | None, str | None]:
+            bids = list(getattr(snap, "bids", []) or [])
+            asks = list(getattr(snap, "asks", []) or [])
+            if not bids or not asks:
+                return None, "missing_top_of_book"
+            bid_qty = _top_level_qty(bids)
+            ask_qty = _top_level_qty(asks)
+            if use_top_of_book:
+                try:
+                    bid_px = float(bids[0][0])
+                    ask_px = float(asks[0][0])
+                except (IndexError, TypeError, ValueError):
+                    return None, "missing_top_of_book"
+            else:
+                bid_px = _effective_price(bids, notional_usd)
+                ask_px = _effective_price(asks, notional_usd)
+            if bid_px <= 0.0 or ask_px <= 0.0:
+                return None, "non_positive_book_px"
+            if bid_px > ask_px:
+                return None, "crossed_book"
+            return (bid_px, ask_px, bid_qty, ask_qty), None
+
+        def _quality_hints(
+            *,
+            buy_snap: OrderBookSnapshot,
+            sell_snap: OrderBookSnapshot,
+            buy_price: float,
+            buy_qty: float,
+            sell_price: float,
+            sell_qty: float,
+        ) -> dict[str, Any]:
+            buy_notional = max(0.0, float(buy_price) * max(float(buy_qty), 0.0))
+            sell_notional = max(0.0, float(sell_price) * max(float(sell_qty), 0.0))
+            depth_floor = max(float(notional_usd or 0.0), 25.0)
+            age_asymmetry = abs((now - float(buy_snap.timestamp)) - (now - float(sell_snap.timestamp)))
+            return {
+                "buy_top_of_book_notional_usd": round(buy_notional, 6),
+                "sell_top_of_book_notional_usd": round(sell_notional, 6),
+                "thin_book_warning": bool(buy_notional < depth_floor or sell_notional < depth_floor),
+                "book_age_asymmetry_sec": round(age_asymmetry, 6),
+                "book_age_asymmetry_warning": bool(age_asymmetry > max(1.0, float(stale_threshold) * 0.25)),
+            }
+
+        for exchange, markets in exchanges.items():
+            for market_type, snap in markets.items():
+                age = now - snap.timestamp
+                # Keep quiet books visible while the feed itself is still
+                # Do not surface opportunities backed by very old books even
+                # if the feed still appears logically connected.
+                if age >= stale_threshold:
+                    stale_n += 1
+                    continue
+
+                book_view, rejection_reason = _extract_book_view(snap)
+                if book_view is None:
+                    _record_source_rejection(exchange, market_type, str(rejection_reason or "missing_top_of_book"))
+                    continue
+                bid_px, ask_px, bid_qty, ask_qty = book_view
+
+                entry = (exchange, snap, bid_px, ask_px, bid_qty, ask_qty)
+                if market_type == "spot":
+                    spot_src.append(entry)
+                elif market_type == "futures":
+                    fut_src.append(entry)
+        cross_exchange_validation = SpreadEngine._validate_cross_exchange_price(symbol, exchanges)
+        flagged_sources = set(cross_exchange_validation.get("flagged_sources") or set())
+
         # ---------- spot_futures: buy spot, sell futures ----------
-        for buy_ex, buy_snap, buy_bid, buy_ask in spot_src:
-            for sell_ex, sell_snap, sell_bid, sell_ask in fut_src:
+        for buy_ex, buy_snap, buy_bid, buy_ask, buy_bid_qty, buy_ask_qty in spot_src:
+            for sell_ex, sell_snap, sell_bid, sell_ask, sell_bid_qty, sell_ask_qty in fut_src:
                 if f"{buy_ex}:spot" in flagged_sources or f"{sell_ex}:futures" in flagged_sources:
                     _record_rejection(
                         buy_ex,
@@ -502,7 +555,7 @@ class SpreadEngine:
                     ))
 
                 if entry_spread >= min_spread:
-                    opps.append(SpreadOpportunity(
+                    opp = SpreadOpportunity(
                         asset=symbol, arb_type="spot_futures",
                         buy_exchange=buy_ex, sell_exchange=sell_ex,
                         buy_market_type="spot", sell_market_type="futures",
@@ -514,18 +567,27 @@ class SpreadEngine:
                         sell_symbol=sell_snap.symbol,
                         buy_book_age=now - buy_snap.timestamp,
                         sell_book_age=now - sell_snap.timestamp,
-                    ))
+                    )
+                    opp.quality_hints = _quality_hints(
+                        buy_snap=buy_snap,
+                        sell_snap=sell_snap,
+                        buy_price=buy_ask,
+                        buy_qty=buy_ask_qty,
+                        sell_price=sell_bid,
+                        sell_qty=sell_bid_qty,
+                    )
+                    opps.append(opp)
 
         # ---------- futures_futures: different exchanges ----------
         n_fut = len(fut_src)
         for i in range(n_fut):
-            buy_ex, buy_snap, buy_bid, buy_ask = fut_src[i]
+            buy_ex, buy_snap, buy_bid, buy_ask, buy_bid_qty, buy_ask_qty = fut_src[i]
             if buy_ask <= 0:
                 continue
             for j in range(n_fut):
                 if i == j:
                     continue
-                sell_ex, sell_snap, sell_bid, sell_ask = fut_src[j]
+                sell_ex, sell_snap, sell_bid, sell_ask, sell_bid_qty, sell_ask_qty = fut_src[j]
                 if buy_ex == sell_ex:
                     continue
                 if f"{buy_ex}:futures" in flagged_sources or f"{sell_ex}:futures" in flagged_sources:
@@ -586,7 +648,7 @@ class SpreadEngine:
                     ))
 
                 if entry_spread >= min_spread:
-                    opps.append(SpreadOpportunity(
+                    opp = SpreadOpportunity(
                         asset=symbol, arb_type="futures_futures",
                         buy_exchange=buy_ex, sell_exchange=sell_ex,
                         buy_market_type="futures", sell_market_type="futures",
@@ -598,7 +660,16 @@ class SpreadEngine:
                         sell_symbol=sell_snap.symbol,
                         buy_book_age=now - buy_snap.timestamp,
                         sell_book_age=now - sell_snap.timestamp,
-                    ))
+                    )
+                    opp.quality_hints = _quality_hints(
+                        buy_snap=buy_snap,
+                        sell_snap=sell_snap,
+                        buy_price=buy_ask,
+                        buy_qty=buy_ask_qty,
+                        sell_price=sell_bid,
+                        sell_qty=sell_bid_qty,
+                    )
+                    opps.append(opp)
 
         return opps, stale_n, records, rejections
 

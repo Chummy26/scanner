@@ -236,8 +236,18 @@ def create_sqlite_snapshot(source_path: Path, target_path: Path) -> Path:
     target_path = Path(target_path)
     target_path.parent.mkdir(parents=True, exist_ok=True)
     if source_path.suffix.lower() == ".sqlite":
+        if target_path.exists():
+            target_path.unlink()
         with sqlite3.connect(source_path, timeout=30.0) as source, sqlite3.connect(target_path, timeout=30.0) as target:
+            try:
+                source.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.DatabaseError:
+                pass
             source.backup(target)
+            integrity_row = target.execute("PRAGMA integrity_check").fetchone()
+            integrity_value = str(integrity_row[0] if integrity_row else "").strip().lower()
+            if integrity_value != "ok":
+                raise RuntimeError(f"sqlite_snapshot_integrity_failed:{integrity_value or 'unknown'}")
         return target_path
     shutil.copy2(source_path, target_path)
     return target_path
@@ -438,7 +448,7 @@ class RuntimeAuditCollector:
                 )
             if not bool(payload.get("numeric_valid", True)):
                 self.alert("invalid_record", severity="error", pair_key=pair_key, payload=payload)
-            if not bool(payload.get("timestamp_monotonic", True)):
+            if not bool(payload.get("timestamp_monotonic", True)) and not bool(payload.get("clock_jitter_ts", False)):
                 self.alert("non_monotonic_timestamp", severity="error", pair_key=pair_key, payload=payload)
             # tracker_record events are NOT written to events.ndjson —
             # they dominate volume (>99% of events) and are never consumed
@@ -467,6 +477,10 @@ class RuntimeAuditCollector:
         gap_detected: bool,
         monotonic: bool,
         invalid_fields: list[str],
+        exact_duplicate_ts: bool = False,
+        retrograde_ts_rejected: bool = False,
+        clock_jitter_ts: bool = False,
+        spread_outlier_warning: bool = False,
     ):
         self.on_tracker_event(
             {
@@ -483,6 +497,10 @@ class RuntimeAuditCollector:
                 "numeric_valid": not invalid_fields,
                 "invalid_fields": list(invalid_fields),
                 "timestamp_monotonic": bool(monotonic),
+                "exact_duplicate_ts": bool(exact_duplicate_ts),
+                "retrograde_ts_rejected": bool(retrograde_ts_rejected),
+                "clock_jitter_ts": bool(clock_jitter_ts),
+                "spread_outlier_warning": bool(spread_outlier_warning),
             }
         )
 

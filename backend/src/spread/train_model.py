@@ -7,6 +7,7 @@ import math
 import os
 import shutil
 import time as _time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -888,6 +889,75 @@ def _split_positive_counts(splits: dict[str, DatasetBundle]) -> dict[str, int]:
     }
 
 
+def _pair_concentration_metrics(pair_ids: list[str]) -> dict[str, Any]:
+    normalized = [str(pair_id) for pair_id in pair_ids if str(pair_id)]
+    if not normalized:
+        return {
+            "num_pairs": 0,
+            "gini": 0.0,
+            "top1_pair_fraction": 0.0,
+            "top_pairs": [],
+            "warning": False,
+        }
+    counts = Counter(normalized)
+    total = max(sum(counts.values()), 1)
+    shares = np.asarray(sorted((count / total for count in counts.values())), dtype=float)
+    if shares.size == 0:
+        gini = 0.0
+    else:
+        index = np.arange(1, shares.size + 1, dtype=float)
+        gini = float((2.0 * np.sum(index * shares) / (shares.size * np.sum(shares))) - ((shares.size + 1.0) / shares.size))
+    top_pairs = [
+        {"pair_id": str(pair_id), "samples": int(count), "fraction": float(count / total)}
+        for pair_id, count in counts.most_common(5)
+    ]
+    top1_fraction = float(top_pairs[0]["fraction"]) if top_pairs else 0.0
+    return {
+        "num_pairs": int(len(counts)),
+        "gini": float(gini),
+        "top1_pair_fraction": top1_fraction,
+        "top_pairs": top_pairs,
+        "warning": bool(gini > 0.70 or top1_fraction > 0.20),
+    }
+
+
+def _normalization_leakage_summary(
+    train_X: torch.Tensor,
+    val_X: torch.Tensor,
+    test_X: torch.Tensor,
+) -> dict[str, Any]:
+    def _feature_means(tensor: torch.Tensor) -> np.ndarray:
+        if tensor.numel() <= 0:
+            return np.empty((0,), dtype=float)
+        arr = tensor.detach().cpu().numpy()
+        return arr.reshape(-1, arr.shape[-1]).mean(axis=0)
+
+    train_means = _feature_means(train_X)
+    val_means = _feature_means(val_X)
+    test_means = _feature_means(test_X)
+    summary = {
+        "fit_source": "train_only",
+        "train_max_abs_mean": float(np.max(np.abs(train_means))) if train_means.size else 0.0,
+        "val_max_abs_mean": float(np.max(np.abs(val_means))) if val_means.size else 0.0,
+        "test_max_abs_mean": float(np.max(np.abs(test_means))) if test_means.size else 0.0,
+        "val_all_near_zero": bool(val_means.size and np.all(np.abs(val_means) < 1e-3)),
+        "test_all_near_zero": bool(test_means.size and np.all(np.abs(test_means) < 1e-3)),
+        "non_finite_train": int((~torch.isfinite(train_X)).sum().item()),
+        "non_finite_val": int((~torch.isfinite(val_X)).sum().item()),
+        "non_finite_test": int((~torch.isfinite(test_X)).sum().item()),
+    }
+    summary["suspicious_global_fit_leakage"] = bool(
+        summary["val_all_near_zero"]
+        and summary["test_all_near_zero"]
+        and max(summary["val_max_abs_mean"], summary["test_max_abs_mean"]) < 1e-6
+    )
+    if summary["non_finite_train"] or summary["non_finite_val"] or summary["non_finite_test"]:
+        raise ValueError(f"normalized_features_non_finite:{summary}")
+    if bool(summary["suspicious_global_fit_leakage"]):
+        raise ValueError(f"normalization_global_fit_leakage_suspected:{summary}")
+    return summary
+
+
 def _stability_summary(split_positive_rates: dict[str, float]) -> dict[str, Any]:
     populated = [float(value) for value in split_positive_rates.values() if float(value) > 0.0]
     if not populated:
@@ -931,8 +1001,8 @@ def _preflight_entry(
             reasons.append("no_samples")
         if int(bundle_obj.summary.get("num_positive_samples", 0)) <= 0:
             reasons.append("no_positive_samples")
-        if int(bundle_obj.summary.get("skipped_windows_right_censored", 0)) > 0:
-            reasons.append("right_censoring_present")
+        if float(bundle_obj.summary.get("right_censoring_fraction", 0.0) or 0.0) > 0.80:
+            reasons.append("right_censoring_excessive")
         if int(bundle_obj.summary.get("block_diagnostics", {}).get("irregular_block_count", 0)) > 0:
             reasons.append("intra_block_irregularity")
         if int(
@@ -967,7 +1037,7 @@ def _preflight_entry(
             reasons.append("cross_session_merge_no_effect")
         return list(dict.fromkeys(reasons))
 
-    if bundle is None or splits is None:
+    if bundle is None:
         return {
             "threshold": float(threshold),
             **label_payload,
@@ -978,14 +1048,69 @@ def _preflight_entry(
             "stability_mode": "primary",
             "qualifies_for_training": False,
             "qualifies_for_training_relaxed": False,
+            "warnings": [],
             "failure_reasons": ["dataset_build_failed"],
             "error": str(error or "dataset_build_failed"),
+        }
+    if splits is None:
+        pair_concentration = _pair_concentration_metrics(list(bundle.pair_ids))
+        warnings: list[str] = []
+        right_censoring_fraction = float(bundle.summary.get("right_censoring_fraction", 0.0) or 0.0)
+        if right_censoring_fraction > 0.40:
+            warnings.append("right_censoring_elevated")
+        if float(bundle.summary.get("warmup_partial_8h_fraction", 0.0) or 0.0) > 0.30:
+            warnings.append("warmup_partial_8h_elevated")
+        if bool(pair_concentration.get("warning", False)):
+            warnings.append("pair_concentration_elevated")
+        return {
+            "threshold": float(threshold),
+            **label_payload,
+            "build_ok": True,
+            "guardrail_ok": False,
+            "purging_ok": False,
+            "stability_ok": False,
+            "stability_mode": "failed",
+            "qualifies_for_training": False,
+            "qualifies_for_training_relaxed": False,
+            "num_samples": int(bundle.summary.get("num_samples", 0)),
+            "num_positive_samples": int(bundle.summary.get("num_positive_samples", 0)),
+            "num_negative_samples": int(bundle.summary.get("num_negative_samples", 0)),
+            "positive_rate": float(bundle.summary.get("positive_rate", 0.0) or 0.0),
+            "right_censoring_fraction": right_censoring_fraction,
+            "warmup_partial_8h_fraction": float(bundle.summary.get("warmup_partial_8h_fraction", 0.0) or 0.0),
+            "split_positive_counts": {"train": 0, "val": 0, "test": 0},
+            "split_positive_rates": {"train": 0.0, "val": 0.0, "test": 0.0},
+            "max_positive_rate_delta": 0.0,
+            "min_to_max_positive_rate_ratio": 0.0,
+            "pair_concentration": pair_concentration,
+            "split_summary": {},
+            "label_audit": dict(bundle.summary.get("label_audit", {})),
+            "label_thresholds": dict(bundle.summary.get("label_thresholds", {})),
+            "block_diagnostics": dict(bundle.summary.get("block_diagnostics", {})),
+            "episode_diagnostics": dict(bundle.summary.get("episode_diagnostics", {})),
+            "cross_session_merge_enabled": bool(bundle.summary.get("cross_session_merge_enabled", False)),
+            "cross_session_merges_applied": int(bundle.summary.get("cross_session_merges_applied", 0)),
+            "cross_session_merge_diagnostics": dict(bundle.summary.get("cross_session_merge_diagnostics", {})),
+            "warnings": list(dict.fromkeys(warnings)),
+            "failure_reasons": ["split_build_failed"],
+            "error": str(error or "split_build_failed"),
         }
 
     split_summary = _build_split_summary(splits)
     positive_counts = _split_positive_counts(splits)
     positive_rates = _split_positive_rates(splits)
     stability = _stability_summary(positive_rates)
+    pair_concentration = _pair_concentration_metrics(list(bundle.pair_ids))
+    warnings: list[str] = []
+    right_censoring_fraction = float(bundle.summary.get("right_censoring_fraction", 0.0) or 0.0)
+    if right_censoring_fraction > 0.40:
+        warnings.append("right_censoring_elevated")
+    if bool(split_summary.get("embargo_gap_below_horizon_warning", False)):
+        warnings.append("embargo_gap_below_horizon")
+    if float(bundle.summary.get("warmup_partial_8h_fraction", 0.0) or 0.0) > 0.30:
+        warnings.append("warmup_partial_8h_elevated")
+    if bool(pair_concentration.get("warning", False)):
+        warnings.append("pair_concentration_elevated")
     guardrail_ok = bool(
         positive_counts["train"] >= int(min_train_positive_samples)
         and positive_counts["val"] >= int(min_val_positive_samples)
@@ -1010,10 +1135,13 @@ def _preflight_entry(
         "num_positive_samples": int(bundle.summary.get("num_positive_samples", 0)),
         "num_negative_samples": int(bundle.summary.get("num_negative_samples", 0)),
         "positive_rate": float(bundle.summary.get("num_positive_samples", 0) / max(bundle.summary.get("num_samples", 1), 1)),
+        "right_censoring_fraction": right_censoring_fraction,
+        "warmup_partial_8h_fraction": float(bundle.summary.get("warmup_partial_8h_fraction", 0.0) or 0.0),
         "split_positive_counts": positive_counts,
         "split_positive_rates": stability["split_positive_rates"],
         "max_positive_rate_delta": float(stability["max_positive_rate_delta"]),
         "min_to_max_positive_rate_ratio": float(stability["min_to_max_positive_rate_ratio"]),
+        "pair_concentration": pair_concentration,
         "split_summary": split_summary,
         "label_audit": dict(bundle.summary.get("label_audit", {})),
         "label_thresholds": dict(bundle.summary.get("label_thresholds", {})),
@@ -1022,6 +1150,7 @@ def _preflight_entry(
         "cross_session_merge_enabled": bool(bundle.summary.get("cross_session_merge_enabled", False)),
         "cross_session_merges_applied": int(bundle.summary.get("cross_session_merges_applied", 0)),
         "cross_session_merge_diagnostics": dict(bundle.summary.get("cross_session_merge_diagnostics", {})),
+        "warnings": list(dict.fromkeys(warnings)),
         "failure_reasons": _failure_reasons(
             bundle_obj=bundle,
             guardrail_ok_value=guardrail_ok,
@@ -1053,7 +1182,7 @@ def run_threshold_preflight(
     _preloaded_blocks: tuple[list, float, dict] | None = None,
     _precomputed_pair_segments: tuple[list[dict[str, Any]], dict[str, Any]] | None = None,
     _precomputed_segment_features: dict[int, list[list[float]]] | None = None,
-    _scaffold_cache: dict[tuple[int, int, bool], Any] | None = None,
+    _scaffold_cache: dict[tuple[int, int, bool, int], Any] | None = None,
     window_stride: int = 1,
 ) -> dict[str, Any]:
     default_state = Path(__file__).resolve().parent.parent.parent / "out" / "config" / "tracker_history.sqlite"
@@ -1128,6 +1257,7 @@ def run_threshold_preflight(
 
     for label_config in label_configs:
         threshold = float(label_config["threshold"])
+        bundle: DatasetBundle | None = None
         try:
             bundle, used_window_stride = _build_bundle_with_fallback(
                 state_path=state_path,
@@ -1160,7 +1290,7 @@ def run_threshold_preflight(
             entry = _preflight_entry(
                 threshold=threshold,
                 label_config=label_config,
-                bundle=None,
+                bundle=bundle,
                 splits=None,
                 error=str(exc),
                 min_train_positive_samples=min_train_positive_samples,
@@ -1316,7 +1446,7 @@ def certify_data_for_training(
     _preloaded_blocks: tuple[list, float, dict] | None = None,
     _precomputed_segments_by_merge: dict[bool, tuple[list[dict[str, Any]], dict[str, Any]]] | None = None,
     _precomputed_features_by_merge: dict[bool, dict[int, list[list[float]]]] | None = None,
-    _scaffold_cache: dict[tuple[int, int, bool], Any] | None = None,
+    _scaffold_cache: dict[tuple[int, int, bool, int], Any] | None = None,
     window_stride: int = 1,
 ) -> dict[str, Any]:
     default_state = Path(__file__).resolve().parent.parent.parent / "out" / "config" / "tracker_history.sqlite"
@@ -1606,7 +1736,7 @@ def run_training_loop(
     _preloaded_blocks: tuple[list, float, dict] | None = None,
     _precomputed_pair_segments: tuple[list[dict[str, Any]], dict[str, Any]] | None = None,
     _precomputed_segment_features: dict[int, list[list[float]]] | None = None,
-    _scaffold_cache: dict[tuple[int, int, bool], Any] | None = None,
+    _scaffold_cache: dict[tuple[int, int, bool, int], Any] | None = None,
 ) -> dict[str, Any]:
     logger.info("Initializing robust ArbML training pipeline...")
     torch.manual_seed(seed)
@@ -1680,6 +1810,11 @@ def run_training_loop(
         "val": int(splits["val"].summary["num_positive_samples"]),
         "test": int(splits["test"].summary["num_positive_samples"]),
     }
+    for split_name, positive_count in split_positive_counts.items():
+        if int(positive_count) < 50:
+            raise ValueError(
+                f"{split_name}_split_positive_floor_failed:{positive_count}:minimum 50 positive samples required"
+            )
     if split_positive_counts["train"] < int(min_train_positive_samples):
         raise ValueError(
             f"Train split has only {split_positive_counts['train']} positive samples; minimum required is {int(min_train_positive_samples)}. "
@@ -1700,6 +1835,20 @@ def run_training_loop(
     feature_mean, feature_std = compute_feature_stats(splits["train"].X)
     for split_bundle in splits.values():
         split_bundle.X = normalize_features(split_bundle.X, feature_mean, feature_std)
+    normalization_summary = _normalization_leakage_summary(
+        splits["train"].X,
+        splits["val"].X,
+        splits["test"].X,
+    )
+    training_warnings = [
+        f"{split_name}_positives_below_100"
+        for split_name, positive_count in split_positive_counts.items()
+        if int(positive_count) < 100
+    ]
+    if bool(normalization_summary.get("suspicious_global_fit_leakage", False)):
+        training_warnings.append("normalization_global_fit_leakage_suspected")
+    if bool(split_summary.get("embargo_gap_below_horizon_warning", False)):
+        training_warnings.append("embargo_gap_below_horizon")
 
     positive_rate_train = float(splits["train"].y_class.mean().item()) if splits["train"].summary["num_samples"] else 0.0
     focal_alpha_effective = float(focal_alpha) if focal_alpha is not None else _derive_focal_alpha(positive_rate_train)
@@ -1838,6 +1987,7 @@ def run_training_loop(
     dataset_summary["feature_abs_sum"] = float(bundle.X.abs().sum().item())
     dataset_summary["positive_rate_train"] = positive_rate_train
     dataset_summary["focal_alpha_effective"] = focal_alpha_effective
+    dataset_summary["pair_concentration"] = _pair_concentration_metrics(list(bundle.pair_ids))
     label_audit = dict(dataset_summary.get("label_audit", {}))
     test_x = splits["test"].X.detach().cpu().numpy() if splits["test"].summary["num_samples"] else np.empty((0, 0, 0), dtype=float)
     feature_std_np = feature_std.detach().cpu().numpy()
@@ -1898,7 +2048,9 @@ def run_training_loop(
         "temporal_walk_forward": temporal_walk_forward,
         "validation_partition": validation_partition,
         "feature_monitoring": feature_monitoring,
+        "normalization_summary": normalization_summary,
         "label_audit": label_audit,
+        "warnings": list(dict.fromkeys(training_warnings)),
         "training": {
             "best_epoch": best_epoch,
             "best_val_loss": best_val_loss,

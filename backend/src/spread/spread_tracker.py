@@ -53,6 +53,12 @@ _DEFAULT_CLEAN_PREDICTION_HORIZON_SEC = 14_400
 _BURN_IN_CHECKPOINT_SEC = 30 * 60
 _BURN_IN_MIN_SEC = 60 * 60
 _FLUSH_PAIR_BATCH_MAX = 512
+_TIMESTAMP_RETROGRADE_TOLERANCE_SEC = 0.5
+_RECENT_RECORD_FINGERPRINT_MAXLEN = 64
+_RECENT_SPREAD_HISTORY_MAXLEN = 64
+_SPREAD_OUTLIER_MIN_HISTORY = 10
+_SPREAD_OUTLIER_MULTIPLIER = 10.0
+_DEFAULT_EPISODE_ABANDONED_CUTOFF_SEC = 2 * _DEFAULT_CLEAN_PREDICTION_HORIZON_SEC
 
 
 @dataclass(slots=True)
@@ -200,6 +206,15 @@ def _episode_total_spread(episode: TrackerEpisode) -> float:
 
 
 def compute_closed_episodes(records: Iterable[SpreadRecord]) -> list[TrackerEpisode]:
+    closed_episodes, _ = compute_closed_episodes_with_diagnostics(records)
+    return closed_episodes
+
+
+def compute_closed_episodes_with_diagnostics(
+    records: Iterable[SpreadRecord],
+    *,
+    abandoned_cutoff_sec: float = _DEFAULT_EPISODE_ABANDONED_CUTOFF_SEC,
+) -> tuple[list[TrackerEpisode], dict[str, int]]:
     ordered = sorted(
         (
             record
@@ -213,16 +228,28 @@ def compute_closed_episodes(records: Iterable[SpreadRecord]) -> list[TrackerEpis
     last_entry: float | None = None
     current_block_id = 0
     active: TrackerEpisode | None = None
+    last_record_ts = 0.0
+    abandoned_episode_count = 0
+
+    def _close_abandoned_if_needed(current_ts: float) -> None:
+        nonlocal active, abandoned_episode_count
+        if active is None:
+            return
+        if max(0.0, float(current_ts) - float(active.start_ts)) > float(abandoned_cutoff_sec):
+            abandoned_episode_count += 1
+            active = None
 
     for record in ordered:
         block_id = int(record.block_id or 0)
         if block_id != current_block_id:
+            _close_abandoned_if_needed(last_record_ts)
             baseline_entries.clear()
             last_entry = None
             current_block_id = block_id
             active = None
 
         current_entry = float(record.entry_spread_pct)
+        last_record_ts = float(record.timestamp)
         n = len(baseline_entries)
         if n > 0:
             # Sort once, compute median and MAD inline — avoids redundant
@@ -268,13 +295,24 @@ def compute_closed_episodes(records: Iterable[SpreadRecord]) -> list[TrackerEpis
                 active.duration_sec = max(0.0, active.end_ts - active.start_ts)
                 active.exit_spread_at_close = float(record.exit_spread_pct)
                 active.is_closed = True
-                episodes.append(active)
+                if (
+                    math.isfinite(active.duration_sec)
+                    and math.isfinite(active.peak_entry_spread)
+                    and math.isfinite(active.exit_spread_at_close)
+                    and active.duration_sec >= 0.0
+                    and active.peak_entry_spread >= active.activation_threshold
+                ):
+                    episodes.append(active)
                 active = None
 
         baseline_entries.append(current_entry)
         last_entry = current_entry
 
-    return episodes
+    _close_abandoned_if_needed(last_record_ts)
+    return episodes, {
+        "abandoned_episode_count": int(abandoned_episode_count),
+        "closed_episode_count": int(len(episodes)),
+    }
 
 
 def build_recurring_context_from_episodes(
@@ -454,6 +492,17 @@ class PairStats:
     block_meta: Dict[int, TrackerBlockMeta] = field(default_factory=dict)
     episodes: Deque[TrackerEpisode] = field(default_factory=deque)
     _episodes_cache_valid: bool = False
+    exact_duplicate_ts_rejections: int = 0
+    retrograde_ts_rejections: int = 0
+    clock_jitter_events: int = 0
+    spread_outlier_warnings: int = 0
+    abandoned_episode_count: int = 0
+    recent_record_fingerprints: Deque[Tuple[int, float, float]] = field(
+        default_factory=lambda: deque(maxlen=_RECENT_RECORD_FINGERPRINT_MAXLEN)
+    )
+    recent_abs_entry_spreads: Deque[float] = field(
+        default_factory=lambda: deque(maxlen=_RECENT_SPREAD_HISTORY_MAXLEN)
+    )
 
     def _prune_events(self, cutoff: float) -> bool:
         pruned = False
@@ -566,6 +615,7 @@ class SpreadTracker:
         self.db_path = Path(db_path) if db_path is not None else None
         self.gap_threshold_sec = self._resolve_gap_threshold_sec(gap_threshold_sec, self.record_interval_sec)
         self.min_total_spread_pct = self._resolve_min_total_spread_pct(min_total_spread_pct)
+        self.episode_abandoned_cutoff_sec = float(_DEFAULT_EPISODE_ABANDONED_CUTOFF_SEC)
         self.audit_collector = audit_collector
         self._lock = threading.Lock()
         self._pairs: Dict[PairKey, PairStats] = defaultdict(PairStats)
@@ -901,6 +951,77 @@ class SpreadTracker:
             if not math.isfinite(numeric):
                 invalid_fields.append(name)
         return invalid_fields
+
+    @staticmethod
+    def _record_fingerprint(ts: float, entry_spread: float, exit_spread: float, interval_sec: float) -> tuple[int, float, float]:
+        bucket_size = max(float(interval_sec or 0.0), 1.0)
+        return (
+            int(round(float(ts) / bucket_size)),
+            round(float(entry_spread), 6),
+            round(float(exit_spread), 6),
+        )
+
+    @staticmethod
+    def _timestamp_status_locked(ps: PairStats, ts: float) -> str:
+        last_ts = float(ps._last_record_ts or 0.0)
+        candidate_ts = float(ts)
+        if last_ts <= 0.0:
+            return "ok"
+        if candidate_ts == last_ts:
+            return "exact_duplicate"
+        if candidate_ts < (last_ts - _TIMESTAMP_RETROGRADE_TOLERANCE_SEC):
+            return "retrograde"
+        if candidate_ts < last_ts:
+            return "clock_jitter"
+        return "ok"
+
+    @staticmethod
+    def _adjust_record_ts(last_ts: float, ts: float) -> float:
+        candidate_ts = float(ts)
+        if candidate_ts < float(last_ts):
+            return float(last_ts) + 1e-6
+        return candidate_ts
+
+    @staticmethod
+    def _is_light_duplicate_locked(ps: PairStats, fingerprint: tuple[int, float, float]) -> bool:
+        return fingerprint in ps.recent_record_fingerprints
+
+    @staticmethod
+    def _remember_record_locked(ps: PairStats, *, fingerprint: tuple[int, float, float], entry_spread: float) -> None:
+        ps.recent_record_fingerprints.append(fingerprint)
+        ps.recent_abs_entry_spreads.append(abs(float(entry_spread)))
+
+    @staticmethod
+    def _is_pair_spread_outlier_locked(ps: PairStats, entry_spread: float) -> bool:
+        history = list(ps.recent_abs_entry_spreads)
+        if len(history) < _SPREAD_OUTLIER_MIN_HISTORY:
+            return False
+        baseline = max(_median(history), 0.05)
+        return abs(float(entry_spread)) > max(baseline * _SPREAD_OUTLIER_MULTIPLIER, 0.50)
+
+    def _emit_tracker_record_rejected(
+        self,
+        *,
+        key: PairKey,
+        ts: float,
+        entry_spread: float,
+        exit_spread: float,
+        invalid_fields: list[str],
+        reason: str,
+        last_record_ts: float,
+    ) -> None:
+        self._emit_event(
+            {
+                "kind": "tracker_record_rejected",
+                "pair_key": self._pair_id(key),
+                "record_ts": float(ts),
+                "entry": float(entry_spread),
+                "exit": float(exit_spread),
+                "invalid_fields": list(invalid_fields),
+                "reason": str(reason),
+                "last_record_ts": float(last_record_ts),
+            }
+        )
 
     def _connect(self) -> sqlite3.Connection:
         if self.db_path is None:
@@ -1345,11 +1466,37 @@ class SpreadTracker:
         ended_at: float | None = None,
     ) -> None:
         finished_at = float(ended_at) if ended_at is not None else time.time()
+        active_session_id = 0
+        restore_payload: list[tuple[PairStats, int, int, float, float, int, float, str, TrackerBlockMeta | None]] = []
         with self._lock:
             current_blocks = []
             for stats in self._pairs.values():
                 if stats.current_session_id == self._active_session_id and stats.current_block_id:
                     current_block_id = int(stats.current_block_id)
+                    previous_meta = stats.block_meta.get(current_block_id)
+                    restore_payload.append(
+                        (
+                            stats,
+                            int(stats.current_session_id),
+                            current_block_id,
+                            float(stats.current_block_start_ts),
+                            float(stats.current_block_end_ts),
+                            int(stats.current_block_record_count),
+                            float(stats.current_block_max_gap_sec),
+                            str(stats.current_block_boundary_reason),
+                            None
+                            if previous_meta is None
+                            else TrackerBlockMeta(
+                                session_id=int(previous_meta.session_id),
+                                start_ts=float(previous_meta.start_ts),
+                                end_ts=float(previous_meta.end_ts),
+                                record_count=int(previous_meta.record_count),
+                                max_gap_sec=float(previous_meta.max_gap_sec),
+                                boundary_reason=str(previous_meta.boundary_reason),
+                                is_open=bool(previous_meta.is_open),
+                            ),
+                        )
+                    )
                     self._close_current_block_locked(stats, finished_at)
                     closed_meta = stats.block_meta.get(current_block_id)
                     current_blocks.append(
@@ -1362,53 +1509,79 @@ class SpreadTracker:
                     )
                     stats.current_session_id = 0
                 elif stats.current_session_id == self._active_session_id:
+                    restore_payload.append((stats, int(stats.current_session_id), 0, 0.0, 0.0, 0, 0.0, "", None))
                     stats.current_session_id = 0
             active_session_id = self._active_session_id
             self._active_session_id = 0
 
         if not active_session_id or self.db_path is None:
             return
-        with self._connect() as conn:
-            session_row = conn.execute(
-                "SELECT started_at FROM tracker_capture_sessions WHERE id = ?",
-                (active_session_id,),
-            ).fetchone()
-            session_started_at = self._coerce_float(session_row["started_at"] if session_row is not None else 0.0, 0.0)
-            normalized_finished_at = max(
-                finished_at,
-                session_started_at,
-                max((float(block_end_ts) for _, block_end_ts, _, _ in current_blocks), default=0.0),
-            )
-            for block_id, end_ts, record_count, max_gap_sec in current_blocks:
-                if int(block_id) <= 0:
-                    continue
+        try:
+            with self._connect() as conn:
+                session_row = conn.execute(
+                    "SELECT started_at FROM tracker_capture_sessions WHERE id = ?",
+                    (active_session_id,),
+                ).fetchone()
+                session_started_at = self._coerce_float(session_row["started_at"] if session_row is not None else 0.0, 0.0)
+                normalized_finished_at = max(
+                    finished_at,
+                    session_started_at,
+                    max((float(block_end_ts) for _, block_end_ts, _, _ in current_blocks), default=0.0),
+                )
+                for block_id, end_ts, record_count, max_gap_sec in current_blocks:
+                    if int(block_id) <= 0:
+                        continue
+                    conn.execute(
+                        """
+                        UPDATE tracker_pair_blocks
+                        SET is_open = 0, end_ts = ?, record_count = ?, max_gap_sec = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (max(end_ts, normalized_finished_at if end_ts <= 0.0 else end_ts), record_count, max_gap_sec, normalized_finished_at, block_id),
+                    )
                 conn.execute(
                     """
                     UPDATE tracker_pair_blocks
-                    SET is_open = 0, end_ts = ?, record_count = ?, max_gap_sec = ?, updated_at = ?
+                    SET is_open = 0,
+                        end_ts = CASE WHEN end_ts <= 0 THEN start_ts ELSE end_ts END,
+                        updated_at = ?
+                    WHERE session_id = ? AND is_open = 1
+                    """,
+                    (normalized_finished_at, active_session_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE tracker_capture_sessions
+                    SET status = ?, ended_at = ?, updated_at = ?
                     WHERE id = ?
                     """,
-                    (max(end_ts, normalized_finished_at if end_ts <= 0.0 else end_ts), record_count, max_gap_sec, normalized_finished_at, block_id),
+                    (status, normalized_finished_at, normalized_finished_at, active_session_id),
                 )
-            conn.execute(
-                """
-                UPDATE tracker_pair_blocks
-                SET is_open = 0,
-                    end_ts = CASE WHEN end_ts <= 0 THEN start_ts ELSE end_ts END,
-                    updated_at = ?
-                WHERE session_id = ? AND is_open = 1
-                """,
-                (normalized_finished_at, active_session_id),
-            )
-            conn.execute(
-                """
-                UPDATE tracker_capture_sessions
-                SET status = ?, ended_at = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (status, normalized_finished_at, normalized_finished_at, active_session_id),
-            )
-            self._reconcile_storage_conn(conn, session_ids=[active_session_id])
+                self._reconcile_storage_conn(conn, session_ids=[active_session_id])
+        except Exception:
+            with self._lock:
+                self._active_session_id = int(active_session_id)
+                for (
+                    stats,
+                    previous_session_id,
+                    previous_block_id,
+                    previous_start_ts,
+                    previous_end_ts,
+                    previous_record_count,
+                    previous_max_gap_sec,
+                    previous_boundary_reason,
+                    previous_meta,
+                ) in restore_payload:
+                    stats.current_session_id = int(previous_session_id)
+                    stats.current_block_id = int(previous_block_id)
+                    stats.current_block_start_ts = float(previous_start_ts)
+                    stats.current_block_end_ts = float(previous_end_ts)
+                    stats.current_block_record_count = int(previous_record_count)
+                    stats.current_block_max_gap_sec = float(previous_max_gap_sec)
+                    stats.current_block_boundary_reason = str(previous_boundary_reason)
+                    if previous_block_id and previous_meta is not None:
+                        stats.block_meta[int(previous_block_id)] = previous_meta
+            raise
         self._run_wal_checkpoint()
 
     def _mark_dirty(self, key: PairKey):
@@ -1560,16 +1733,19 @@ class SpreadTracker:
             for event in ps.inverted_events
             if event.timestamp >= state_cutoff
         ]
+        inv = list(dict.fromkeys(inv))
         ent = [
             (float(event.timestamp), int(event.session_id), int(event.block_id) if event.block_id is not None else None)
             for event in ps.entry_events
             if event.timestamp >= state_cutoff
         ]
+        ent = list(dict.fromkeys(ent))
         ext = [
             (float(event.timestamp), int(event.session_id), int(event.block_id) if event.block_id is not None else None)
             for event in ps.exit_events
             if event.timestamp >= state_cutoff
         ]
+        ext = list(dict.fromkeys(ext))
         recs = [
             (
                 float(record.timestamp),
@@ -1581,6 +1757,7 @@ class SpreadTracker:
             for record in ps.records
             if record.timestamp >= record_cutoff
         ]
+        recs = list(dict.fromkeys(recs))
         blocks = [
             {
                 "runtime_block_id": int(block_id),
@@ -1613,6 +1790,7 @@ class SpreadTracker:
             "records": recs,
             "blocks": blocks,
             "episodes": episodes,
+            "abandoned_episode_count": int(ps.abandoned_episode_count),
         }
 
     @staticmethod
@@ -1703,7 +1881,12 @@ class SpreadTracker:
     def _ensure_episode_cache_locked(self, ps: PairStats):
         if ps._episodes_cache_valid:
             return
-        ps.episodes = deque(compute_closed_episodes(list(ps.records)))
+        episodes, diagnostics = compute_closed_episodes_with_diagnostics(
+            list(ps.records),
+            abandoned_cutoff_sec=self.episode_abandoned_cutoff_sec,
+        )
+        ps.episodes = deque(episodes)
+        ps.abandoned_episode_count = int(diagnostics.get("abandoned_episode_count", 0) or 0)
         ps._episodes_cache_valid = True
 
     def _rebuild_episodes_for_pair_conn(self, conn: sqlite3.Connection, pair_id: int):
@@ -1725,7 +1908,10 @@ class SpreadTracker:
                 (int(pair_id),),
             )
         ]
-        episodes = compute_closed_episodes(records)
+        episodes, diagnostics = compute_closed_episodes_with_diagnostics(
+            records,
+            abandoned_cutoff_sec=self.episode_abandoned_cutoff_sec,
+        )
         conn.execute("DELETE FROM tracker_pair_episodes WHERE pair_id = ?", (int(pair_id),))
         if episodes:
             conn.executemany(
@@ -1762,6 +1948,7 @@ class SpreadTracker:
             for _, ps in self._pairs.items():
                 if int(ps.storage_pair_id) == int(pair_id):
                     ps.episodes = deque(episodes)
+                    ps.abandoned_episode_count = int(diagnostics.get("abandoned_episode_count", 0) or 0)
                     ps._episodes_cache_valid = True
                     break
 
@@ -1824,6 +2011,7 @@ class SpreadTracker:
             ps._last_record_ts = max((record.timestamp for record in records), default=0.0)
             ps._stats_dirty = True
             ps.episodes = deque(self._episodes_from_rows(episode_rows))
+            ps.abandoned_episode_count = 0
             ps._episodes_cache_valid = True
 
     def _delete_pairs_from_storage(self, conn: sqlite3.Connection, keys: Iterable[PairKey]):
@@ -1903,31 +2091,81 @@ class SpreadTracker:
                 preserve_after_ts = self._last_flush_at if self._last_flush_at > 0.0 else float("-inf")
                 if ps._prune_records(record_cutoff, preserve_after_ts=preserve_after_ts):
                     pair_dirty = True
-                record_delta_sec = (ts - ps._last_record_ts) if ps._last_record_ts > 0.0 else 0.0
+                timestamp_status = self._timestamp_status_locked(ps, ts)
+                if timestamp_status == "exact_duplicate":
+                    self._record_hot_path_attempt_locked(key)
+                    self._record_hot_path_rejection_locked(key, invalid_fields=["duplicate_ts"])
+                    ps.exact_duplicate_ts_rejections += 1
+                    self._emit_tracker_record_rejected(
+                        key=key,
+                        ts=ts,
+                        entry_spread=entry_v,
+                        exit_spread=exit_v,
+                        invalid_fields=["duplicate_ts"],
+                        reason="exact_duplicate_ts",
+                        last_record_ts=ps._last_record_ts,
+                    )
+                    return
+                if timestamp_status == "retrograde":
+                    self._record_hot_path_attempt_locked(key)
+                    self._record_hot_path_rejection_locked(key, invalid_fields=["retrograde_ts"])
+                    ps.retrograde_ts_rejections += 1
+                    self._emit_tracker_record_rejected(
+                        key=key,
+                        ts=ts,
+                        entry_spread=entry_v,
+                        exit_spread=exit_v,
+                        invalid_fields=["retrograde_ts"],
+                        reason="retrograde_ts_rejected",
+                        last_record_ts=ps._last_record_ts,
+                    )
+                    return
+                clock_jitter_ts = timestamp_status == "clock_jitter"
+                if clock_jitter_ts:
+                    ps.clock_jitter_events += 1
+                effective_ts = self._adjust_record_ts(ps._last_record_ts, ts)
+                record_delta_sec = (effective_ts - ps._last_record_ts) if ps._last_record_ts > 0.0 else 0.0
                 gap_detected = bool(ps._last_record_ts > 0.0 and record_delta_sec > self.gap_threshold_sec)
-                monotonic = bool(ps._last_record_ts <= 0.0 or ts > ps._last_record_ts)
+                monotonic = bool(ps._last_record_ts <= 0.0 or effective_ts > ps._last_record_ts)
                 should_record = (
                     not ps.records
-                    or (ts - ps._last_record_ts) >= max(self.record_interval_sec, 0.0)
+                    or (effective_ts - ps._last_record_ts) >= max(self.record_interval_sec, 0.0)
                 )
                 if should_record:
                     self._record_hot_path_attempt_locked(key)
-                    block_id = self._ensure_block_locked(key, ps, ts)
+                    fingerprint = self._record_fingerprint(ts, entry_v, exit_v, self.record_interval_sec)
+                    if self._is_light_duplicate_locked(ps, fingerprint):
+                        self._record_hot_path_rejection_locked(key, invalid_fields=["duplicate_payload"])
+                        self._emit_tracker_record_rejected(
+                            key=key,
+                            ts=ts,
+                            entry_spread=entry_v,
+                            exit_spread=exit_v,
+                            invalid_fields=["duplicate_payload"],
+                            reason="light_duplicate_payload",
+                            last_record_ts=ps._last_record_ts,
+                        )
+                        return
+                    block_id = self._ensure_block_locked(key, ps, effective_ts)
                     if ps._last_record_ts > 0.0 and ps.current_block_record_count > 0:
-                        ps.current_block_max_gap_sec = max(ps.current_block_max_gap_sec, ts - ps._last_record_ts)
+                        ps.current_block_max_gap_sec = max(ps.current_block_max_gap_sec, effective_ts - ps._last_record_ts)
+                    spread_outlier_warning = self._is_pair_spread_outlier_locked(ps, entry_v)
+                    if spread_outlier_warning:
+                        ps.spread_outlier_warnings += 1
                     ps.records.append(
                         SpreadRecord(
-                            timestamp=ts,
+                            timestamp=effective_ts,
                             entry_spread_pct=entry_v,
                             exit_spread_pct=exit_v,
                             session_id=self._active_session_id or ps.current_session_id,
                             block_id=block_id,
                         )
                     )
-                    ps.current_block_end_ts = ts
+                    self._remember_record_locked(ps, fingerprint=fingerprint, entry_spread=entry_v)
+                    ps.current_block_end_ts = effective_ts
                     ps.current_block_record_count += 1
                     self._update_open_block_meta_locked(ps)
-                    ps._last_record_ts = ts
+                    ps._last_record_ts = effective_ts
                     ps._stats_dirty = True
                     ps._episodes_cache_valid = False
                     pair_dirty = True
@@ -1943,12 +2181,16 @@ class SpreadTracker:
                             gap_detected=gap_detected,
                             monotonic=monotonic,
                             invalid_fields=list(invalid_fields),
+                            exact_duplicate_ts=False,
+                            retrograde_ts_rejected=False,
+                            clock_jitter_ts=clock_jitter_ts,
+                            spread_outlier_warning=spread_outlier_warning,
                         )
                     self._emit_event(
                         {
                             "kind": "tracker_record",
                             "pair_key": self._pair_id(key),
-                            "record_ts": ts,
+                            "record_ts": effective_ts,
                             "entry": entry_v,
                             "exit": exit_v,
                             "session_id": self._active_session_id or ps.current_session_id,
@@ -1959,6 +2201,10 @@ class SpreadTracker:
                             "numeric_valid": not invalid_fields,
                             "invalid_fields": list(invalid_fields),
                             "timestamp_monotonic": monotonic,
+                            "exact_duplicate_ts": False,
+                            "retrograde_ts_rejected": False,
+                            "clock_jitter_ts": clock_jitter_ts,
+                            "spread_outlier_warning": spread_outlier_warning,
                         }
                     )
                     if self.max_records_per_pair > 0:
@@ -1992,6 +2238,11 @@ class SpreadTracker:
                 "avg_spread": round(ps.avg_spread, 4),
                 "record_count": len(ps.records),
                 "last_seen_ts": ps.last_seen_ts,
+                "exact_duplicate_ts_rejections": int(ps.exact_duplicate_ts_rejections),
+                "retrograde_ts_rejections": int(ps.retrograde_ts_rejections),
+                "clock_jitter_events": int(ps.clock_jitter_events),
+                "spread_outlier_warnings": int(ps.spread_outlier_warnings),
+                "abandoned_episode_count": int(ps.abandoned_episode_count),
             }
 
     def get_history(self, symbol: str, buy_ex: str, buy_mt: str, sell_ex: str, sell_mt: str, limit: int = 200) -> List[Dict]:
@@ -2347,8 +2598,12 @@ class SpreadTracker:
 
         started_at = time.perf_counter()
         snapshot_rebindings: list[tuple[PairKey, int, dict[int, int]]] = []
+        records_before = 0
+        records_after = 0
         try:
             with self._connect() as conn:
+                records_before_row = conn.execute("SELECT COUNT(*) FROM tracker_records").fetchone()
+                records_before = int(records_before_row[0] if records_before_row is not None else 0)
                 conn.execute("BEGIN")
                 if deleted_keys:
                     self._delete_pairs_from_storage(conn, deleted_keys)
@@ -2500,6 +2755,7 @@ class SpreadTracker:
                         )
                         for event_ts, session_id, block_id in inv
                     ]
+                    mapped_inv = list(dict.fromkeys(mapped_inv))
                     mapped_ent = [
                         (
                             storage_pair_id,
@@ -2509,6 +2765,7 @@ class SpreadTracker:
                         )
                         for event_ts, session_id, block_id in ent
                     ]
+                    mapped_ent = list(dict.fromkeys(mapped_ent))
                     mapped_ext = [
                         (
                             storage_pair_id,
@@ -2518,6 +2775,7 @@ class SpreadTracker:
                         )
                         for event_ts, session_id, block_id in ext
                     ]
+                    mapped_ext = list(dict.fromkeys(mapped_ext))
                     mapped_records = [
                         (
                             storage_pair_id,
@@ -2529,6 +2787,7 @@ class SpreadTracker:
                         )
                         for record in records
                     ]
+                    mapped_records = list(dict.fromkeys(mapped_records))
                     if inv:
                         conn.executemany(
                             """
@@ -2613,7 +2872,6 @@ class SpreadTracker:
                         (storage_pair_id, storage_pair_id),
                     )
                     snapshot_rebindings.append((key, storage_pair_id, runtime_to_storage_block_id))
-                self._last_flush_at = ts
                 self._write_meta(
                     conn,
                     {
@@ -2624,11 +2882,14 @@ class SpreadTracker:
                         "gap_threshold_sec": self.gap_threshold_sec,
                         "min_total_spread_pct": self.min_total_spread_pct,
                         "quality_fix_activated_at": self.quality_fix_activated_at,
-                        "last_flush_at": self._last_flush_at,
+                        "last_flush_at": float(ts),
                         _HOT_PATH_REJECTION_META_KEY: json.dumps(rejection_stats_payload, sort_keys=True),
                     },
                 )
                 conn.commit()
+                self._last_flush_at = float(ts)
+                records_after_row = conn.execute("SELECT COUNT(*) FROM tracker_records").fetchone()
+                records_after = int(records_after_row[0] if records_after_row is not None else 0)
             self._run_wal_checkpoint()
         except Exception as exc:
             logger.error("[Tracker] Failed to flush SQLite storage: %s", exc)
@@ -2685,6 +2946,9 @@ class SpreadTracker:
                 "duration_ms": (time.perf_counter() - started_at) * 1000.0,
                 "pairs_flushed": len(dirty_keys),
                 "force": bool(force),
+                "records_before": int(records_before),
+                "records_after": int(records_after),
+                "commit_success": True,
                 "storage_stats": self.get_storage_stats(),
             }
         )
@@ -5036,28 +5300,78 @@ class SpreadTracker:
                     ps.history_enabled = True
                     pair_dirty = True
                 if ps.history_enabled and rec_interval >= 0:
-                    record_delta_sec = (ts - ps._last_record_ts) if ps._last_record_ts > 0.0 else 0.0
+                    timestamp_status = self._timestamp_status_locked(ps, ts)
+                    if timestamp_status == "exact_duplicate":
+                        self._record_hot_path_attempt_locked(key)
+                        self._record_hot_path_rejection_locked(key, invalid_fields=["duplicate_ts"])
+                        ps.exact_duplicate_ts_rejections += 1
+                        self._emit_tracker_record_rejected(
+                            key=key,
+                            ts=ts,
+                            entry_spread=entry_v,
+                            exit_spread=exit_v,
+                            invalid_fields=["duplicate_ts"],
+                            reason="exact_duplicate_ts",
+                            last_record_ts=ps._last_record_ts,
+                        )
+                        continue
+                    if timestamp_status == "retrograde":
+                        self._record_hot_path_attempt_locked(key)
+                        self._record_hot_path_rejection_locked(key, invalid_fields=["retrograde_ts"])
+                        ps.retrograde_ts_rejections += 1
+                        self._emit_tracker_record_rejected(
+                            key=key,
+                            ts=ts,
+                            entry_spread=entry_v,
+                            exit_spread=exit_v,
+                            invalid_fields=["retrograde_ts"],
+                            reason="retrograde_ts_rejected",
+                            last_record_ts=ps._last_record_ts,
+                        )
+                        continue
+                    clock_jitter_ts = timestamp_status == "clock_jitter"
+                    if clock_jitter_ts:
+                        ps.clock_jitter_events += 1
+                    effective_ts = self._adjust_record_ts(ps._last_record_ts, ts)
+                    record_delta_sec = (effective_ts - ps._last_record_ts) if ps._last_record_ts > 0.0 else 0.0
                     gap_detected = bool(ps._last_record_ts > 0.0 and record_delta_sec > self.gap_threshold_sec)
-                    monotonic = bool(ps._last_record_ts <= 0.0 or ts > ps._last_record_ts)
-                    should_record = (not ps.records or (ts - ps._last_record_ts) >= rec_interval)
+                    monotonic = bool(ps._last_record_ts <= 0.0 or effective_ts > ps._last_record_ts)
+                    should_record = (not ps.records or (effective_ts - ps._last_record_ts) >= rec_interval)
                     if should_record:
                         self._record_hot_path_attempt_locked(key)
-                        block_id = self._ensure_block_locked(key, ps, ts)
+                        fingerprint = self._record_fingerprint(ts, entry_v, exit_v, self.record_interval_sec)
+                        if self._is_light_duplicate_locked(ps, fingerprint):
+                            self._record_hot_path_rejection_locked(key, invalid_fields=["duplicate_payload"])
+                            self._emit_tracker_record_rejected(
+                                key=key,
+                                ts=ts,
+                                entry_spread=entry_v,
+                                exit_spread=exit_v,
+                                invalid_fields=["duplicate_payload"],
+                                reason="light_duplicate_payload",
+                                last_record_ts=ps._last_record_ts,
+                            )
+                            continue
+                        block_id = self._ensure_block_locked(key, ps, effective_ts)
                         if ps._last_record_ts > 0.0 and ps.current_block_record_count > 0:
-                            ps.current_block_max_gap_sec = max(ps.current_block_max_gap_sec, ts - ps._last_record_ts)
+                            ps.current_block_max_gap_sec = max(ps.current_block_max_gap_sec, effective_ts - ps._last_record_ts)
+                        spread_outlier_warning = self._is_pair_spread_outlier_locked(ps, entry_v)
+                        if spread_outlier_warning:
+                            ps.spread_outlier_warnings += 1
                         ps.records.append(
                             SpreadRecord(
-                                timestamp=ts,
+                                timestamp=effective_ts,
                                 entry_spread_pct=entry_v,
                                 exit_spread_pct=exit_v,
                                 session_id=self._active_session_id or ps.current_session_id,
                                 block_id=block_id,
                             )
                         )
-                        ps.current_block_end_ts = ts
+                        self._remember_record_locked(ps, fingerprint=fingerprint, entry_spread=entry_v)
+                        ps.current_block_end_ts = effective_ts
                         ps.current_block_record_count += 1
                         self._update_open_block_meta_locked(ps)
-                        ps._last_record_ts = ts
+                        ps._last_record_ts = effective_ts
                         ps._stats_dirty = True
                         ps._episodes_cache_valid = False
                         pair_dirty = True
@@ -5073,12 +5387,16 @@ class SpreadTracker:
                                 gap_detected=gap_detected,
                                 monotonic=monotonic,
                                 invalid_fields=list(invalid_fields),
+                                exact_duplicate_ts=False,
+                                retrograde_ts_rejected=False,
+                                clock_jitter_ts=clock_jitter_ts,
+                                spread_outlier_warning=spread_outlier_warning,
                             )
                         self._emit_event(
                             {
                                 "kind": "tracker_record",
                                 "pair_key": self._pair_id(key),
-                                "record_ts": ts,
+                                "record_ts": effective_ts,
                                 "entry": entry_v,
                                 "exit": exit_v,
                                 "session_id": self._active_session_id or ps.current_session_id,
@@ -5089,6 +5407,10 @@ class SpreadTracker:
                                 "numeric_valid": not invalid_fields,
                                 "invalid_fields": list(invalid_fields),
                                 "timestamp_monotonic": monotonic,
+                                "exact_duplicate_ts": False,
+                                "retrograde_ts_rejected": False,
+                                "clock_jitter_ts": clock_jitter_ts,
+                                "spread_outlier_warning": spread_outlier_warning,
                             }
                         )
                         if max_recs > 0:

@@ -12,6 +12,7 @@ from typing import Any, Callable, Iterable
 
 import numpy as np
 
+from .feature_contracts import V2_MULTISCALE_FEATURE_NAMES, V3_EXIT_AWARE_FEATURE_NAMES
 from .ml_dataset import (
     FEATURE_NAMES,
     _block_threshold_counts,
@@ -39,11 +40,18 @@ GATE_03_DISAPPEARED_WARN_RATE = 0.20
 GATE_03_DISAPPEARED_FAIL_RATE = 0.95
 GATE_03_INTERMITTENT_WARN_RATE = 0.15
 GATE_03_INTERMITTENT_FAIL_RATE = 0.70
+GATE_05_DEGENERATE_VARIANCE_EPS = 1e-10
+GATE_05_NAN_FRACTION_FAIL = 0.05
+GATE_05_ZERO_HEAVY_WARN = 0.80
+GATE_05_V3_V2_VARIANCE_RATIO_WARN = 0.10
 GATE_06_MIN_EPISODE_DURATION_SEC = 30.0
+GATE_06_EPISODE_COMPLETENESS_FAIL = 0.50
+GATE_06_EPISODE_COMPLETENESS_WARN = 0.80
 GATE_12_MIN_RECORDS_PER_ACTIVE_HOUR = 10.0
 GATE_12_OUTLIER_HOUR_RATE_THRESHOLD = 0.15
 GATE_12_PAIR_QUALITY_FAIL_RATE = 0.15
 GATE_12_EPISODE_OUTLIER_FAIL_RATE = 0.02
+GATE_10_TEMPORAL_STATIONARITY_CV_WARN = 1.50
 
 
 def _normalize_threshold_values(thresholds: list[float] | None) -> list[float]:
@@ -1028,6 +1036,191 @@ def _zero_return_ratio(values: list[float]) -> float:
     return float(zero_returns / max(len(values) - 1, 1))
 
 
+def _feature_quality_diagnostics(bundle: Any) -> dict[str, Any]:
+    if bundle is None or getattr(bundle, "X", None) is None:
+        return {
+            "feature_count": 0,
+            "degenerate_features": [],
+            "nan_fraction_failures": [],
+            "inf_fraction_failures": [],
+            "zero_heavy_v3_features": [],
+            "v3_vs_v2_variance_ratio": 0.0,
+        }
+    feature_tensor = bundle.X.detach().cpu().numpy()
+    if feature_tensor.size <= 0:
+        return {
+            "feature_count": int(feature_tensor.shape[-1]) if feature_tensor.ndim >= 1 else 0,
+            "degenerate_features": [],
+            "nan_fraction_failures": [],
+            "inf_fraction_failures": [],
+            "zero_heavy_v3_features": [],
+            "v3_vs_v2_variance_ratio": 0.0,
+        }
+    feature_view = feature_tensor.reshape(-1, feature_tensor.shape[-1])
+    feature_names = list(getattr(bundle, "feature_names", FEATURE_NAMES[: feature_view.shape[1]]))
+    variances = np.var(feature_view, axis=0)
+    nan_fraction = np.mean(np.isnan(feature_view), axis=0)
+    inf_fraction = np.mean(np.isinf(feature_view), axis=0)
+    zero_fraction = np.mean(np.abs(feature_view) <= 1e-12, axis=0)
+    degenerate_features = [
+        {
+            "feature": str(feature_names[index]),
+            "variance": float(variances[index]),
+            "nan_fraction": float(nan_fraction[index]),
+            "inf_fraction": float(inf_fraction[index]),
+            "zero_fraction": float(zero_fraction[index]),
+        }
+        for index in range(len(feature_names))
+        if float(variances[index]) <= GATE_05_DEGENERATE_VARIANCE_EPS
+    ]
+    nan_fraction_failures = [
+        {
+            "feature": str(feature_names[index]),
+            "nan_fraction": float(nan_fraction[index]),
+        }
+        for index in range(len(feature_names))
+        if float(nan_fraction[index]) > GATE_05_NAN_FRACTION_FAIL
+    ]
+    inf_fraction_failures = [
+        {
+            "feature": str(feature_names[index]),
+            "inf_fraction": float(inf_fraction[index]),
+        }
+        for index in range(len(feature_names))
+        if float(inf_fraction[index]) > 0.0
+    ]
+    v3_extra_features = set(V3_EXIT_AWARE_FEATURE_NAMES) - set(V2_MULTISCALE_FEATURE_NAMES)
+    zero_heavy_v3_features = [
+        {
+            "feature": str(feature_names[index]),
+            "zero_fraction": float(zero_fraction[index]),
+        }
+        for index in range(len(feature_names))
+        if str(feature_names[index]) in v3_extra_features and float(zero_fraction[index]) > GATE_05_ZERO_HEAVY_WARN
+    ]
+    v2_indices = [
+        index for index, feature_name in enumerate(feature_names)
+        if str(feature_name) in set(V2_MULTISCALE_FEATURE_NAMES)
+    ]
+    v3_indices = [
+        index for index, feature_name in enumerate(feature_names)
+        if str(feature_name) in v3_extra_features
+    ]
+    v2_mean_variance = float(np.mean(variances[v2_indices])) if v2_indices else 0.0
+    v3_mean_variance = float(np.mean(variances[v3_indices])) if v3_indices else 0.0
+    variance_ratio = (
+        float(v3_mean_variance / max(v2_mean_variance, 1e-12))
+        if v3_indices and v2_indices
+        else 0.0
+    )
+    return {
+        "feature_count": len(feature_names),
+        "degenerate_features": degenerate_features,
+        "nan_fraction_failures": nan_fraction_failures,
+        "inf_fraction_failures": inf_fraction_failures,
+        "zero_heavy_v3_features": zero_heavy_v3_features,
+        "v2_feature_count": len(v2_indices),
+        "v3_extra_feature_count": len(v3_indices),
+        "v2_mean_variance": float(v2_mean_variance),
+        "v3_mean_variance": float(v3_mean_variance),
+        "v3_vs_v2_variance_ratio": float(variance_ratio),
+    }
+
+
+def _episode_completeness_diagnostics(episodes: list[Any]) -> dict[str, Any]:
+    closed_episodes = [episode for episode in episodes if bool(getattr(episode, "is_closed", True))]
+    complete_count = 0
+    invalid_closed_episodes: list[dict[str, Any]] = []
+    for episode in closed_episodes:
+        peak = getattr(episode, "peak_entry_spread", None)
+        exit_spread = getattr(episode, "exit_spread_at_close", None)
+        duration = getattr(episode, "duration_sec", None)
+        is_complete = all(
+            value is not None and math.isfinite(float(value))
+            for value in (peak, exit_spread, duration)
+        ) and float(duration or 0.0) >= 0.0
+        if is_complete:
+            complete_count += 1
+            continue
+        invalid_closed_episodes.append(
+            {
+                "peak_entry_spread": 0.0 if peak is None else float(peak),
+                "exit_spread_at_close": 0.0 if exit_spread is None else float(exit_spread),
+                "duration_sec": 0.0 if duration is None else float(duration),
+            }
+        )
+    closed_count = len(closed_episodes)
+    completeness_rate = float(complete_count / max(closed_count, 1)) if closed_count > 0 else 1.0
+    return {
+        "closed_episode_count": int(closed_count),
+        "complete_closed_episode_count": int(complete_count),
+        "closed_episode_completeness_rate": float(completeness_rate),
+        "invalid_closed_episode_count": int(len(invalid_closed_episodes)),
+        "invalid_closed_episode_examples": invalid_closed_episodes[:10],
+        "abandoned_episode_count": int(sum(1 for episode in episodes if not bool(getattr(episode, "is_closed", True)))),
+    }
+
+
+def _temporal_stationarity_diagnostics(bundle: Any) -> dict[str, Any]:
+    if bundle is None or int(bundle.summary.get("num_samples", 0) or 0) <= 0:
+        return {
+            "bin_count": 0,
+            "positive_rate_cv": 0.0,
+            "zero_positive_bins": 0,
+            "warning": False,
+            "bins": [],
+        }
+    ordered_indices = np.argsort(np.asarray(bundle.timestamps, dtype=float))
+    y_class = bundle.y_class.detach().cpu().numpy()[ordered_indices]
+    ordered_ts = np.asarray(bundle.timestamps, dtype=float)[ordered_indices]
+    bin_count = max(4, min(8, int(math.sqrt(max(len(ordered_indices), 1)))))
+    bin_count = min(bin_count, len(ordered_indices)) if len(ordered_indices) > 0 else 0
+    if bin_count <= 0:
+        return {
+            "bin_count": 0,
+            "positive_rate_cv": 0.0,
+            "zero_positive_bins": 0,
+            "warning": False,
+            "bins": [],
+        }
+    bins: list[dict[str, Any]] = []
+    rates: list[float] = []
+    zero_positive_bins = 0
+    for bin_indices in np.array_split(np.arange(len(ordered_indices)), bin_count):
+        if bin_indices.size <= 0:
+            continue
+        bin_labels = y_class[bin_indices]
+        positive_count = int(np.sum(bin_labels >= 0.5))
+        sample_count = int(bin_indices.size)
+        positive_rate = float(positive_count / max(sample_count, 1))
+        if positive_count <= 0:
+            zero_positive_bins += 1
+        rates.append(positive_rate)
+        bins.append(
+            {
+                "start_ts": float(ordered_ts[int(bin_indices[0])]),
+                "end_ts": float(ordered_ts[int(bin_indices[-1])]),
+                "samples": sample_count,
+                "positive_samples": positive_count,
+                "positive_rate": positive_rate,
+            }
+        )
+    mean_rate = float(np.mean(rates)) if rates else 0.0
+    positive_rate_cv = (
+        float(np.std(np.asarray(rates, dtype=float)) / max(mean_rate, 1e-12))
+        if rates and mean_rate > 0.0
+        else (float("inf") if zero_positive_bins > 0 else 0.0)
+    )
+    warning = bool(positive_rate_cv > GATE_10_TEMPORAL_STATIONARITY_CV_WARN or zero_positive_bins > 0)
+    return {
+        "bin_count": int(bin_count),
+        "positive_rate_cv": float(positive_rate_cv),
+        "zero_positive_bins": int(zero_positive_bins),
+        "warning": warning,
+        "bins": bins,
+    }
+
+
 def _build_gate(
     gate_id: str,
     title: str,
@@ -1108,7 +1301,7 @@ def run_training_certification(
     _preloaded_blocks: tuple[list, float, dict] | None = None,
     _precomputed_segments_by_merge: dict[bool, tuple[list[dict[str, Any]], dict[str, Any]]] | None = None,
     _precomputed_features_by_merge: dict[bool, dict[int, list[list[float]]]] | None = None,
-    _scaffold_cache: dict[tuple[int, int, bool], Any] | None = None,
+    _scaffold_cache: dict[tuple[int, int, bool, int], Any] | None = None,
     window_stride: int = 1,
 ) -> dict[str, Any]:
     state_path = Path(state_file)
@@ -1425,8 +1618,40 @@ def run_training_certification(
                         metrics = _score_shift(first_half[:, index].tolist(), second_half[:, index].tolist())
                         if float(metrics["score"]) > 3.0:
                             drifted_features.append({"feature": feature_name, **metrics})
-            gate05_status = "FAIL" if len(drifted_features) > 3 else ("WARNING" if drifted_features else "PASS")
-            _persist_gate(_build_gate("gate_05_intra_soak_feature_drift", "Intra-soak feature drift", status=gate05_status, failure_reasons=["intra_soak_feature_drift"] if len(drifted_features) > 3 else [], warnings=["intra_soak_feature_drift"] if 0 < len(drifted_features) <= 3 else [], details={"drifted_features": drifted_features, "feature_count": len(getattr(bundle, "feature_names", FEATURE_NAMES)) if bundle is not None else len(FEATURE_NAMES)}))
+            feature_quality = _feature_quality_diagnostics(bundle)
+            gate05_failures: list[str] = []
+            gate05_warnings: list[str] = []
+            if len(drifted_features) > 3:
+                gate05_failures.append("intra_soak_feature_drift")
+            elif drifted_features:
+                gate05_warnings.append("intra_soak_feature_drift")
+            if feature_quality["degenerate_features"]:
+                gate05_failures.append("degenerate_features_detected")
+            if feature_quality["nan_fraction_failures"]:
+                gate05_failures.append("feature_nan_fraction_failed")
+            if feature_quality["inf_fraction_failures"]:
+                gate05_failures.append("feature_inf_fraction_failed")
+            if feature_quality["zero_heavy_v3_features"]:
+                gate05_warnings.append("zero_heavy_v3_features")
+            if (
+                float(feature_quality.get("v3_vs_v2_variance_ratio", 0.0) or 0.0) > 0.0
+                and float(feature_quality.get("v3_vs_v2_variance_ratio", 0.0) or 0.0) < GATE_05_V3_V2_VARIANCE_RATIO_WARN
+            ):
+                gate05_warnings.append("v3_feature_variance_ratio_low")
+            gate05_status = "FAIL" if gate05_failures else ("WARNING" if gate05_warnings else "PASS")
+            _persist_gate(
+                _build_gate(
+                    "gate_05_intra_soak_feature_drift",
+                    "Intra-soak feature drift",
+                    status=gate05_status,
+                    failure_reasons=gate05_failures,
+                    warnings=gate05_warnings,
+                    details={
+                        "drifted_features": drifted_features,
+                        **feature_quality,
+                    },
+                )
+            )
 
         _check_timeout()
         total_spreads = (
@@ -1443,6 +1668,7 @@ def run_training_certification(
         episodes_per_hour = float(episode_count / max(session_hours, 1.0 / 3600.0))
         gate06_failures = []
         gate06_warnings = []
+        episode_completeness = _episode_completeness_diagnostics(episodes)
         if episode_count <= 0:
             gate06_failures.append("no_qualified_episodes")
         elif episodes_per_hour < 0.5:
@@ -1456,6 +1682,12 @@ def run_training_certification(
             or duration_p50 >= float(prediction_horizon_sec)
         ):
             gate06_failures.append("episode_quality_degraded")
+        completeness_rate = float(episode_completeness.get("closed_episode_completeness_rate", 1.0) or 1.0)
+        if int(episode_completeness.get("closed_episode_count", 0) or 0) > 0:
+            if completeness_rate < GATE_06_EPISODE_COMPLETENESS_FAIL:
+                gate06_failures.append("episode_field_completeness_failed")
+            elif completeness_rate < GATE_06_EPISODE_COMPLETENESS_WARN:
+                gate06_warnings.append("episode_field_completeness_degraded")
         _persist_gate(
             _build_gate(
                 "gate_06_episode_yield",
@@ -1470,6 +1702,9 @@ def run_training_certification(
                     "prediction_horizon_sec": float(prediction_horizon_sec),
                     "total_spread_quantiles": {"p50": total_spread_p50, "p90": _percentile(total_spreads, 90.0)},
                     "duration_sec_quantiles": {"p50": duration_p50, "p90": _percentile(durations, 90.0)},
+                    **episode_completeness,
+                    "episode_completeness_fail_threshold": GATE_06_EPISODE_COMPLETENESS_FAIL,
+                    "episode_completeness_warn_threshold": GATE_06_EPISODE_COMPLETENESS_WARN,
                 },
             )
         )
@@ -1602,6 +1837,7 @@ def run_training_certification(
             dual_summary: list[dict[str, Any]] = []
             qualifying_configs: list[str] = []
             failure_counter: Counter[str] = Counter()
+            temporal_stationarity = _temporal_stationarity_diagnostics(bundle)
             # Use pre-computed segments + features if available, otherwise build per merge mode
             _eff_gap = max_session_gap_sec
             if _eff_gap is None and _cached_blocks_tuple is not None:
@@ -1720,7 +1956,23 @@ def run_training_certification(
                     else:
                         failure_counter.update(reason_list)
                 dual_summary.append(config_entry)
-            _persist_gate(_build_gate("gate_10_dual_mode_preflight", "Dual-mode preflight", status="PASS" if qualifying_configs else "FAIL", failure_reasons=list(failure_counter.keys()) if not qualifying_configs else [], details={"qualifying_configs": qualifying_configs, "configs": dual_summary, "dataset_fingerprints": dataset_fingerprints}))
+            gate10_warnings = ["label_temporal_stationarity_warning"] if bool(temporal_stationarity.get("warning", False)) else []
+            gate10_status = "FAIL" if not qualifying_configs else ("WARNING" if gate10_warnings else "PASS")
+            _persist_gate(
+                _build_gate(
+                    "gate_10_dual_mode_preflight",
+                    "Dual-mode preflight",
+                    status=gate10_status,
+                    failure_reasons=list(failure_counter.keys()) if not qualifying_configs else [],
+                    warnings=gate10_warnings,
+                    details={
+                        "qualifying_configs": qualifying_configs,
+                        "configs": dual_summary,
+                        "dataset_fingerprints": dataset_fingerprints,
+                        "temporal_stationarity": temporal_stationarity,
+                    },
+                )
+            )
 
         _check_timeout()
         if quick_sqlite_metrics is not None:

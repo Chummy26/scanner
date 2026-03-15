@@ -47,12 +47,19 @@ def _make_bundle(
     interval_p50: float = 15.0,
     ratio_p90: float = 1.2,
 ) -> SimpleNamespace:
-    feature_count = 10
-    rows = torch.full((num_samples, 2, feature_count), 0.25, dtype=torch.float32)
+    feature_count = len(tc.FEATURE_NAMES)
+    half_samples = max(num_samples // 2, 1)
+    half_rows = torch.arange(half_samples * 2 * feature_count, dtype=torch.float32).reshape(half_samples, 2, feature_count)
+    half_rows = (half_rows / 1000.0) + 0.25
+    rows = torch.cat([half_rows, half_rows.clone()], dim=0)
+    if rows.shape[0] < num_samples:
+        rows = torch.cat([rows, half_rows[:1].clone()], dim=0)
+    rows = rows[:num_samples]
     return SimpleNamespace(
         X=rows,
         y_class=torch.ones(num_samples, dtype=torch.float32),
         y_eta=torch.full((num_samples,), 120.0, dtype=torch.float32),
+        feature_names=list(tc.FEATURE_NAMES),
         timestamps=[float(index * 60) for index in range(num_samples)],
         summary={
             "num_samples": num_samples,
@@ -506,6 +513,93 @@ def test_certification_gate6_no_longer_requires_spread_median_above_threshold(tm
     assert gate06["details"]["total_spread_quantiles"]["p50"] < 0.8
 
 
+def test_certification_gate05_fails_on_degenerate_features(tmp_path: Path, monkeypatch):
+    degenerate_bundle = SimpleNamespace(
+        X=torch.zeros((32, 2, len(tc.FEATURE_NAMES)), dtype=torch.float32),
+        y_class=torch.ones(32, dtype=torch.float32),
+        y_eta=torch.full((32,), 120.0, dtype=torch.float32),
+        feature_names=list(tc.FEATURE_NAMES),
+        timestamps=[float(index * 60) for index in range(32)],
+        summary={
+            "num_samples": 32,
+            "block_diagnostics": {
+                "inter_record_interval_sec_quantiles": {"p50": 15.0},
+                "max_to_median_interval_ratio_quantiles": {"p90": 1.2},
+                "irregular_block_count": 0,
+            },
+        },
+    )
+    state_path = _install_base_mocks(
+        monkeypatch,
+        tmp_path,
+        records=_make_records("PAIR_A"),
+        episodes=[DummyEpisode(1.20, 0.20, 120.0), DummyEpisode(1.15, 0.18, 140.0)],
+        bundle=degenerate_bundle,
+    )
+
+    payload = tc.run_training_certification(
+        state_file=state_path,
+        artifact_dir=tmp_path / "artifacts",
+        sequence_length=4,
+        prediction_horizon_sec=240,
+        thresholds=[0.8],
+        selected_session_ids=None,
+        selected_block_ids=None,
+        allow_cross_session_merge=False,
+        max_session_gap_sec=None,
+        regime_shift_score_threshold=3.0,
+        certification_mode="full",
+        max_certification_duration_sec=300,
+        allow_legacy_sessions=False,
+        runtime_audit_dir=None,
+        run_reconnection_stress=False,
+        preflight_fn=_preflight_ok,
+        dataset_fingerprint_fn=_fingerprint,
+    )
+
+    gate05 = payload["gate_results"]["gate_05_intra_soak_feature_drift"]
+    assert gate05["status"] == "FAIL"
+    assert "degenerate_features_detected" in gate05["failure_reasons"]
+
+
+def test_certification_gate06_fails_on_incomplete_closed_episode_fields(tmp_path: Path, monkeypatch):
+    state_path = _install_base_mocks(
+        monkeypatch,
+        tmp_path,
+        records=_make_records("PAIR_A"),
+        episodes=[
+            DummyEpisode(1.20, 0.20, 120.0),
+            DummyEpisode(1.15, 0.18, -1.0),
+            DummyEpisode(1.25, 0.22, -2.0),
+        ],
+        runtime_hours=1.0,
+    )
+
+    payload = tc.run_training_certification(
+        state_file=state_path,
+        artifact_dir=tmp_path / "artifacts",
+        sequence_length=4,
+        prediction_horizon_sec=240,
+        thresholds=[0.8],
+        selected_session_ids=None,
+        selected_block_ids=None,
+        allow_cross_session_merge=False,
+        max_session_gap_sec=None,
+        regime_shift_score_threshold=3.0,
+        certification_mode="full",
+        max_certification_duration_sec=300,
+        allow_legacy_sessions=False,
+        runtime_audit_dir=None,
+        run_reconnection_stress=False,
+        preflight_fn=_preflight_ok,
+        dataset_fingerprint_fn=_fingerprint,
+    )
+
+    gate06 = payload["gate_results"]["gate_06_episode_yield"]
+    assert gate06["status"] == "FAIL"
+    assert "episode_field_completeness_failed" in gate06["failure_reasons"]
+
+
 def test_certification_gate12b_excludes_pairs_failed_by_12a(tmp_path: Path, monkeypatch):
     frozen_pair = [
         {"pair_id": "PAIR_A", "session_id": 101, "block_id": 1001, "timestamp": float(index * 60), "entry_spread": 0.25, "exit_spread": -0.10}
@@ -779,6 +873,10 @@ def test_certification_gate12_fails_when_outlier_pair_rate_exceeds_threshold(tmp
 
 
 def test_run_clean_training_cycle_blocks_on_failed_certification(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(
+        "src.spread.train_model._load_blocks_from_sqlite",
+        lambda *args, **kwargs: ([], 0.0, {"num_blocks": 0, "num_sessions": 0}),
+    )
     monkeypatch.setattr(
         "src.spread.train_model.certify_data_for_training",
         lambda **kwargs: {"certified": False, "failure_reasons": ["runtime_health_failed"]},

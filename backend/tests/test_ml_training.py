@@ -520,6 +520,48 @@ def _write_multi_session_sqlite_with_spacing(
     return path
 
 
+def _write_rich_training_multi_session_sqlite(
+    path: Path,
+    *,
+    num_sessions: int = 4,
+    pairs_per_session: int = 30,
+) -> Path:
+    session_span_sec = max((pairs_per_session + 5) * 10_000, 100_000)
+    for session_index in range(num_sessions):
+        tracker = SpreadTracker(
+            window_sec=604800,
+            record_interval_sec=60.0,
+            max_records_per_pair=0,
+            epsilon_pct=0.0,
+            history_enable_entry_spread_pct=0.0,
+            track_enable_entry_spread_pct=0.0,
+            db_path=path,
+            gap_threshold_sec=120.0,
+        )
+        for pair_index in range(pairs_per_session):
+            pair_payload = _make_pair(
+                base_ts=1_710_000_000 + (session_index * session_span_sec) + (pair_index * 10_000),
+                positive=True,
+                offset=(pair_index % 5) * 0.005,
+            )
+            symbol = f"TRAIN_{session_index:02d}_{pair_index:02d}"
+            for record in pair_payload["records"]:
+                tracker.record_spread(
+                    symbol,
+                    "mexc",
+                    "spot",
+                    "gate",
+                    "futures",
+                    record["entry"],
+                    record["exit"],
+                    now_ts=float(record["ts"]),
+                )
+        ended_at = float(1_710_000_000 + (session_index * session_span_sec) + (pairs_per_session * 10_000))
+        assert tracker.flush_to_storage(now_ts=ended_at, force=True)
+        tracker.close_active_session(ended_at=ended_at)
+    return path
+
+
 def _write_same_pair_multi_session_merge_sqlite(
     path: Path,
     *,
@@ -1190,9 +1232,10 @@ def test_threshold_preflight_reports_cross_session_merge_mode_and_failure_reason
 
 
 def test_dataset_fingerprint_is_stable_when_only_sqlite_mtime_changes(tmp_path: Path):
-    sqlite_path = _write_tracker_sqlite(
+    sqlite_path = _write_rich_training_multi_session_sqlite(
         tmp_path / "tracker_history_fingerprint.sqlite",
-        json.loads(_write_tracker_state(tmp_path / "tracker_state_fingerprint.json").read_text(encoding="utf-8"))["pairs"],
+        num_sessions=4,
+        pairs_per_session=180,
     )
     artifact_dir_a = tmp_path / "artifacts_a"
     artifact_dir_b = tmp_path / "artifacts_b"
@@ -1202,6 +1245,7 @@ def test_dataset_fingerprint_is_stable_when_only_sqlite_mtime_changes(tmp_path: 
         artifact_dir=artifact_dir_a,
         sequence_length=4,
         prediction_horizon_sec=240,
+        window_stride=1,
         hidden_size=8,
         num_layers=1,
         dropout=0.0,
@@ -1219,6 +1263,7 @@ def test_dataset_fingerprint_is_stable_when_only_sqlite_mtime_changes(tmp_path: 
         artifact_dir=artifact_dir_b,
         sequence_length=4,
         prediction_horizon_sec=240,
+        window_stride=1,
         hidden_size=8,
         num_layers=1,
         dropout=0.0,
@@ -1235,9 +1280,11 @@ def test_dataset_fingerprint_is_stable_when_only_sqlite_mtime_changes(tmp_path: 
 
 
 def test_run_training_loop_saves_artifacts_and_beats_negative_baseline(tmp_path: Path):
-    json_state = _write_tracker_state(tmp_path / "tracker_state.json")
-    payload = json.loads(json_state.read_text(encoding="utf-8"))
-    state_path = _write_tracker_sqlite(tmp_path / "tracker_history.sqlite", payload["pairs"])
+    state_path = _write_rich_training_multi_session_sqlite(
+        tmp_path / "tracker_history.sqlite",
+        num_sessions=4,
+        pairs_per_session=180,
+    )
     artifact_dir = tmp_path / "artifacts"
 
     report = run_training_loop(
@@ -1245,6 +1292,7 @@ def test_run_training_loop_saves_artifacts_and_beats_negative_baseline(tmp_path:
         artifact_dir=artifact_dir,
         sequence_length=4,
         prediction_horizon_sec=240,
+        window_stride=1,
         hidden_size=8,
         num_layers=1,
         dropout=0.0,
@@ -1355,7 +1403,7 @@ def test_threshold_preflight_reports_block_window_feasibility(tmp_path: Path):
         min_test_positive_samples=0,
     )
 
-    block_diagnostics = preflight["block_diagnostics"]
+    block_diagnostics = preflight["block_diagnostics"] or preflight["thresholds"]["1.0"]["block_diagnostics"]
     assert block_diagnostics["record_count_threshold_counts"]["ge_8"] == 3
     assert block_diagnostics["record_count_threshold_counts"]["ge_10"] == 2
     assert block_diagnostics["record_count_threshold_counts"]["ge_12"] == 2
@@ -1469,7 +1517,11 @@ def test_clean_training_cycle_archives_existing_artifacts_and_writes_preflight(m
 
 
 def test_run_training_loop_accepts_session_chronological_split(tmp_path: Path):
-    sqlite_path = _write_multi_session_sqlite(tmp_path / "tracker_history_sessions.sqlite", num_sessions=4)
+    sqlite_path = _write_rich_training_multi_session_sqlite(
+        tmp_path / "tracker_history_sessions.sqlite",
+        num_sessions=4,
+        pairs_per_session=180,
+    )
     artifact_dir = tmp_path / "artifacts_sessions"
 
     report = run_training_loop(
@@ -1477,6 +1529,7 @@ def test_run_training_loop_accepts_session_chronological_split(tmp_path: Path):
         artifact_dir=artifact_dir,
         sequence_length=4,
         prediction_horizon_sec=240,
+        window_stride=1,
         hidden_size=8,
         num_layers=1,
         dropout=0.0,

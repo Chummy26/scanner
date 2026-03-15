@@ -775,3 +775,31 @@ def test_tracker_rejects_invalid_numeric_records_before_persistence(tmp_path: Pa
     assert storage["invalid_record_rejections_total"] == 1
     assert storage["invalid_entry_rejections_total"] == 0
     assert storage["invalid_exit_rejections_total"] == 1
+
+
+def test_tracker_tracks_duplicate_ts_retrograde_and_clock_jitter(tmp_path: Path):
+    tracker = SpreadTracker(
+        window_sec=3600,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=tmp_path / "tracker.sqlite",
+    )
+    pair = ("BTC", "mexc", "spot", "gate", "futures")
+
+    tracker.record_spread(*pair, 0.25, -0.10, now_ts=15.0)
+    tracker.record_spread(*pair, 0.26, -0.09, now_ts=15.0)
+    tracker.record_spread(*pair, 0.27, -0.08, now_ts=14.7)
+    tracker.record_spread(*pair, 0.28, -0.07, now_ts=14.0)
+    tracker.record_spread(*pair, 0.29, -0.06, now_ts=30.0)
+
+    stats = tracker.get_pair_stats(*pair)
+    history = tracker.get_history(*pair, limit=10)
+
+    assert stats is not None
+    assert stats["exact_duplicate_ts_rejections"] == 1
+    assert stats["retrograde_ts_rejections"] == 1
+    assert stats["clock_jitter_events"] == 1
+    assert len(history) == 2
