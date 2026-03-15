@@ -26,6 +26,10 @@ from .ml_dataset import (
 )
 from .spread_tracker import SpreadRecord, compute_closed_episodes
 
+import logging
+
+_cert_logger = logging.getLogger("certification")
+
 CHECKPOINT_WINDOW_SEC = 30 * 60
 DEFAULT_CERTIFICATION_THRESHOLDS = [0.8, 1.0, 1.2]
 DEFAULT_CERTIFICATION_LABEL_PERCENTILES = [60, 70, 80]
@@ -1394,9 +1398,26 @@ def run_training_certification(
         if (time.perf_counter() - started_at) > float(max_certification_duration_sec):
             raise TimeoutError("certification_timeout")
 
+    _critical_failure_detected = False
+
     def _persist_gate(gate: dict[str, Any]) -> dict[str, Any]:
+        nonlocal _critical_failure_detected
         gate_results[str(gate["gate_id"])] = gate
         write_json(gate_dir / f"{gate['gate_id']}.json", gate)
+        status = str(gate.get("status", ""))
+        gate_id = str(gate.get("gate_id", ""))
+        title = str(gate.get("title", gate_id))
+        elapsed = time.perf_counter() - started_at
+        if status == "FAIL":
+            reasons = gate.get("failure_reasons", [])
+            _cert_logger.warning("FAIL  %s (%s) [%.0fs] -- %s", gate_id, title, elapsed, ", ".join(reasons))
+            _critical_failure_detected = True
+        elif status == "WARNING":
+            _cert_logger.info("WARN  %s (%s) [%.0fs]", gate_id, title, elapsed)
+        elif status == "SKIPPED":
+            _cert_logger.info("SKIP  %s (%s) [%.0fs]", gate_id, title, elapsed)
+        else:
+            _cert_logger.info("PASS  %s (%s) [%.0fs]", gate_id, title, elapsed)
         return gate
 
     def _skip_gate(gate_id: str, title: str, reason: str) -> dict[str, Any]:
@@ -1823,14 +1844,17 @@ def run_training_certification(
             _persist_gate(_build_gate("gate_08_reconnection_stress", "Reconnection stress", status="FAIL" if disconnects > reconnects else "PASS", failure_reasons=["reconnection_stress_failed"] if disconnects > reconnects else [], details={"executed": True, "disconnect_count": disconnects, "reconnect_count": reconnects}))
 
         _check_timeout()
-        if str(certification_mode).lower() == "quick":
+        # Early exit: skip gate_10 (expensive) if critical gates already failed
+        if _critical_failure_detected and str(certification_mode).lower() != "quick":
+            _cert_logger.warning("Skipping gate_10 (dual-mode preflight) — earlier gates already FAILED.")
+        if _critical_failure_detected or str(certification_mode).lower() == "quick":
             _persist_gate(
                 _build_gate(
                     "gate_10_dual_mode_preflight",
                     "Dual-mode preflight",
                     status="SKIPPED",
-                    warnings=["dual_preflight_skipped_in_quick_mode"],
-                    details={"executed": False, "reason": "quick_mode"},
+                    warnings=["dual_preflight_skipped_in_quick_mode"] if str(certification_mode).lower() == "quick" else ["skipped_due_to_prior_failures"],
+                    details={"executed": False, "reason": "quick_mode" if str(certification_mode).lower() == "quick" else "prior_gate_failures"},
                 )
             )
         else:

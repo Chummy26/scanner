@@ -2295,9 +2295,38 @@ def run_clean_training_cycle(
         window_stride=window_stride,
     )
     if not bool(certification.get("certified")):
+        _action_map = {
+            "integrity_anomaly": "SQLite has structural corruption (record count mismatches, range errors). Re-run soak or check tracker.",
+            "audit_sqlite_inconsistency": "Runtime audit counts diverge from SQLite. The tracker may have missed writes. Re-soak with latest tracker.",
+            "tracker_sqlite_count_divergence": "Pair/record counts differ between runtime tracker and SQLite. Re-soak to synchronize.",
+            "runtime_audit_stale": "Runtime audit package is older than 24h. Run a fresh soak before training.",
+            "runtime_health_failed": "Runtime audit shows disconnects, memory growth, or errors. Check tracker health during soak.",
+            "right_censoring_present": "Some windows extend beyond observable data. May need longer soak duration or shorter prediction_horizon.",
+            "intra_block_irregularity": "Block recording intervals are irregular (gaps or bursts). Check exchange connection stability.",
+            "temporal_instability": "Feature distributions shift across time checkpoints. Dataset may span regime changes.",
+            "excessive_intra_block_irregularity": "Too many blocks with irregular timing. Exchange connection was unstable during soak.",
+            "certification_timeout": f"Certification exceeded {max_certification_duration_sec}s. Dataset may be too large for current timeout.",
+            "reconnection_stress_failed": "More disconnects than reconnects. Tracker reconnection is unreliable.",
+        }
+        _reasons = certification.get("failure_reasons", []) or ["unknown_certification_failure"]
+        _gate_summary = []
+        for _gid, _gate in sorted(certification.get("gate_results", {}).items()):
+            _st = _gate.get("status", "?")
+            if _st == "FAIL":
+                _gate_summary.append(f"  FAIL {_gid}: {', '.join(_gate.get('failure_reasons', []))}")
+            elif _st == "WARNING":
+                _gate_summary.append(f"  WARN {_gid}: {', '.join(_gate.get('warnings', []))}")
+        _actions = [f"  - {r}: {_action_map.get(r, 'Investigate manually.')}" for r in _reasons]
+        _msg = (
+            "Training data certification FAILED.\n\n"
+            "Gate results:\n" + "\n".join(_gate_summary) + "\n\n"
+            "Actions:\n" + "\n".join(_actions) + "\n\n"
+            f"Full report: {artifact_root / 'data_certification.json'}"
+        )
+        logger.error(_msg)
         raise ValueError(
             "Training data certification failed: "
-            + ", ".join(certification.get("failure_reasons", []) or ["unknown_certification_failure"])
+            + ", ".join(_reasons)
         )
     effective_scope = dict(certification.get("effective_session_scope") or {})
     effective_session_ids = [
