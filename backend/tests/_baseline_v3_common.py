@@ -329,7 +329,32 @@ def collect_episode_v3_completeness(db_path: Path, *, since_ts: float | None = N
                   AND exit_spread_at_close IS NOT NULL
                   AND peak_entry_spread IS NOT NULL
                   AND duration_sec IS NOT NULL
-                  AND duration_sec > 0
+                  AND duration_sec >= 0
+                  AND peak_entry_spread = peak_entry_spread
+                  AND exit_spread_at_close = exit_spread_at_close
+                  AND duration_sec = duration_sec
+                """,
+                params,
+            ).fetchone()[0]
+        )
+        peak_positive = int(
+            conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM tracker_pair_episodes
+                {where_sql}
+                  AND peak_entry_spread > 0
+                """,
+                params,
+            ).fetchone()[0]
+        )
+        exit_zero = int(
+            conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM tracker_pair_episodes
+                {where_sql}
+                  AND exit_spread_at_close = 0
                 """,
                 params,
             ).fetchone()[0]
@@ -337,6 +362,14 @@ def collect_episode_v3_completeness(db_path: Path, *, since_ts: float | None = N
     completeness_rate = float(complete_total / max(closed_total, 1)) if closed_total > 0 else 0.0
     return {
         "closed_episode_count": closed_total,
+        "complete_gate06_episode_count": complete_total,
+        "gate06_completeness_rate": completeness_rate,
+        "peak_positive_episode_count": peak_positive,
+        "peak_positive_rate": float(peak_positive / max(closed_total, 1)) if closed_total > 0 else 0.0,
+        "peak_non_positive_episode_count": int(max(closed_total - peak_positive, 0)),
+        "peak_non_positive_rate": float(max(closed_total - peak_positive, 0) / max(closed_total, 1)) if closed_total > 0 else 0.0,
+        "exit_zero_episode_count": exit_zero,
+        "exit_zero_rate": float(exit_zero / max(closed_total, 1)) if closed_total > 0 else 0.0,
         "complete_v3_episode_count": complete_total,
         "v3_completeness_rate": completeness_rate,
         "since_ts": None if since_ts is None else float(since_ts),

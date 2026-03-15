@@ -138,7 +138,9 @@ def run_t0_check(
                 (
                     "Quality",
                     [
-                        f"- v3_completeness_rate: `{float(episode_v3.get('v3_completeness_rate', 0.0) or 0.0):.4f}`",
+                        f"- gate06_completeness_rate: `{float(episode_v3.get('gate06_completeness_rate', episode_v3.get('v3_completeness_rate', 0.0)) or 0.0):.4f}`",
+                        f"- peak_non_positive_rate: `{float(episode_v3.get('peak_non_positive_rate', 0.0) or 0.0):.4f}`",
+                        f"- exit_zero_rate: `{float(episode_v3.get('exit_zero_rate', 0.0) or 0.0):.4f}`",
                         f"- positive_episode_rate: `{float(positive_estimate.get('positive_rate', 0.0) or 0.0):.4f}`",
                         f"- interval_p50_sec: `{float(interval_regularity.get('interval_p50_sec', 0.0) or 0.0):.4f}`",
                         f"- quick_cert_verdict: `{quick_cert_summary.get('verdict', 'UNKNOWN')}`",

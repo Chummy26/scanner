@@ -68,14 +68,18 @@ define completeness e informativeness como propriedades fundamentais.
 
 **Onde:** training_certification.py, junto com gate_06 ou como extensão
 **O que:** Query nos episódios fechados:
-- % com exit_spread_at_close != 0 AND != NULL
-- % com peak_entry_spread > 0
-- % com duration_sec > 0
+- % com `exit_spread_at_close IS NOT NULL`
+- % com `peak_entry_spread IS NOT NULL`
+- % com `duration_sec >= 0`
+- todos os 3 campos devem ser finitos
 **Threshold BLOCK:** Se < 50% dos episódios têm os 3 campos
 **Threshold WARN:** Se < 80%
 **Por quê:** Se os dados foram colectados antes de o TrackerEpisode gravar estes campos,
 as features v3 de ciclo (mean_total_spread, reversion_speed, close_rate) e exit
 (mean_exit, exit_p10) serão todas zero. O treino v3 seria equivalente ao v2.
+**Nota importante:** `peak_entry_spread <= 0` e `exit_spread_at_close = 0.0` são
+resultados de mercado legítimos, não incompletude. Episódios sem entrada favorável
+ou que fecham exatamente no neutro continuam a ser episódios v3 completos.
 **Referência:** Sambasivan et al. (2021, CHI) "Data Cascades" — 92% dos practitioners
 reportam problemas compounding por dados incompletos descobertos tarde.
 
@@ -327,16 +331,29 @@ print(f'Data age: {age_h:.1f}h (need < 8h for fresh snapshot)')
 
 # 2. Episode v3 fields
 total_ep = conn.execute('SELECT COUNT(*) FROM tracker_pair_episodes WHERE is_closed = 1').fetchone()[0]
-with_exit = conn.execute('SELECT COUNT(*) FROM tracker_pair_episodes WHERE is_closed = 1 AND exit_spread_at_close IS NOT NULL AND exit_spread_at_close != 0').fetchone()[0]
-with_peak = conn.execute('SELECT COUNT(*) FROM tracker_pair_episodes WHERE is_closed = 1 AND peak_entry_spread > 0').fetchone()[0]
-with_dur = conn.execute('SELECT COUNT(*) FROM tracker_pair_episodes WHERE is_closed = 1 AND duration_sec > 0').fetchone()[0]
+gate06_complete = conn.execute('''
+    SELECT COUNT(*)
+    FROM tracker_pair_episodes
+    WHERE is_closed = 1
+      AND exit_spread_at_close IS NOT NULL
+      AND peak_entry_spread IS NOT NULL
+      AND duration_sec IS NOT NULL
+      AND duration_sec >= 0
+      AND exit_spread_at_close = exit_spread_at_close
+      AND peak_entry_spread = peak_entry_spread
+      AND duration_sec = duration_sec
+''').fetchone()[0]
+peak_positive = conn.execute('SELECT COUNT(*) FROM tracker_pair_episodes WHERE is_closed = 1 AND peak_entry_spread > 0').fetchone()[0]
+peak_non_positive = conn.execute('SELECT COUNT(*) FROM tracker_pair_episodes WHERE is_closed = 1 AND peak_entry_spread <= 0').fetchone()[0]
+exit_zero = conn.execute('SELECT COUNT(*) FROM tracker_pair_episodes WHERE is_closed = 1 AND exit_spread_at_close = 0').fetchone()[0]
 print(f'\nEpisode v3 completeness:')
 print(f'  Total closed: {total_ep:,}')
-print(f'  With exit:    {with_exit:,} ({100*with_exit/max(total_ep,1):.0f}%)')
-print(f'  With peak:    {with_peak:,} ({100*with_peak/max(total_ep,1):.0f}%)')
-print(f'  With duration:{with_dur:,} ({100*with_dur/max(total_ep,1):.0f}%)')
-v3_ready = with_exit/max(total_ep,1) >= 0.50
-print(f'  V3 READY: {\"YES\" if v3_ready else \"NO — need 50%+ episodes with exit/peak/duration\"}\n')
+print(f'  Gate 06 complete:   {gate06_complete:,} ({100*gate06_complete/max(total_ep,1):.0f}%)')
+print(f'  Peak positive:      {peak_positive:,} ({100*peak_positive/max(total_ep,1):.0f}%)')
+print(f'  Peak non-positive:  {peak_non_positive:,} ({100*peak_non_positive/max(total_ep,1):.0f}%)')
+print(f'  Exit exactly zero:  {exit_zero:,} ({100*exit_zero/max(total_ep,1):.0f}%)')
+v3_ready = gate06_complete/max(total_ep,1) >= 0.50
+print(f'  V3 READY: {\"YES\" if v3_ready else \"NO — need 50%+ episodes with finite exit/peak/duration\"}\n')
 
 # 3. Interval regularity
 intervals = conn.execute('''
