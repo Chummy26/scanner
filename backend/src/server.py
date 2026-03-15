@@ -57,7 +57,7 @@ BACKEND_DIR = SRC_DIR.parent
 PROJECT_DIR = BACKEND_DIR.parent
 sys.path.insert(0, str(SRC_DIR))
 
-from system.auth import AuthManager
+from auth import AuthManager
 from spread.perf_monitor import RuntimePerfMonitor
 
 # ---------------------------------------------------------------------------
@@ -1936,19 +1936,6 @@ async def handle_ml_training_run_latest(request):
         return web.json_response({"error": str(exc)}, status=404)
 
 
-# ---------------------------------------------------------------------------
-# REST Handlers: Funding (legacy pipeline data)
-# ---------------------------------------------------------------------------
-
-async def handle_funding_snapshot(request):
-    snapshot_path = OUT_DIR / "latest" / "funding_snapshot.json"
-    if snapshot_path.exists():
-        try:
-            data = json.loads(snapshot_path.read_text(encoding="utf-8"))
-            return web.json_response(data)
-        except Exception:
-            pass
-    return web.json_response({"data": [], "error": "no_data"})
 
 
 # ---------------------------------------------------------------------------
@@ -2202,27 +2189,6 @@ async def handle_export_history(request):
     )
 
 
-async def handle_export_funding_snapshot(request):
-    deny = _require_export_auth(request)
-    if deny is not None:
-        return deny
-    # Reuse legacy payload but wrap with a stable envelope.
-    now_ms = int(time.time() * 1000)
-    snapshot_path = OUT_DIR / "latest" / "funding_snapshot.json"
-    data = None
-    if snapshot_path.exists():
-        try:
-            data = json.loads(snapshot_path.read_text(encoding="utf-8"))
-        except Exception:
-            data = None
-    return web.json_response(
-        {
-            "schema_name": "scanner.export.funding_snapshot",
-            "schema_version": "1.0.0",
-            "ts_ms": now_ms,
-            "data": data,
-        }
-    )
 
 
 async def handle_export_filters_snapshot(request):
@@ -2557,17 +2523,6 @@ async def handle_discord_callback(request):
     return web.json_response({"ok": True})
 
 
-async def handle_ui_snapshot(request):
-    snapshot_path = OUT_DIR / "latest" / "ui_snapshot.json"
-    if not snapshot_path.exists():
-        snapshot_path = OUT_DIR / "ui_snapshot.json"
-    if snapshot_path.exists():
-        try:
-            data = json.loads(snapshot_path.read_text(encoding="utf-8"))
-            return web.json_response(data)
-        except Exception:
-            pass
-    return web.json_response({"data": [], "error": "no_data"})
 
 
 # ---------------------------------------------------------------------------
@@ -3081,16 +3036,11 @@ def create_app() -> web.Application:
     # ---- Export API (for ArbML / ML consumers) ----
     app.router.add_get("/_export/v1/opportunities", handle_export_opportunities)
     app.router.add_post("/_export/v1/history", handle_export_history)
-    app.router.add_get("/_export/v1/funding_snapshot", handle_export_funding_snapshot)
     app.router.add_get("/_export/v1/filters_snapshot", handle_export_filters_snapshot)
     app.router.add_get("/_export/v1/networks", handle_export_networks)
     app.router.add_get("/_export/v1/funding_history", handle_export_funding_history)
     app.router.add_get("/_export/v1/futures_meta", handle_export_futures_meta)
     app.router.add_post("/_export/v1/orderbook", handle_export_orderbook)
-
-    # ---- Funding (legacy) ----
-    app.router.add_get("/api/funding/snapshot", handle_funding_snapshot)
-    app.router.add_get("/ui", handle_ui_snapshot)
 
     # ---- Extra endpoints the frontend calls ----
     app.router.add_get("/panels", handle_panels)
