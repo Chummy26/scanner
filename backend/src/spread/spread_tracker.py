@@ -2871,6 +2871,17 @@ class SpreadTracker:
                         """,
                         (storage_pair_id, storage_pair_id),
                     )
+                    # Recompute persisted block metadata from the full retained record set.
+                    # Without this, blocks that straddle the rewrite cutoff keep older records
+                    # in SQLite but get start/count rewritten from only the recent snapshot rows.
+                    for storage_block_id in sorted(
+                        {
+                            int(block_id)
+                            for block_id in runtime_to_storage_block_id.values()
+                            if int(block_id) > 0
+                        }
+                    ):
+                        self._recompute_block_from_db(conn, int(storage_block_id))
                     snapshot_rebindings.append((key, storage_pair_id, runtime_to_storage_block_id))
                 self._write_meta(
                     conn,

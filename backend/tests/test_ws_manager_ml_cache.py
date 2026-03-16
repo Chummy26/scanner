@@ -1,8 +1,10 @@
 import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 
 from src.spread.models import SpreadConfig, SpreadOpportunity
 from src.spread.ws_manager import WSManager
+from src.spread import ws_manager as ws_mod
 from src.spread import market_data
 
 
@@ -214,6 +216,56 @@ def test_ws_manager_hot_path_enqueues_refresh_when_tracker_marker_changes(monkey
         assert ws_mgr.ml_analyzer.predict_calls == 2
     finally:
         market_data._market_data_ready = original_ready
+
+
+def test_snapshot_scheduler_uses_extended_quick_cert_timeout(monkeypatch, tmp_path: Path):
+    calls: dict[str, object] = {}
+
+    class _DummyTracker:
+        def __init__(self, db_path: Path):
+            self.db_path = db_path
+
+        def flush_to_storage(self, force: bool = False):
+            calls["flush_force"] = force
+            return True
+
+    class _DummyManager:
+        def __init__(self):
+            self.tracker = _DummyTracker(tmp_path / "tracker.sqlite")
+            self._artifact_root = tmp_path
+
+        def _snapshot_path_for_slot(self, slot_time: datetime) -> Path:
+            return tmp_path / "snapshot.sqlite"
+
+        def _drain_tracker_ingest_batch(self, now_ts=None, drain_all: bool = False):
+            calls["drain_all"] = drain_all
+            return None
+
+    async def _fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    def _fake_create_snapshot(source: Path, target: Path):
+        target.write_text("snapshot", encoding="utf-8")
+        calls["snapshot_source"] = str(source)
+        return target
+
+    def _fake_certify_data_for_training(**kwargs):
+        calls["certify_kwargs"] = dict(kwargs)
+        return {"verdict": "CERTIFIED", "certified": True, "failure_reasons": []}
+
+    monkeypatch.setattr(ws_mod.asyncio, "to_thread", _fake_to_thread)
+    monkeypatch.setattr(ws_mod, "create_sqlite_snapshot", _fake_create_snapshot)
+    monkeypatch.setattr(ws_mod, "certify_data_for_training", _fake_certify_data_for_training)
+    monkeypatch.setattr(ws_mod, "update_snapshot_manifest", lambda *args, **kwargs: None)
+
+    manager = _DummyManager()
+    snapshot_path = asyncio.run(WSManager._create_snapshot_for_slot(manager, datetime.now(timezone.utc)))
+
+    assert snapshot_path == tmp_path / "snapshot.sqlite"
+    assert calls["drain_all"] is True
+    assert calls["flush_force"] is True
+    assert calls["certify_kwargs"]["certification_mode"] == "quick"
+    assert calls["certify_kwargs"]["max_certification_duration_sec"] == 1800
 
 
 def test_ws_manager_skips_ml_work_when_model_is_not_ready(monkeypatch, tmp_path: Path):

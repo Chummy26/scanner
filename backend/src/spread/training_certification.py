@@ -40,6 +40,9 @@ DEFAULT_RUNTIME_AUDIT_STALENESS_SEC = 24 * 60 * 60
 GATE_02_MIN_INTERVAL_SEC = 10.0
 GATE_02_MAX_INTERVAL_SEC = 40.0
 GATE_03_MIN_RECORDS_FOR_COMPLETENESS = 10
+GATE_03_STABLE_MIN_CHECKPOINTS = 4
+GATE_03_STABLE_MIN_COVERAGE = 0.70
+GATE_03_RECENT_WINDOW_CHECKPOINTS = 4
 GATE_03_DISAPPEARED_WARN_RATE = 0.20
 GATE_03_DISAPPEARED_FAIL_RATE = 0.95
 GATE_03_INTERMITTENT_WARN_RATE = 0.15
@@ -319,6 +322,35 @@ def _safe_in(
         ((value,) for value in normalized),
     )
     return f"{column_expr} IN (SELECT id FROM {temp_table_name})", []
+
+
+def _pair_exchange_legs(pair_id: str) -> tuple[str, str] | tuple[()]:
+    parts = [str(part or "").strip().lower() for part in str(pair_id or "").split("|")]
+    if len(parts) < 5:
+        return ()
+    buy_exchange = parts[1]
+    sell_exchange = parts[3]
+    if not buy_exchange or not sell_exchange:
+        return ()
+    return buy_exchange, sell_exchange
+
+
+def _health_filtered_exchanges(hourly_health: list[dict[str, Any]]) -> set[str]:
+    excluded: set[str] = set()
+    for item in list(hourly_health or []):
+        verdict = str(item.get("quality_verdict") or "").strip().lower()
+        open_exchanges = {
+            str(exchange or "").strip().lower()
+            for exchange in list(item.get("exchanges_circuit_open") or [])
+            if str(exchange or "").strip()
+        }
+        if verdict in {"degraded", "unhealthy"} or open_exchanges:
+            excluded.update(open_exchanges)
+    return excluded
+
+
+def _effective_stable_checkpoint_min(checkpoint_count: int) -> int:
+    return max(1, min(GATE_03_STABLE_MIN_CHECKPOINTS, max(int(checkpoint_count) - 1, 1)))
 
 
 def _fetch_scope_ids(
@@ -1390,6 +1422,21 @@ def run_training_certification(
         checkpoint_buckets = []
         pair_ids = list(quick_sqlite_metrics["pair_ids"])
         block_diagnostics = dict(quick_sqlite_metrics["block_diagnostics"])
+    if quick_sqlite_metrics is not None:
+        scope_start_ts = float(quick_sqlite_metrics.get("min_ts", 0.0) or 0.0)
+        scope_end_ts = float(quick_sqlite_metrics.get("max_ts", 0.0) or 0.0)
+    elif records:
+        scope_start_ts = min(float(record.get("timestamp", 0.0) or 0.0) for record in records)
+        scope_end_ts = max(float(record.get("timestamp", 0.0) or 0.0) for record in records)
+    else:
+        scope_start_ts = min((float(row.get("started_at", 0.0) or 0.0) for row in runtime_session_rows), default=0.0)
+        scope_end_ts = max((float(row.get("ended_at", 0.0) or 0.0) for row in runtime_session_rows), default=0.0)
+    hourly_health = _load_hourly_health_samples(
+        state_path,
+        scope_start_ts=scope_start_ts,
+        scope_end_ts=scope_end_ts,
+    )
+    health_filtered_exchanges = _health_filtered_exchanges(hourly_health)
     session_hours = _session_duration_hours(runtime_session_rows, records)
     gate_results: dict[str, Any] = {}
     dataset_fingerprints: dict[str, str] = {}
@@ -1525,50 +1572,85 @@ def run_training_certification(
             if quick_sqlite_metrics is not None
             else Counter(str(record["pair_id"]) for record in records if str(record["pair_id"]))
         )
-        completeness_pair_ids = sorted(
+        raw_completeness_pair_ids = sorted(
             pair_id
             for pair_id, record_count in pair_record_counts.items()
             if int(record_count) >= GATE_03_MIN_RECORDS_FOR_COMPLETENESS
         )
-        completeness_pair_set = set(completeness_pair_ids)
+        excluded_pairs_by_exchange_health = sorted(
+            pair_id
+            for pair_id in raw_completeness_pair_ids
+            if health_filtered_exchanges
+            and any(exchange in health_filtered_exchanges for exchange in _pair_exchange_legs(pair_id))
+        )
+        health_filtered_pair_ids = [
+            pair_id for pair_id in raw_completeness_pair_ids if pair_id not in set(excluded_pairs_by_exchange_health)
+        ]
+        pair_presence_windows: dict[str, set[int]] = {}
         disappeared_pairs = []
         intermittent_pairs = []
         if quick_sqlite_metrics is not None:
             checkpoint_count = int(quick_sqlite_metrics["checkpoint_count"])
             pair_presence_sets = dict(quick_sqlite_metrics["pair_checkpoint_presence"])
-            for pair_id in completeness_pair_ids:
-                presence_set = {int(value) for value in pair_presence_sets.get(pair_id, set())}
-                if not presence_set:
-                    continue
-                first = min(presence_set)
-                last = max(presence_set)
-                if checkpoint_count > 0 and last < checkpoint_count - 1:
-                    disappeared_pairs.append(pair_id)
-                if len(presence_set) < (last - first + 1):
-                    intermittent_pairs.append(pair_id)
+            for pair_id in health_filtered_pair_ids:
+                pair_presence_windows[pair_id] = {int(value) for value in pair_presence_sets.get(pair_id, set())}
             records_per_pair_per_hour = float(
                 int(quick_sqlite_metrics["records_total"])
                 / max(len(pair_ids) * max(session_hours, 1.0 / 3600.0), 1.0)
             )
         else:
             pair_presence = {pair_id: [pair_id in set(bucket["pairs"]) for bucket in checkpoint_buckets] for pair_id in pair_ids}
+            checkpoint_count = len(checkpoint_buckets)
             for pair_id, presence in pair_presence.items():
-                if pair_id not in completeness_pair_set:
+                if pair_id not in set(health_filtered_pair_ids):
                     continue
-                if not any(presence):
-                    continue
-                first = presence.index(True)
-                last = len(presence) - 1 - presence[::-1].index(True)
-                if last < len(presence) - 1:
-                    disappeared_pairs.append(pair_id)
-                if any(not value for value in presence[first:last + 1]):
-                    intermittent_pairs.append(pair_id)
+                pair_presence_windows[pair_id] = {index for index, value in enumerate(presence) if value}
             records_per_pair_per_hour = float(len(records) / max(len(pair_ids) * max(session_hours, 1.0 / 3600.0), 1.0))
-        active_pair_count = max(len(completeness_pair_ids), 1)
-        disappeared_rate = float(len(disappeared_pairs) / active_pair_count)
-        intermittent_rate = float(len(intermittent_pairs) / active_pair_count)
+        stable_min_checkpoints = _effective_stable_checkpoint_min(checkpoint_count)
+        stable_pairs = []
+        excluded_ephemeral_pairs = []
+        for pair_id in health_filtered_pair_ids:
+            presence_set = set(pair_presence_windows.get(pair_id, set()))
+            if not presence_set:
+                continue
+            first = min(presence_set)
+            last = max(presence_set)
+            span = max(last - first + 1, 1)
+            coverage_ratio = float(len(presence_set) / span)
+            if len(presence_set) >= stable_min_checkpoints and coverage_ratio >= GATE_03_STABLE_MIN_COVERAGE:
+                stable_pairs.append(pair_id)
+            else:
+                excluded_ephemeral_pairs.append(pair_id)
+        recent_window_checkpoints = max(1, min(GATE_03_RECENT_WINDOW_CHECKPOINTS, checkpoint_count))
+        recent_stable_pairs = []
+        for pair_id in stable_pairs:
+            presence_set = set(pair_presence_windows.get(pair_id, set()))
+            if not presence_set:
+                continue
+            first = min(presence_set)
+            last = max(presence_set)
+            if checkpoint_count > 0 and last >= checkpoint_count - recent_window_checkpoints:
+                recent_stable_pairs.append(pair_id)
+            if len(presence_set) < (last - first + 1):
+                intermittent_pairs.append(pair_id)
+            if checkpoint_count > 0 and pair_id in recent_stable_pairs and last < checkpoint_count - 1:
+                disappeared_pairs.append(pair_id)
+        stable_pair_count = len(stable_pairs)
+        recent_pair_count = len(recent_stable_pairs)
+        disappeared_rate = float(len(disappeared_pairs) / max(recent_pair_count, 1)) if recent_pair_count > 0 else 0.0
+        intermittent_rate = float(len(intermittent_pairs) / max(stable_pair_count, 1)) if stable_pair_count > 0 else 0.0
         density_threshold = _scaled_density_threshold(len(pair_ids))
         recommendations: list[str] = []
+        if excluded_pairs_by_exchange_health:
+            recommendations.append(
+                "excluded degraded/unhealthy exchange legs from completeness denominator: "
+                f"count={len(excluded_pairs_by_exchange_health)} exchanges={sorted(health_filtered_exchanges)}"
+            )
+        if excluded_ephemeral_pairs:
+            recommendations.append(
+                "excluded route-ephemeral pairs from completeness denominator: "
+                f"count={len(excluded_ephemeral_pairs)} min_checkpoints={stable_min_checkpoints} min_coverage={GATE_03_STABLE_MIN_COVERAGE:.2f}"
+            )
         if rejection_stats and (
             disappeared_rate >= GATE_03_DISAPPEARED_WARN_RATE
             or intermittent_rate >= GATE_03_INTERMITTENT_WARN_RATE
@@ -1599,8 +1681,13 @@ def run_training_certification(
                     "checkpoint_count": int(quick_sqlite_metrics["checkpoint_count"]) if quick_sqlite_metrics is not None else len(checkpoint_buckets),
                     "records_per_pair_per_hour": records_per_pair_per_hour,
                     "records_per_pair_per_hour_threshold": density_threshold,
-                    "completeness_pair_count": len(completeness_pair_ids),
+                    "completeness_pair_count": len(stable_pairs),
+                    "completeness_pair_count_raw": len(raw_completeness_pair_ids),
+                    "completeness_pair_count_after_exchange_health": len(health_filtered_pair_ids),
                     "completeness_pair_min_records": GATE_03_MIN_RECORDS_FOR_COMPLETENESS,
+                    "stable_pair_min_checkpoints": stable_min_checkpoints,
+                    "stable_pair_min_coverage": GATE_03_STABLE_MIN_COVERAGE,
+                    "recent_window_checkpoints": recent_window_checkpoints,
                     "disappeared_pair_warn_rate": GATE_03_DISAPPEARED_WARN_RATE,
                     "disappeared_pair_fail_rate": GATE_03_DISAPPEARED_FAIL_RATE,
                     "intermittent_pair_warn_rate": GATE_03_INTERMITTENT_WARN_RATE,
@@ -1609,7 +1696,15 @@ def run_training_certification(
                     "intermittent_pairs": intermittent_pairs[:50],
                     "disappeared_pair_rate": disappeared_rate,
                     "intermittent_pair_rate": intermittent_rate,
+                    "stable_pair_count": stable_pair_count,
+                    "recent_stable_pair_count": recent_pair_count,
                     "hot_path_rejection_stats": rejection_stats,
+                    "excluded_pairs_by_exchange_health_count": len(excluded_pairs_by_exchange_health),
+                    "excluded_pairs_by_exchange_health": excluded_pairs_by_exchange_health[:50],
+                    "excluded_exchanges_by_health": sorted(health_filtered_exchanges),
+                    "excluded_ephemeral_pairs_count": len(excluded_ephemeral_pairs),
+                    "excluded_ephemeral_pairs": excluded_ephemeral_pairs[:50],
+                    "hourly_health_sample_count": len(hourly_health),
                 },
             )
         )
@@ -1732,13 +1827,6 @@ def run_training_certification(
 
         _check_timeout()
         if certification_mode == "quick":
-            quick_scope_start = float(quick_sqlite_metrics.get("min_ts", 0.0) or 0.0) if quick_sqlite_metrics is not None else 0.0
-            quick_scope_end = float(quick_sqlite_metrics.get("max_ts", 0.0) or 0.0) if quick_sqlite_metrics is not None else 0.0
-            hourly_health = _load_hourly_health_samples(
-                state_path,
-                scope_start_ts=quick_scope_start,
-                scope_end_ts=quick_scope_end,
-            )
             if not hourly_health:
                 _skip_gate("gate_07_book_health", "Book health", "quick_mode_skipped")
             else:

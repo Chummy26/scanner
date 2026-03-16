@@ -1898,6 +1898,7 @@ class WSManager:
             certify_data_for_training,
             state_file=target,
             certification_mode="quick",
+            max_certification_duration_sec=1800,
         )
         cert_path = target.with_suffix(".cert.json")
         cert_path.write_text(json.dumps(certification, indent=2, sort_keys=True), encoding="utf-8")

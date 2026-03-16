@@ -617,6 +617,55 @@ def test_tracker_batch_record_flush_materializes_runtime_block_ids(tmp_path: Pat
     assert storage["blocks_total"] == 2
 
 
+def test_tracker_flush_recomputes_block_metadata_across_rewrite_cutoff(tmp_path: Path):
+    db_path = tmp_path / "tracker_history.sqlite"
+    tracker = SpreadTracker(
+        window_sec=3600,
+        memory_window_sec=60,
+        record_interval_sec=15.0,
+        max_records_per_pair=0,
+        epsilon_pct=0.0,
+        history_enable_entry_spread_pct=0.0,
+        track_enable_entry_spread_pct=0.0,
+        db_path=db_path,
+        gap_threshold_sec=45.0,
+    )
+
+    pair = ("ETH", "mexc", "spot", "gate", "futures")
+    for ts in (0.0, 15.0, 30.0):
+        tracker.record_spread(*pair, 0.44, -0.20, now_ts=ts)
+    assert tracker.flush_to_storage(now_ts=30.0, force=True)
+
+    for ts in (45.0, 60.0, 75.0):
+        tracker.record_spread(*pair, 0.49, -0.15, now_ts=ts)
+    assert tracker.flush_to_storage(now_ts=120.0, force=True)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        block = conn.execute(
+            """
+            SELECT id, start_ts, end_ts, record_count
+            FROM tracker_pair_blocks
+            ORDER BY id ASC
+            LIMIT 1
+            """
+        ).fetchone()
+        actual = conn.execute(
+            """
+            SELECT MIN(ts) AS min_ts, MAX(ts) AS max_ts, COUNT(*) AS record_count
+            FROM tracker_records
+            WHERE block_id = ?
+            """,
+            (int(block["id"]),),
+        ).fetchone()
+
+    assert block is not None
+    assert actual is not None
+    assert float(block["start_ts"]) == pytest.approx(float(actual["min_ts"]))
+    assert float(block["end_ts"]) == pytest.approx(float(actual["max_ts"]))
+    assert int(block["record_count"]) == int(actual["record_count"])
+
+
 def test_tracker_quality_report_flags_structural_anomalies(tmp_path: Path):
     db_path = tmp_path / "tracker_history.sqlite"
     tracker = SpreadTracker(

@@ -434,10 +434,103 @@ def test_certification_gate3_treats_route_ephemerality_as_warning_not_fail(tmp_p
     )
 
     gate03 = payload["gate_results"]["gate_03_completeness"]
-    assert gate03["status"] == "WARNING"
+    assert gate03["status"] == "PASS"
     assert gate03["failure_reasons"] == []
-    assert gate03["warnings"] == ["pair_completeness_degraded"]
-    assert gate03["details"]["disappeared_pair_rate"] == pytest.approx(0.9)
+    assert gate03["warnings"] == []
+    assert gate03["details"]["completeness_pair_count"] == 1
+    assert gate03["details"]["excluded_ephemeral_pairs_count"] == 9
+
+
+def test_certification_gate3_excludes_pairs_from_degraded_exchange_health(tmp_path: Path, monkeypatch):
+    state_path = _install_base_mocks(
+        monkeypatch,
+        tmp_path,
+        records=[],
+        episodes=[],
+        runtime_hours=2.0,
+        rejection_stats={
+            "rejection_rate_by_pair": {"AAA|gate|futures|xt|futures": 1.0},
+            "rejection_rate_by_exchange": {"xt": 0.75},
+        },
+    )
+    pair_ids = [
+        "AAA|gate|futures|xt|futures",
+        "BBB|gate|futures|mexc|futures",
+    ]
+    pair_record_counts = Counter({pair_id: 20 for pair_id in pair_ids})
+    pair_checkpoint_presence = {
+        pair_ids[0]: {0, 2},
+        pair_ids[1]: {0, 1, 2, 3},
+    }
+    monkeypatch.setattr(
+        tc,
+        "_stream_quick_sqlite_metrics",
+        lambda *args, **kwargs: {
+            "pair_ids": pair_ids,
+            "pair_record_counts": pair_record_counts,
+            "pair_checkpoint_presence": pair_checkpoint_presence,
+            "checkpoint_count": 4,
+            "records_total": 500,
+            "episode_total_spreads": [0.20, 0.25, 0.30, 0.35],
+            "episode_durations": [45.0, 50.0, 55.0, 60.0],
+            "episode_peaks": [1.0, 1.1, 1.2, 1.3],
+            "episode_exits": [0.2, 0.3, 0.4, 0.5],
+            "pair_hour_counts": Counter({pair_id: 2 for pair_id in pair_ids}),
+            "frozen_entry_hours": Counter(),
+            "frozen_exit_hours": Counter(),
+            "unresponsive_exit_hours": Counter(),
+            "entry_outlier_hours": Counter(),
+            "exit_outlier_hours": Counter(),
+            "pearson_by_pair": {},
+            "bilateral_zero_rate": 0.0,
+            "num_blocks": 20,
+            "min_ts": 0.0,
+            "max_ts": 7_200.0,
+            "block_diagnostics": {
+                "inter_record_interval_sec_quantiles": {"p50": 31.0},
+                "max_to_median_interval_ratio_quantiles": {"p90": 1.8},
+                "irregular_block_count": 0,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        tc,
+        "_load_hourly_health_samples",
+        lambda *args, **kwargs: [
+            {
+                "quality_verdict": "degraded",
+                "exchanges_circuit_open": ["xt"],
+            }
+        ],
+    )
+
+    payload = tc.run_training_certification(
+        state_file=state_path,
+        artifact_dir=tmp_path / "artifacts",
+        sequence_length=4,
+        prediction_horizon_sec=240,
+        thresholds=[0.8],
+        selected_session_ids=None,
+        selected_block_ids=None,
+        allow_cross_session_merge=False,
+        max_session_gap_sec=None,
+        regime_shift_score_threshold=3.0,
+        certification_mode="quick",
+        max_certification_duration_sec=300,
+        allow_legacy_sessions=False,
+        runtime_audit_dir=None,
+        run_reconnection_stress=False,
+        preflight_fn=_preflight_ok,
+        dataset_fingerprint_fn=_fingerprint,
+    )
+
+    gate03 = payload["gate_results"]["gate_03_completeness"]
+    assert gate03["status"] == "PASS"
+    assert gate03["failure_reasons"] == []
+    assert gate03["details"]["completeness_pair_count_raw"] == 2
+    assert gate03["details"]["completeness_pair_count"] == 1
+    assert gate03["details"]["excluded_pairs_by_exchange_health_count"] == 1
+    assert gate03["details"]["excluded_exchanges_by_health"] == ["xt"]
 
 
 @pytest.mark.parametrize(("runtime_hours", "expected_status"), [(1.5, "WARNING"), (4.0, "FAIL")])
